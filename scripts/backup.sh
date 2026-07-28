@@ -161,27 +161,38 @@ backup_matrix() {
   local any_failed=0
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
+    local tmp="$BACKUP_DIR/${name}-$DATE.sql"
+    local err="$BACKUP_DIR/${name}-$DATE.err"
     local out="$BACKUP_DIR/${name}-$DATE.sql.gz"
 
-    # Mount volume read-only; dump to stdout via the pre-built
-    # sqlite-dumper:latest image (alpine + sqlite, built by deploy_backups).
-    # The pipe to gzip happens on the host. If the dump fails or produces
-    # an empty file we remove the artifact so backup_to_github errors
-    # loudly rather than silently committing zero bytes.
+    # Dump to a PLAIN .sql first (no pipe) so sqlite3's REAL exit is seen —
+    # piping straight to gzip would mask a sqlite3 failure behind gzip's exit
+    # status, and a gzip of empty input is still a non-empty container so an
+    # `-s` size check on the .gz lies (it "passes" for a zero-row dump). Mount
+    # the volume read-only (online-safe snapshot) and capture stderr so a
+    # WAL-locked/failed read reports loudly. Mirrors backup_aiko_island.
     if ! docker run --rm -v "${volume}:/data:ro" sqlite-dumper:latest \
-      sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump 2>/dev/null \
-       | gzip > "$out"; then
-      error "${name} sqlite3 .dump failed"
-      rm -f "$out"
+         sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump > "$tmp" 2>"$err"; then
+      error "${name} sqlite3 .dump failed: $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
     fi
-    if [ ! -s "$out" ]; then
-      error "${name} dump produced empty output"
-      rm -f "$out"
+    # A COMPLETE .dump's LAST non-blank line is exactly `COMMIT;`. Check the
+    # tail end-anchored (not `grep '^COMMIT;'`): application data can embed a
+    # multiline string whose line starts `COMMIT;` and fool a whole-file grep
+    # into accepting a truncated dump. A silent empty/truncated backup is worse
+    # than none — restore would replay it over a live bridge DB.
+    local lastline
+    lastline=$(grep -ve '^[[:space:]]*$' "$tmp" | tail -n1)
+    if [ "$lastline" != "COMMIT;" ]; then
+      error "${name} dump invalid (last line '$lastline', not COMMIT; — empty/truncated): $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
     fi
+    rm -f "$err"
+    gzip -f "$tmp"   # -> $out (${name}-$DATE.sql.gz)
     log "  ${name} → $(basename "$out") ($(du -h "$out" | cut -f1))"
   done
 
