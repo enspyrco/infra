@@ -2,8 +2,7 @@
 // ============
 // Fans out `image.published` events from CI to OCI-host subscribers over SSE,
 // so a merge-to-main reaches the running container in ~seconds without the
-// host ever opening an inbound port. Design + rationale:
-// https://outline.imagineering.cc/doc/the-imagineering-deploy-bus-qz9QscpP6Q
+// host ever opening an inbound port. Design + rationale: see ../DESIGN.md.
 //
 // Routes:
 //   POST /publish           Bearer PUBLISH_TOKEN. Body is the event JSON
