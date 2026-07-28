@@ -12,7 +12,7 @@
 # revives a `failed` unit so it can never die permanently silent.
 [Unit]
 Description=Deploy-bus SSE subscriber for %i
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service

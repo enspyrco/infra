@@ -5,7 +5,7 @@
 # (and /etc/cd-bus/<svc>.env) is separate — see README.md.
 #
 # Run FROM this directory on the host (these repo files are hand-managed
-# mirrors of the host, like the rest of imagineering-infra's deploy artifacts):
+# mirrors of the host, like the rest of enspyrco/infra's deploy artifacts):
 #   scp -r cd-bus/fleet nick@host:/tmp/cd-bus-fleet && \
 #     ssh host 'cd /tmp/cd-bus-fleet && sudo ./install-shared.sh'
 set -euo pipefail
@@ -20,7 +20,7 @@ UNITS=/etc/systemd/system
 # the shared Telegram helper, and the unit files run as group nick. Warn rather
 # than fail — install the scripts/units regardless, but make a missing prereq loud.
 getent group nick >/dev/null || echo "WARN: group 'nick' not found — the units run as User=nick; create it or edit the units."
-[ -f /opt/scripts/lib/telegram.sh ] || echo "WARN: /opt/scripts/lib/telegram.sh missing — failure ALERTS will not send until imagineering-infra's deploy_scripts installs it."
+[ -f /opt/scripts/lib/telegram.sh ] || echo "WARN: /opt/scripts/lib/telegram.sh missing — failure ALERTS will not send until enspyrco/infra's deploy_scripts installs it."
 
 echo "installing shared scripts -> $OPT"
 install -d -o root -g root -m 0755 "$OPT"

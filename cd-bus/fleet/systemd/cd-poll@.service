@@ -4,7 +4,7 @@
 # Install at /etc/systemd/system/cd-poll@.service
 [Unit]
 Description=Deploy-bus CD pull backstop for %i
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
