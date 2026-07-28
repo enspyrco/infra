@@ -1,6 +1,8 @@
-# Imagineering Infrastructure
+# enspyrco/infra
 
-Monorepo for Imagineering infrastructure and self-hosted services.
+Monorepo for self-hosted infrastructure — imagineering.cc services, co-located xdeca, and enspyr.
+(Formerly `imagineering-cc/imagineering-infra`; renamed 2026-07-28. The `imagineering.cc` domain
+and its live services are unchanged — only the GitHub repo moved.)
 
 ## IMPORTANT: Production Server Safety
 

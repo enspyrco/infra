@@ -2,7 +2,7 @@
 // Telegram message via the existing `notify` proxy.
 //
 // TOPOLOGY: we do NOT hold a Telegram bot token or build a Telegram path. The
-// `notify` service (imagineering-infra/notify, https://notify.imagineering.cc)
+// `notify` service (enspyrco/infra/notify, https://notify.imagineering.cc)
 // already is the notification bus — it holds the bot token centrally and takes
 // a thin `POST /send` with a Bearer API key. Because notify is PUBLIC https
 // (unlike claude-shim's loopback bind), this is a plain `fetch` — no shell, no

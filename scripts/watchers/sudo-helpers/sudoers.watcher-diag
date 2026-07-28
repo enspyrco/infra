@@ -3,7 +3,7 @@
 # script in /usr/local/bin/ — never a raw command. Wrappers take no
 # arguments to eliminate any "wrong flag passed" failure mode.
 #
-# Source of truth: scripts/watchers/sudo-helpers/ in imagineering-infra.
+# Source of truth: scripts/watchers/sudo-helpers/ in enspyrco/infra.
 # Re-install via the procedure in that directory's README.md when
 # adding/modifying wrappers.
 
