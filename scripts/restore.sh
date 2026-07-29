@@ -50,6 +50,27 @@ cleanup_backups() {
   rm -rf "$BACKUP_CLONE_DIR"
 }
 
+# Validate a plain-text pg_dump BEFORE any destructive restore step: non-empty,
+# complete (end-anchored '-- PostgreSQL database dump complete'), and not a
+# schemaless/empty DB (has CREATE TABLE). Returns non-zero so the caller can abort
+# with the LIVE database still intact. The old restore_kanbn/outline dropped the
+# live DB FIRST, then blind-loaded — a corrupt/truncated repo dump wiped live data.
+# (The full atomic restore-into-temp-DB-then-rename is Phase 2 of #29 — needs a
+# postgres test container; this guard already stops a bad dump reaching dropdb.)
+_validate_pg_dump() {
+  local svc="$1" f="$2"
+  if [ ! -s "$f" ]; then
+    error "$svc: dump $(basename "$f") is empty — refusing (live DB untouched)"; return 1
+  fi
+  if ! tail -n5 "$f" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "$svc: dump incomplete (no completion marker — truncated) — refusing (live DB untouched)"; return 1
+  fi
+  if ! grep -q 'CREATE TABLE' "$f"; then
+    error "$svc: dump has no CREATE TABLE (empty/wrong DB) — refusing (live DB untouched)"; return 1
+  fi
+  return 0
+}
+
 restore_kanbn() {
   log "Restoring Kan.bn..."
 
@@ -62,6 +83,9 @@ restore_kanbn() {
     cleanup_backups
     exit 1
   fi
+  # Validate BEFORE the destructive drop — a corrupt/truncated dump must never
+  # reach dropdb (the old code dropped first, then blind-loaded).
+  _validate_pg_dump kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   # Ensure Kan.bn postgres is running
   cd ~/apps/kanbn
@@ -73,9 +97,15 @@ restore_kanbn() {
   log "Dropping existing database..."
   docker exec -i kanbn_postgres bash -c "psql -U kanbn -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kanbn' AND pid <> pg_backend_pid();\" postgres && dropdb -U kanbn kanbn && createdb -U kanbn kanbn"
 
-  # Restore database
+  # Atomic load: --single-transaction + ON_ERROR_STOP so a replay error rolls the
+  # WHOLE load back instead of leaving a half-populated DB. (The DB was just
+  # dropped+recreated, so on failure it ends EMPTY — surfaced loudly below, not
+  # silently logged as success.)
   log "Restoring database..."
-  docker exec -i kanbn_postgres psql -U kanbn kanbn < "$BACKUP_FILE"
+  if ! docker exec -i kanbn_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U kanbn kanbn < "$BACKUP_FILE"; then
+    error "Kan.bn psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
+    cleanup_backups; exit 1
+  fi
 
   log "Restarting Kan.bn..."
   docker compose restart
@@ -95,6 +125,8 @@ restore_outline() {
     cleanup_backups
     exit 1
   fi
+  # Validate BEFORE the destructive drop (see restore_kanbn).
+  _validate_pg_dump outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   # Ensure Outline postgres is running
   cd ~/apps/outline
@@ -106,9 +138,12 @@ restore_outline() {
   log "Dropping existing database..."
   docker exec -i outline_postgres bash -c "psql -U outline -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'outline' AND pid <> pg_backend_pid();\" postgres && dropdb -U outline outline && createdb -U outline outline"
 
-  # Restore database
+  # Atomic load (see restore_kanbn): rolls back on any replay error.
   log "Restoring database..."
-  docker exec -i outline_postgres psql -U outline outline < "$BACKUP_FILE"
+  if ! docker exec -i outline_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U outline outline < "$BACKUP_FILE"; then
+    error "Outline psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
+    cleanup_backups; exit 1
+  fi
 
   log "Restarting Outline..."
   docker compose restart
@@ -131,10 +166,21 @@ restore_pm_bot() {
 
   # Copy SQLite database into container volume
   log "Restoring database..."
+  # Validate before overwriting the live DB: non-empty AND a real SQLite file
+  # (magic header "SQLite format 3"). A truncated/empty/wrong backup must not
+  # clobber the live bot.db.
+  if [ ! -s "$BACKUP_FILE" ]; then
+    error "Dreamfinder restore: $BACKUP_FILE is empty — refusing (live DB untouched)"
+    cleanup_backups; exit 1
+  fi
+  if ! head -c 16 "$BACKUP_FILE" | grep -aq 'SQLite format 3'; then
+    error "Dreamfinder restore: $BACKUP_FILE is not a SQLite database (bad magic) — refusing (live DB untouched)"
+    cleanup_backups; exit 1
+  fi
+
   # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
   # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
-  # silently wrote a file the app ignores (a no-op restore). (#29 tracks adding a
-  # pre-overwrite validity/size check on the .db.)
+  # silently wrote a file the app ignores (a no-op restore).
   docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
@@ -157,12 +203,20 @@ restore_radicale() {
     exit 1
   fi
 
+  # Validate the archive BEFORE the destructive rm — a truncated/corrupt tar must
+  # not reach `rm -rf /data/collections` (which would leave collections gone with
+  # nothing to extract). `tar tf` reads the whole archive, so truncation fails here.
+  if ! tar tf "$BACKUP_FILE" >/dev/null 2>&1; then
+    error "Radicale restore: $BACKUP_FILE is not a valid/complete tar — refusing (collections untouched)"
+    cleanup_backups; exit 1
+  fi
+
   # Stop Radicale
   log "Stopping Radicale..."
   cd ~/apps/radicale
   docker compose stop radicale
 
-  # Restore collections into the volume
+  # Restore collections into the volume. Validated above, so the rm is safe.
   log "Restoring collections..."
   docker compose run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
     -c "rm -rf /data/collections && tar xf /restore.tar -C /"
@@ -185,6 +239,13 @@ restore_claudius() {
     error "No claudius.tar found in backup repo"
     cleanup_backups
     exit 1
+  fi
+
+  # Validate the archive before extracting over live state (extract is additive,
+  # lower-risk than a rm, but a corrupt tar should still be refused loudly).
+  if ! tar tf "$BACKUP_FILE" >/dev/null 2>&1; then
+    error "Claudius restore: $BACKUP_FILE is not a valid/complete tar — refusing"
+    cleanup_backups; exit 1
   fi
 
   # Restore state files into container
