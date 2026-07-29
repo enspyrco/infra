@@ -258,7 +258,10 @@ restore_radicale() {
   #   2. Content sentinel: at least one member under data/collections (backup.sh
   #      tars `docker exec radicale tar czf - /data/collections`, so a real archive
   #      lists data/collections[/...]). An empty or wrong-tree tar fails here.
-  if ! printf '%s\n' "$radicale_members" | grep -q '^data/collections'; then
+  # Exact directory boundary (`(/|$)`) — a bare prefix would also match a wrong
+  # tree like data/collections-old / data/collections.bak, pass, then let the
+  # rm wipe the real collections (cage-match #138 round 2, Carnot).
+  if ! printf '%s\n' "$radicale_members" | grep -qE '^data/collections(/|$)'; then
     error "Radicale restore: $BACKUP_FILE has no data/collections members (empty/wrong-tree tar) — refusing (collections untouched)"
     cleanup_backups; exit 1
   fi
@@ -465,14 +468,10 @@ restore_matrix() {
     "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
-  # Build the sqlite helper if absent — restore may run on a box where the
-  # backup path (which builds it) has never executed. Idempotent.
-  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
-    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-      | docker build -q -t sqlite-dumper:latest - >/dev/null \
-      || { error "failed to build sqlite-dumper:latest"; cleanup_backups; return 1; }
-  fi
+  # Build the sqlite helper if absent — restore may run on a box where the backup
+  # path (which builds it) has never executed. Shared _ensure_sqlite_dumper, same
+  # as island/pm_bot (cage-match #138 round 2, Kelvin: was an inline copy).
+  _ensure_sqlite_dumper || { cleanup_backups; return 1; }
 
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
