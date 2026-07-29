@@ -73,13 +73,30 @@ mkdir -p "$BACKUP_DIR"
 backup_kanbn() {
   log "Backing up Kan.bn..."
 
-  local backup_file="$BACKUP_DIR/kanbn-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/kanbn-$DATE.sql"
+  local err="$BACKUP_DIR/kanbn-$DATE.err"
+  local out="$BACKUP_DIR/kanbn-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec kanbn_postgres \
-    pg_dump -U kanbn kanbn | gzip > "$backup_file"
-
-  log "Kan.bn backup complete: kanbn-$DATE.sql.gz"
+  # Dump to a plain .sql first so pg_dump's REAL exit is seen — piping straight
+  # to gzip masks it behind gzip's status, silently committing a truncated/empty
+  # backup over the good one. Then require pg_dump's end-marker before gzip.
+  if ! docker exec kanbn_postgres pg_dump -U kanbn kanbn > "$tmp" 2>"$err"; then
+    error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  # A COMPLETE pg_dump plain-text dump ends with the EXACT line
+  # '-- PostgreSQL database dump complete'. Anchor on the whole line (grep -qxF),
+  # not a loose substring, so a data row near EOF can't fake completeness after a
+  # truncation (same end-anchoring discipline as the sqlite COMMIT; check).
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"
+  # Check gzip's own exit — a failed compress (ENOSPC/SIGKILL) must not leave the
+  # function logging success with a missing/partial .gz (pipe-masks-exit reborn).
+  if ! gzip -f "$tmp"; then error "Kan.bn gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
+  log "Kan.bn backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_pm_bot() {
@@ -103,41 +120,64 @@ backup_pm_bot() {
 backup_outline() {
   log "Backing up Outline..."
 
-  local backup_file="$BACKUP_DIR/outline-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/outline-$DATE.sql"
+  local err="$BACKUP_DIR/outline-$DATE.err"
+  local out="$BACKUP_DIR/outline-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec outline_postgres \
-    pg_dump -U outline outline | gzip > "$backup_file"
-
-  log "Outline backup complete: outline-$DATE.sql.gz"
+  # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
+  # then require the completion marker before gzip.
+  if ! docker exec outline_postgres pg_dump -U outline outline > "$tmp" 2>"$err"; then
+    error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "Outline dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"
+  if ! gzip -f "$tmp"; then error "Outline gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
+  log "Outline backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_radicale() {
   log "Backing up Radicale..."
 
-  local backup_file="$BACKUP_DIR/radicale-$DATE.tar.gz"
+  local out="$BACKUP_DIR/radicale-$DATE.tar.gz"
 
-  # Tar the collections from the Docker volume
-  docker exec radicale tar czf - /data/collections > "$backup_file"
-
-  log "Radicale backup complete: radicale-$DATE.tar.gz"
+  # Tar the collections from the Docker volume. The old code ignored tar's exit
+  # AND never checked the artifact, so a failed/partial tar committed silently.
+  if ! docker exec radicale tar czf - /data/collections > "$out" 2>/dev/null; then
+    error "Radicale tar failed"; rm -f "$out"; return 1
+  fi
+  # Verify the archive is a readable, complete gzip'd tar (a truncated .tar.gz
+  # fails to list); catches a corrupt/partial write before it's committed.
+  if ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Radicale backup is not a valid tar.gz (truncated/empty)"; rm -f "$out"; return 1
+  fi
+  log "Radicale backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_claudius() {
   log "Backing up Claudius..."
 
-  local backup_file="$BACKUP_DIR/claudius-$DATE.tar.gz"
+  local out="$BACKUP_DIR/claudius-$DATE.tar.gz"
 
-  # Tar critical persistent state from the logs volume
+  # Some of these files may not exist yet; tar warns and exits non-zero but still
+  # archives whatever IS present — so we deliberately do NOT gate on tar's exit.
+  # Instead we validate the RESULT is a readable, non-empty tar.gz, which catches
+  # a truncated/corrupt write (the actual silent-loss risk) without failing the
+  # legitimate "some optional state files absent" case.
   docker exec claudius tar czf - \
     /workspace/logs/agent-state.json \
     /workspace/logs/persona-evolution.md \
     /workspace/logs/conversation.log \
     /workspace/logs/playwright-storage.json \
     /workspace/logs/initiative-state.json \
-    2>/dev/null > "$backup_file"
-
-  log "Claudius backup complete: claudius-$DATE.tar.gz"
+    2>/dev/null > "$out" || true
+  if [ ! -s "$out" ] || ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Claudius backup is not a valid/non-empty tar.gz"; rm -f "$out"; return 1
+  fi
+  log "Claudius backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 # Dumps each mautrix bridge's SQLite DB + both relay-bots' DBs to .sql.gz.
@@ -161,26 +201,50 @@ backup_matrix() {
   local any_failed=0
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
+    local tmp="$BACKUP_DIR/${name}-$DATE.sql"
+    local err="$BACKUP_DIR/${name}-$DATE.err"
     local out="$BACKUP_DIR/${name}-$DATE.sql.gz"
 
-    # Mount volume read-only; dump to stdout via the pre-built
-    # sqlite-dumper:latest image (alpine + sqlite, built by deploy_backups).
-    # The pipe to gzip happens on the host. If the dump fails or produces
-    # an empty file we remove the artifact so backup_to_github errors
-    # loudly rather than silently committing zero bytes.
+    # Dump to a PLAIN .sql first (no pipe) so sqlite3's REAL exit is seen —
+    # piping straight to gzip would mask a sqlite3 failure behind gzip's exit
+    # status, and a gzip of empty input is still a non-empty container so an
+    # `-s` size check on the .gz lies (it "passes" for a zero-row dump). Mount
+    # the volume read-only (online-safe snapshot) and capture stderr so a
+    # WAL-locked/failed read reports loudly. Mirrors backup_aiko_island.
     if ! docker run --rm -v "${volume}:/data:ro" sqlite-dumper:latest \
-      sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump 2>/dev/null \
-       | gzip > "$out"; then
-      error "${name} sqlite3 .dump failed"
-      rm -f "$out"
+         sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump > "$tmp" 2>"$err"; then
+      error "${name} sqlite3 .dump failed: $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
     fi
-    if [ ! -s "$out" ]; then
-      error "${name} dump produced empty output"
-      rm -f "$out"
+    # A COMPLETE .dump's LAST non-blank line is exactly `COMMIT;`. Check the
+    # tail end-anchored (not `grep '^COMMIT;'`): application data can embed a
+    # multiline string whose line starts `COMMIT;` and fool a whole-file grep
+    # into accepting a truncated dump. A silent empty/truncated backup is worse
+    # than none — restore would replay it over a live bridge DB.
+    local lastline
+    lastline=$(grep -ve '^[[:space:]]*$' "$tmp" | tail -n1)
+    if [ "$lastline" != "COMMIT;" ]; then
+      error "${name} dump invalid (last line '$lastline', not COMMIT; — empty/truncated): $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
+    fi
+    # Reject a structurally-valid but SCHEMALESS dump — `.dump` of an empty or
+    # wrong DB (opened fresh) ends in COMMIT; with no tables. A real bridge DB
+    # always emits CREATE TABLE; its absence means we'd back up an empty DB that
+    # restore would then replay over a live bridge (the silent-loss class moved
+    # from truncation to wrong/empty-DB — Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$tmp"; then
+      error "${name} dump has no CREATE TABLE (empty/wrong DB) — refusing"
+      rm -f "$tmp" "$err"
+      any_failed=1
+      continue
+    fi
+    rm -f "$err"
+    if ! gzip -f "$tmp"; then
+      error "${name} gzip failed (disk full?)"; rm -f "$tmp" "$out"; any_failed=1; continue
     fi
     log "  ${name} → $(basename "$out") ($(du -h "$out" | cut -f1))"
   done
@@ -239,8 +303,16 @@ backup_aiko_island() {
     rm -f "$tmp" "$err"
     return 1
   fi
+  # Schemaless-dump gate (same as backup_matrix, and MORE important here): the
+  # island DB is the SOLE copy, so a `.dump` of an empty/wrong volume ending in
+  # COMMIT; with no tables must not overwrite yesterday's good backup in the repo.
+  if ! grep -q 'CREATE TABLE' "$tmp"; then
+    error "aiko-island dump has no CREATE TABLE (empty/wrong DB) — refusing"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
   rm -f "$err"
-  gzip -f "$tmp"   # -> $out (aiko-island-$DATE.sql.gz)
+  if ! gzip -f "$tmp"; then error "aiko-island gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "aiko-island backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
@@ -330,15 +402,22 @@ backup_continuwuity() {
   # static at this point (we just produced a fresh snapshot and won't
   # call backup-database again until tomorrow), so no concurrent-write
   # concerns.
-  if ! docker run --rm -v "${backup_volume}:/data:ro" alpine \
+  # pipefail in a subshell so tar's failure propagates instead of being masked by
+  # age's exit (the pipe-masks-exit class — critical here: this tarball holds the
+  # homeserver SIGNING KEYS, so a silent-empty backup is unrecoverable identity loss).
+  if ! ( set -o pipefail; docker run --rm -v "${backup_volume}:/data:ro" alpine \
        tar czf - -C /data . 2>/dev/null \
-       | age -r "$AGE_RECIPIENT" > "$out"; then
+       | age -r "$AGE_RECIPIENT" > "$out" ); then
     error "Continuwuity tar/encrypt failed"
     rm -f "$out"
     return 1
   fi
+  # Non-empty floor: age of a failed/empty tar can still write a tiny valid-looking
+  # ciphertext; refuse it rather than commit an unrestorable signing-key backup.
+  # (Completeness beyond non-empty — meta/ race, BackupEngine layout, min-size
+  # floor — is deferred to #29.)
   if [ ! -s "$out" ]; then
-    error "Continuwuity encrypted tarball is empty"
+    error "Continuwuity encrypted tarball is empty — refusing"
     rm -f "$out"
     return 1
   fi
