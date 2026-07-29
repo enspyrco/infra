@@ -131,7 +131,11 @@ restore_pm_bot() {
 
   # Copy SQLite database into container volume
   log "Restoring database..."
-  docker cp "$BACKUP_FILE" dreamfinder:/app/data/kan-bot.db
+  # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
+  # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
+  # silently wrote a file the app ignores (a no-op restore). (#29 tracks adding a
+  # pre-overwrite validity/size check on the .db.)
+  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
   cd ~/apps/dreamfinder
@@ -248,7 +252,7 @@ _restore_island_core() {
   if ! docker run --rm -i -v "${vol}:/data" sqlite-dumper:latest sh -c '
         set -e
         rm -f /data/aiko.db.restore /data/aiko.db.restore-wal /data/aiko.db.restore-shm
-        sqlite3 /data/aiko.db.restore        # replay dump from stdin
+        sqlite3 -bail /data/aiko.db.restore  # replay dump; -bail: exit non-zero on first SQL error
         integ=$(sqlite3 /data/aiko.db.restore "PRAGMA integrity_check;")
         [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
         sqlite3 /data/aiko.db.restore ".tables" | grep -qw users || { echo "no users table in restored DB" >&2; exit 1; }
@@ -339,34 +343,99 @@ restore_matrix() {
     "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
+  # Build the sqlite helper if absent — restore may run on a box where the
+  # backup path (which builds it) has never executed. Idempotent.
+  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
+    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
+    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
+      | docker build -q -t sqlite-dumper:latest - >/dev/null \
+      || { error "failed to build sqlite-dumper:latest"; cleanup_backups; return 1; }
+  fi
+
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
-  cd ~/apps/matrix
+  cd ~/apps/matrix || { error "cannot cd ~/apps/matrix"; cleanup_backups; return 1; }
   docker compose stop
 
+  local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
     local sql_file="$BACKUP_CLONE_DIR/${name}.sql"
     if [ ! -f "$sql_file" ]; then
+      # Missing dump: skip, but track it — a silent skip under a "complete!"
+      # banner is a cousin of the old |continue bug (some bridges never touched
+      # while the run reports success). Surface it loudly at the end.
       warn "No ${name}.sql found in backup repo, skipping"
+      skipped=$((skipped+1)); skipped_names="$skipped_names $name"
       continue
     fi
 
-    log "  Restoring $name from ${name}.sql..."
-    # Replace the existing DB with a fresh one populated from the dump.
-    # Pipe SQL through stdin into sqlite3 in the sqlite-dumper container
-    # (rw mount). Removing the old WAL/SHM files first prevents stale
-    # write-ahead state corrupting the restore.
-    docker run --rm -i -v "${volume}:/data" sqlite-dumper:latest sh -c \
-      "rm -f /data/${dbfile} /data/${dbfile}-wal /data/${dbfile}-shm && \
-       sqlite3 /data/${dbfile}" < "$sql_file" || \
-      error "Restore failed for $name (continuing)"
+    # Validate the dump BEFORE the destructive path. The OLD code rm'd the live
+    # DB then replayed with a non-fatal `|| error`, so a truncated/empty dump
+    # wiped a bridge DB while the run still logged success. Now a bad dump is
+    # refused and the live DB is left intact. End-anchored COMMIT; check (not
+    # `grep '^COMMIT;'`): app data can embed a COMMIT;-prefixed line.
+    if [ ! -s "$sql_file" ]; then
+      error "$name: dump $(basename "$sql_file") is empty — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+    if [ "$(grep -ve '^[[:space:]]*$' "$sql_file" | tail -n1)" != "COMMIT;" ]; then
+      error "$name: dump looks truncated/invalid (last line not COMMIT;) — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+    # Reject a schemaless dump (valid COMMIT; but no tables — an empty/wrong DB):
+    # PRAGMA integrity_check returns ok on an empty DB, so without this the empty
+    # candidate would atomically replace a live bridge (Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$sql_file"; then
+      error "$name: dump has no CREATE TABLE (empty/wrong DB) — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+
+    log "  Restoring $name (build candidate -> integrity_check -> atomic install)..."
+    # Build + validate the replacement in a TEMP file inside the volume; only
+    # swap it in on success. Rescue the old DB (+WAL/SHM) by full copy first, so
+    # the live $dbfile is never destroyed unless a valid replacement exists.
+    # Mirrors _restore_island_core (minus the island-only users-table check —
+    # bridge schemas differ, so PRAGMA integrity_check is the generic gate).
+    local rescue; rescue="${dbfile}.rescue-$(date +%Y%m%d-%H%M%S)"
+    if ! docker run --rm -i -v "${volume}:/data" sqlite-dumper:latest sh -c '
+          set -e
+          dbfile="'"$dbfile"'"; rescue="'"$rescue"'"
+          rm -f "/data/$dbfile.restore" "/data/$dbfile.restore-wal" "/data/$dbfile.restore-shm"
+          sqlite3 -bail "/data/$dbfile.restore"      # replay dump; -bail: exit non-zero on first SQL error
+          integ=$(sqlite3 "/data/$dbfile.restore" "PRAGMA integrity_check;")
+          [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
+          # Rescue the COMPLETE old state (db + WAL/SHM) by full copy before
+          # touching it; cp failure is fatal under set -e, absence is not.
+          if [ -f "/data/$dbfile" ]; then
+            cp -p "/data/$dbfile" "/data/$rescue"
+            if [ -f "/data/$dbfile-wal" ]; then cp -p "/data/$dbfile-wal" "/data/$rescue-wal"; fi
+            if [ -f "/data/$dbfile-shm" ]; then cp -p "/data/$dbfile-shm" "/data/$rescue-shm"; fi
+          fi
+          # Remove stale sidecars BEFORE install so a fresh-from-.dump DB never
+          # sits beside a salt-mismatched WAL (SQLite corruption).
+          rm -f "/data/$dbfile-wal" "/data/$dbfile-shm"
+          # Atomic install LAST: single rename, always old-or-new, never neither.
+          mv -f "/data/$dbfile.restore" "/data/$dbfile"
+        ' < "$sql_file"; then
+      error "Restore FAILED for $name — the candidate was rejected or the install aborted. In the common case (bad dump / integrity_check fail) the failure is BEFORE any destructive step and live $dbfile is untouched; if it aborted mid-swap, the prior DB (+WAL/SHM) is preserved as $dbfile.rescue-* in the volume. Inspect the volume before retrying. Continuing with other bridges."
+      any_failed=1; continue
+    fi
+    log "  $name restored OK (previous DB kept as $dbfile.rescue-* in the volume)"
   done
 
   log "Restarting matrix stack..."
   docker compose up -d
 
   cleanup_backups
+  if [ "$any_failed" -eq 1 ]; then
+    error "Matrix restore finished with errors (see above); failed/empty bridges were skipped with their live DBs intact"
+    return 1
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    warn "Matrix restore complete for the bridges that had dumps, but ${skipped} had NO dump in the repo and were left untouched:${skipped_names}. This is an INCOMPLETE restore — confirm that's intended (fresh bridges) and not a partial/wrong backup clone."
+    return 0
+  fi
   log "Matrix restore complete!"
 }
 
