@@ -73,13 +73,25 @@ mkdir -p "$BACKUP_DIR"
 backup_kanbn() {
   log "Backing up Kan.bn..."
 
-  local backup_file="$BACKUP_DIR/kanbn-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/kanbn-$DATE.sql"
+  local err="$BACKUP_DIR/kanbn-$DATE.err"
+  local out="$BACKUP_DIR/kanbn-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec kanbn_postgres \
-    pg_dump -U kanbn kanbn | gzip > "$backup_file"
-
-  log "Kan.bn backup complete: kanbn-$DATE.sql.gz"
+  # Dump to a plain .sql first so pg_dump's REAL exit is seen — piping straight
+  # to gzip masks it behind gzip's status, silently committing a truncated/empty
+  # backup over the good one. Then require pg_dump's end-marker before gzip.
+  if ! docker exec kanbn_postgres pg_dump -U kanbn kanbn > "$tmp" 2>"$err"; then
+    error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  # A COMPLETE pg_dump plain-text dump ends with '-- PostgreSQL database dump
+  # complete' in its last few lines; its absence means truncated/empty.
+  if ! tail -n5 "$tmp" | grep -q 'PostgreSQL database dump complete'; then
+    error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"; gzip -f "$tmp"   # -> $out
+  log "Kan.bn backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_pm_bot() {
@@ -103,41 +115,63 @@ backup_pm_bot() {
 backup_outline() {
   log "Backing up Outline..."
 
-  local backup_file="$BACKUP_DIR/outline-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/outline-$DATE.sql"
+  local err="$BACKUP_DIR/outline-$DATE.err"
+  local out="$BACKUP_DIR/outline-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec outline_postgres \
-    pg_dump -U outline outline | gzip > "$backup_file"
-
-  log "Outline backup complete: outline-$DATE.sql.gz"
+  # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
+  # then require the completion marker before gzip.
+  if ! docker exec outline_postgres pg_dump -U outline outline > "$tmp" 2>"$err"; then
+    error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  if ! tail -n5 "$tmp" | grep -q 'PostgreSQL database dump complete'; then
+    error "Outline dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"; gzip -f "$tmp"   # -> $out
+  log "Outline backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_radicale() {
   log "Backing up Radicale..."
 
-  local backup_file="$BACKUP_DIR/radicale-$DATE.tar.gz"
+  local out="$BACKUP_DIR/radicale-$DATE.tar.gz"
 
-  # Tar the collections from the Docker volume
-  docker exec radicale tar czf - /data/collections > "$backup_file"
-
-  log "Radicale backup complete: radicale-$DATE.tar.gz"
+  # Tar the collections from the Docker volume. The old code ignored tar's exit
+  # AND never checked the artifact, so a failed/partial tar committed silently.
+  if ! docker exec radicale tar czf - /data/collections > "$out" 2>/dev/null; then
+    error "Radicale tar failed"; rm -f "$out"; return 1
+  fi
+  # Verify the archive is a readable, complete gzip'd tar (a truncated .tar.gz
+  # fails to list); catches a corrupt/partial write before it's committed.
+  if ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Radicale backup is not a valid tar.gz (truncated/empty)"; rm -f "$out"; return 1
+  fi
+  log "Radicale backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_claudius() {
   log "Backing up Claudius..."
 
-  local backup_file="$BACKUP_DIR/claudius-$DATE.tar.gz"
+  local out="$BACKUP_DIR/claudius-$DATE.tar.gz"
 
-  # Tar critical persistent state from the logs volume
+  # Some of these files may not exist yet; tar warns and exits non-zero but still
+  # archives whatever IS present — so we deliberately do NOT gate on tar's exit.
+  # Instead we validate the RESULT is a readable, non-empty tar.gz, which catches
+  # a truncated/corrupt write (the actual silent-loss risk) without failing the
+  # legitimate "some optional state files absent" case.
   docker exec claudius tar czf - \
     /workspace/logs/agent-state.json \
     /workspace/logs/persona-evolution.md \
     /workspace/logs/conversation.log \
     /workspace/logs/playwright-storage.json \
     /workspace/logs/initiative-state.json \
-    2>/dev/null > "$backup_file"
-
-  log "Claudius backup complete: claudius-$DATE.tar.gz"
+    2>/dev/null > "$out" || true
+  if [ ! -s "$out" ] || ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Claudius backup is not a valid/non-empty tar.gz"; rm -f "$out"; return 1
+  fi
+  log "Claudius backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 # Dumps each mautrix bridge's SQLite DB + both relay-bots' DBs to .sql.gz.
