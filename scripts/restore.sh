@@ -71,6 +71,52 @@ _validate_pg_dump() {
   return 0
 }
 
+# Build the tiny alpine+sqlite helper image if absent (idempotent — mirrors
+# backup-aiko-island-standalone.sh) so a box where the backup path never ran can
+# still validate a SQLite candidate. Shared single door for _restore_island_core
+# and _validate_sqlite_db so both paths validate identically. Returns non-zero on
+# build failure so the caller can abort with live state intact.
+_ensure_sqlite_dumper() {
+  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
+    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
+    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
+      | docker build -q -t sqlite-dumper:latest - >/dev/null \
+      || { error "failed to build sqlite-dumper:latest"; return 1; }
+  fi
+  return 0
+}
+
+# Validate a raw SQLite .db file BEFORE it overwrites live state. The 16-byte magic
+# header alone is NOT enough: a truncated/garbage file that keeps the header still
+# passes a magic check and then clobbers the live DB (cage-match #138: Carnot+Tesla).
+# So this runs the same PRAGMA integrity_check the island path uses (reads the whole
+# b-tree — truncation fails) PLUS a non-empty .tables check (rejects a schemaless/
+# wrong DB). Exact-byte header match first as a cheap pre-filter. Returns non-zero
+# so the caller aborts with the live DB untouched.
+_validate_sqlite_db() {
+  local svc="$1" f="$2"
+  if [ ! -s "$f" ]; then
+    error "$svc: $(basename "$f") is empty — refusing (live DB untouched)"; return 1
+  fi
+  # Exact 15-byte header ("SQLite format 3", the magic minus its trailing NUL) —
+  # an exact prefix match, not a substring grep that any 16 bytes containing the
+  # string would satisfy (cage-match #138: Carnot+Tesla).
+  if [ "$(head -c 15 "$f")" != "SQLite format 3" ]; then
+    error "$svc: $(basename "$f") is not a SQLite database (bad header) — refusing (live DB untouched)"; return 1
+  fi
+  _ensure_sqlite_dumper || { error "$svc: cannot validate SQLite candidate (no sqlite-dumper image) — refusing (live DB untouched)"; return 1; }
+  # integrity_check reads the entire file, so a truncated-but-header-valid DB fails
+  # here; the non-empty .tables check rejects a schemaless/wrong DB. Mount read-only.
+  if ! docker run --rm -v "$f:/candidate.db:ro" sqlite-dumper:latest sh -c '
+        integ=$(sqlite3 /candidate.db "PRAGMA integrity_check;" 2>&1) || { echo "sqlite3 failed: $integ" >&2; exit 1; }
+        [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
+        [ -n "$(sqlite3 /candidate.db ".tables" 2>/dev/null)" ] || { echo "no tables (schemaless/wrong DB)" >&2; exit 1; }
+      '; then
+    error "$svc: $(basename "$f") failed SQLite integrity_check (truncated/corrupt/schemaless) — refusing (live DB untouched)"; return 1
+  fi
+  return 0
+}
+
 restore_kanbn() {
   log "Restoring Kan.bn..."
 
@@ -166,17 +212,11 @@ restore_pm_bot() {
 
   # Copy SQLite database into container volume
   log "Restoring database..."
-  # Validate before overwriting the live DB: non-empty AND a real SQLite file
-  # (magic header "SQLite format 3"). A truncated/empty/wrong backup must not
-  # clobber the live bot.db.
-  if [ ! -s "$BACKUP_FILE" ]; then
-    error "Dreamfinder restore: $BACKUP_FILE is empty — refusing (live DB untouched)"
-    cleanup_backups; exit 1
-  fi
-  if ! head -c 16 "$BACKUP_FILE" | grep -aq 'SQLite format 3'; then
-    error "Dreamfinder restore: $BACKUP_FILE is not a SQLite database (bad magic) — refusing (live DB untouched)"
-    cleanup_backups; exit 1
-  fi
+  # Validate before overwriting the live DB: non-empty, exact SQLite header, AND
+  # a full PRAGMA integrity_check + non-empty schema (see _validate_sqlite_db). A
+  # header-only check would let a truncated-but-header-valid backup clobber the live
+  # bot.db — the same content-sentinel the island/matrix paths already enforce.
+  _validate_sqlite_db "Dreamfinder restore" "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
   # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
@@ -205,9 +245,21 @@ restore_radicale() {
 
   # Validate the archive BEFORE the destructive rm — a truncated/corrupt tar must
   # not reach `rm -rf /data/collections` (which would leave collections gone with
-  # nothing to extract). `tar tf` reads the whole archive, so truncation fails here.
-  if ! tar tf "$BACKUP_FILE" >/dev/null 2>&1; then
+  # nothing to extract). Two gates, because `tar tf` checks the CARRIER not the
+  # PAYLOAD (cage-match #138, Tesla): a well-formed EMPTY tar, or a valid tar of the
+  # WRONG tree, lists fine and would still let the rm wipe collections with nothing
+  # useful to restore.
+  #   1. Readable/complete archive (truncation fails a full listing).
+  local radicale_members
+  if ! radicale_members=$(tar tf "$BACKUP_FILE" 2>/dev/null); then
     error "Radicale restore: $BACKUP_FILE is not a valid/complete tar — refusing (collections untouched)"
+    cleanup_backups; exit 1
+  fi
+  #   2. Content sentinel: at least one member under data/collections (backup.sh
+  #      tars `docker exec radicale tar czf - /data/collections`, so a real archive
+  #      lists data/collections[/...]). An empty or wrong-tree tar fails here.
+  if ! printf '%s\n' "$radicale_members" | grep -q '^data/collections'; then
+    error "Radicale restore: $BACKUP_FILE has no data/collections members (empty/wrong-tree tar) — refusing (collections untouched)"
     cleanup_backups; exit 1
   fi
 
@@ -216,7 +268,10 @@ restore_radicale() {
   cd ~/apps/radicale
   docker compose stop radicale
 
-  # Restore collections into the volume. Validated above, so the rm is safe.
+  # Restore collections into the volume. Content-validated above (readable tar with
+  # real collections members), so the rm won't wipe live data with nothing to
+  # restore. NOTE: the in-container extract itself is not yet atomic (a mid-extract
+  # failure after the rm leaves a partial tree) — stage-to-temp-then-swap is Phase 2.
   log "Restoring collections..."
   docker compose run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
     -c "rm -rf /data/collections && tar xf /restore.tar -C /"
@@ -241,10 +296,21 @@ restore_claudius() {
     exit 1
   fi
 
-  # Validate the archive before extracting over live state (extract is additive,
-  # lower-risk than a rm, but a corrupt tar should still be refused loudly).
-  if ! tar tf "$BACKUP_FILE" >/dev/null 2>&1; then
+  # Validate the archive before extracting over live state. Extract is additive
+  # (no rm), so the blast is lower than radicale — but an empty/wrong-tree tar
+  # would still "restore" nothing silently, exactly the no-op class this PR fights.
+  # So carrier + payload here too, symmetric with radicale (cage-match #138, Tesla):
+  #   1. Readable/complete archive.
+  local claudius_members
+  if ! claudius_members=$(tar tf "$BACKUP_FILE" 2>/dev/null); then
     error "Claudius restore: $BACKUP_FILE is not a valid/complete tar — refusing"
+    cleanup_backups; exit 1
+  fi
+  #   2. Content sentinel: at least one workspace/ member (backup.sh tars
+  #      /workspace/... paths). An empty/wrong-tree tar fails here rather than
+  #      extracting nothing and reporting success.
+  if ! printf '%s\n' "$claudius_members" | grep -q '^workspace/'; then
+    error "Claudius restore: $BACKUP_FILE has no workspace/ members (empty/wrong-tree tar) — refusing"
     cleanup_backups; exit 1
   fi
 
@@ -292,14 +358,9 @@ _restore_island_core() {
   fi
 
   # The island image ships no sqlite3; build the tiny alpine+sqlite helper if
-  # absent (idempotent — mirrors backup-aiko-island-standalone.sh) so restore
-  # works on a box where the backup path has never run.
-  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
-    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-      | docker build -q -t sqlite-dumper:latest - >/dev/null \
-      || { error "failed to build sqlite-dumper:latest"; return 1; }
-  fi
+  # absent (shared _ensure_sqlite_dumper, also used by _validate_sqlite_db) so
+  # restore works on a box where the backup path has never run.
+  _ensure_sqlite_dumper || return 1
 
   log "Stopping island container $cid..."
   docker stop "$cid" >/dev/null || { error "failed to stop container $cid"; return 1; }
