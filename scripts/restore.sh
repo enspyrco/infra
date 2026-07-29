@@ -131,7 +131,11 @@ restore_pm_bot() {
 
   # Copy SQLite database into container volume
   log "Restoring database..."
-  docker cp "$BACKUP_FILE" dreamfinder:/app/data/kan-bot.db
+  # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
+  # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
+  # silently wrote a file the app ignores (a no-op restore). (#29 tracks adding a
+  # pre-overwrite validity/size check on the .db.)
+  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
   cd ~/apps/dreamfinder
@@ -375,6 +379,13 @@ restore_matrix() {
       error "$name: dump looks truncated/invalid (last line not COMMIT;) — skipping (live DB untouched)"
       any_failed=1; continue
     fi
+    # Reject a schemaless dump (valid COMMIT; but no tables — an empty/wrong DB):
+    # PRAGMA integrity_check returns ok on an empty DB, so without this the empty
+    # candidate would atomically replace a live bridge (Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$sql_file"; then
+      error "$name: dump has no CREATE TABLE (empty/wrong DB) — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
 
     log "  Restoring $name (build candidate -> integrity_check -> atomic install)..."
     # Build + validate the replacement in a TEMP file inside the volume; only
@@ -403,7 +414,7 @@ restore_matrix() {
           # Atomic install LAST: single rename, always old-or-new, never neither.
           mv -f "/data/$dbfile.restore" "/data/$dbfile"
         ' < "$sql_file"; then
-      error "Restore FAILED for $name — candidate rejected before install, live $dbfile unchanged (rescue copy $dbfile.rescue-* in the volume if the swap had started). Continuing with other bridges."
+      error "Restore FAILED for $name — the candidate was rejected or the install aborted. In the common case (bad dump / integrity_check fail) the failure is BEFORE any destructive step and live $dbfile is untouched; if it aborted mid-swap, the prior DB (+WAL/SHM) is preserved as $dbfile.rescue-* in the volume. Inspect the volume before retrying. Continuing with other bridges."
       any_failed=1; continue
     fi
     log "  $name restored OK (previous DB kept as $dbfile.rescue-* in the volume)"

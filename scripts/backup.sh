@@ -84,13 +84,18 @@ backup_kanbn() {
     error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  # A COMPLETE pg_dump plain-text dump ends with '-- PostgreSQL database dump
-  # complete' in its last few lines; its absence means truncated/empty.
-  if ! tail -n5 "$tmp" | grep -q 'PostgreSQL database dump complete'; then
+  # A COMPLETE pg_dump plain-text dump ends with the EXACT line
+  # '-- PostgreSQL database dump complete'. Anchor on the whole line (grep -qxF),
+  # not a loose substring, so a data row near EOF can't fake completeness after a
+  # truncation (same end-anchoring discipline as the sqlite COMMIT; check).
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
     error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
-  rm -f "$err"; gzip -f "$tmp"   # -> $out
+  rm -f "$err"
+  # Check gzip's own exit — a failed compress (ENOSPC/SIGKILL) must not leave the
+  # function logging success with a missing/partial .gz (pipe-masks-exit reborn).
+  if ! gzip -f "$tmp"; then error "Kan.bn gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "Kan.bn backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
@@ -125,11 +130,12 @@ backup_outline() {
     error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  if ! tail -n5 "$tmp" | grep -q 'PostgreSQL database dump complete'; then
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
     error "Outline dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
-  rm -f "$err"; gzip -f "$tmp"   # -> $out
+  rm -f "$err"
+  if ! gzip -f "$tmp"; then error "Outline gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "Outline backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
@@ -225,8 +231,21 @@ backup_matrix() {
       any_failed=1
       continue
     fi
+    # Reject a structurally-valid but SCHEMALESS dump — `.dump` of an empty or
+    # wrong DB (opened fresh) ends in COMMIT; with no tables. A real bridge DB
+    # always emits CREATE TABLE; its absence means we'd back up an empty DB that
+    # restore would then replay over a live bridge (the silent-loss class moved
+    # from truncation to wrong/empty-DB — Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$tmp"; then
+      error "${name} dump has no CREATE TABLE (empty/wrong DB) — refusing"
+      rm -f "$tmp" "$err"
+      any_failed=1
+      continue
+    fi
     rm -f "$err"
-    gzip -f "$tmp"   # -> $out (${name}-$DATE.sql.gz)
+    if ! gzip -f "$tmp"; then
+      error "${name} gzip failed (disk full?)"; rm -f "$tmp" "$out"; any_failed=1; continue
+    fi
     log "  ${name} → $(basename "$out") ($(du -h "$out" | cut -f1))"
   done
 
@@ -285,7 +304,7 @@ backup_aiko_island() {
     return 1
   fi
   rm -f "$err"
-  gzip -f "$tmp"   # -> $out (aiko-island-$DATE.sql.gz)
+  if ! gzip -f "$tmp"; then error "aiko-island gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "aiko-island backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
@@ -375,12 +394,20 @@ backup_continuwuity() {
   # static at this point (we just produced a fresh snapshot and won't
   # call backup-database again until tomorrow), so no concurrent-write
   # concerns.
-  if ! docker run --rm -v "${backup_volume}:/data:ro" alpine \
+  # pipefail in a subshell so tar's failure propagates instead of being masked by
+  # age's exit (the pipe-masks-exit class — critical here: this tarball holds the
+  # homeserver SIGNING KEYS, so a silent-empty backup is unrecoverable identity loss).
+  if ! ( set -o pipefail; docker run --rm -v "${backup_volume}:/data:ro" alpine \
        tar czf - -C /data . 2>/dev/null \
-       | age -r "$AGE_RECIPIENT" > "$out"; then
+       | age -r "$AGE_RECIPIENT" > "$out" ); then
     error "Continuwuity tar/encrypt failed"
     rm -f "$out"
     return 1
+  fi
+  # Non-empty floor: age of a failed/empty tar can still write a tiny valid-looking
+  # ciphertext; refuse it rather than commit an unrestorable signing-key backup.
+  if [ ! -s "$out" ]; then
+    error "Continuwuity backup is empty — refusing"; rm -f "$out"; return 1
   fi
   if [ ! -s "$out" ]; then
     error "Continuwuity encrypted tarball is empty"
