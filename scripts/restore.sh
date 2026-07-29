@@ -252,7 +252,7 @@ _restore_island_core() {
   if ! docker run --rm -i -v "${vol}:/data" sqlite-dumper:latest sh -c '
         set -e
         rm -f /data/aiko.db.restore /data/aiko.db.restore-wal /data/aiko.db.restore-shm
-        sqlite3 /data/aiko.db.restore        # replay dump from stdin
+        sqlite3 -bail /data/aiko.db.restore  # replay dump; -bail: exit non-zero on first SQL error
         integ=$(sqlite3 /data/aiko.db.restore "PRAGMA integrity_check;")
         [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
         sqlite3 /data/aiko.db.restore ".tables" | grep -qw users || { echo "no users table in restored DB" >&2; exit 1; }
@@ -357,12 +357,16 @@ restore_matrix() {
   cd ~/apps/matrix || { error "cannot cd ~/apps/matrix"; cleanup_backups; return 1; }
   docker compose stop
 
-  local any_failed=0
+  local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
     local sql_file="$BACKUP_CLONE_DIR/${name}.sql"
     if [ ! -f "$sql_file" ]; then
+      # Missing dump: skip, but track it — a silent skip under a "complete!"
+      # banner is a cousin of the old |continue bug (some bridges never touched
+      # while the run reports success). Surface it loudly at the end.
       warn "No ${name}.sql found in backup repo, skipping"
+      skipped=$((skipped+1)); skipped_names="$skipped_names $name"
       continue
     fi
 
@@ -398,7 +402,7 @@ restore_matrix() {
           set -e
           dbfile="'"$dbfile"'"; rescue="'"$rescue"'"
           rm -f "/data/$dbfile.restore" "/data/$dbfile.restore-wal" "/data/$dbfile.restore-shm"
-          sqlite3 "/data/$dbfile.restore"            # replay dump from stdin
+          sqlite3 -bail "/data/$dbfile.restore"      # replay dump; -bail: exit non-zero on first SQL error
           integ=$(sqlite3 "/data/$dbfile.restore" "PRAGMA integrity_check;")
           [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
           # Rescue the COMPLETE old state (db + WAL/SHM) by full copy before
@@ -427,6 +431,10 @@ restore_matrix() {
   if [ "$any_failed" -eq 1 ]; then
     error "Matrix restore finished with errors (see above); failed/empty bridges were skipped with their live DBs intact"
     return 1
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    warn "Matrix restore complete for the bridges that had dumps, but ${skipped} had NO dump in the repo and were left untouched:${skipped_names}. This is an INCOMPLETE restore — confirm that's intended (fresh bridges) and not a partial/wrong backup clone."
+    return 0
   fi
   log "Matrix restore complete!"
 }

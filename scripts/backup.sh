@@ -303,6 +303,14 @@ backup_aiko_island() {
     rm -f "$tmp" "$err"
     return 1
   fi
+  # Schemaless-dump gate (same as backup_matrix, and MORE important here): the
+  # island DB is the SOLE copy, so a `.dump` of an empty/wrong volume ending in
+  # COMMIT; with no tables must not overwrite yesterday's good backup in the repo.
+  if ! grep -q 'CREATE TABLE' "$tmp"; then
+    error "aiko-island dump has no CREATE TABLE (empty/wrong DB) — refusing"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
   rm -f "$err"
   if ! gzip -f "$tmp"; then error "aiko-island gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "aiko-island backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
@@ -406,11 +414,10 @@ backup_continuwuity() {
   fi
   # Non-empty floor: age of a failed/empty tar can still write a tiny valid-looking
   # ciphertext; refuse it rather than commit an unrestorable signing-key backup.
+  # (Completeness beyond non-empty — meta/ race, BackupEngine layout, min-size
+  # floor — is deferred to #29.)
   if [ ! -s "$out" ]; then
-    error "Continuwuity backup is empty — refusing"; rm -f "$out"; return 1
-  fi
-  if [ ! -s "$out" ]; then
-    error "Continuwuity encrypted tarball is empty"
+    error "Continuwuity encrypted tarball is empty — refusing"
     rm -f "$out"
     return 1
   fi
