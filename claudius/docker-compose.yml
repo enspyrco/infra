@@ -1,7 +1,7 @@
 # Claudius Maximus — headless email-polling Claude Code agent.
 #
 # Source is rsynced from ~/git/experiments/containerized-claude/claudius-maximus-container/
-# by deploy-to.sh. This file lives in imagineering-infra for consistent deployment.
+# by deploy-to.sh. This file lives in enspyrco/infra for consistent deployment.
 #
 # Deploy: ./scripts/deploy-to.sh 149.118.69.221 claudius
 
