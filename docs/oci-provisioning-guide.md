@@ -2,7 +2,7 @@
 
 This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately capable machines (2 CPU cores, 12GB RAM) and they're **free** on Oracle's Always Free tier.
 
-> ⚠️ **Oracle halved the Ampere allowance on 15 June 2026**, from 4 OCPU / 24 GB to **2 OCPU / 12 GB**, with no announcement — just a docs edit. This guide reflects the post-halving numbers. Two consequences worth knowing before you start:
+> ⚠️ **Oracle halved the Ampere allowance on 15 June 2026**, from 4 OCPU / 24 GB to **2 OCPU / 12 GB**, with no announcement — just a docs edit. This guide reflects the post-halving numbers.
 
 The catch? Everyone wants one, so they're almost always "out of capacity." Hence the retry script — it tries every 5 minutes until one slips through.
 
@@ -243,14 +243,28 @@ This creates a key pair. The script will pass the public key to Oracle when crea
 
 ## Step 6: Install Dependencies
 
-On your local machine:
+The script needs three tools on the machine you're running it from: **jq** (parses OCI's JSON), **yq** (reads `accounts.yaml`), and **bc** (compares OCPU counts).
+
+**Linux (Debian/Ubuntu):**
 
 ```bash
-# jq for parsing JSON responses from OCI
 sudo apt-get install -y jq bc
-
-# yq for parsing the accounts config file
 pip3 install yq
+```
+
+**macOS:**
+
+```bash
+brew install jq          # bc ships with macOS already
+pip3 install yq          # NOT `brew install yq` — see the warning below
+```
+
+> ⚠️ **On macOS, do not `brew install yq`.** Homebrew's `yq` is the **Go** implementation (mikefarah), which uses different syntax. The script calls `yq -r '.accounts | length'`, which is **python-yq** (a `jq` wrapper) syntax — the Go version errors on it, and provisioning dies at the dependency check with `ERROR: yq not installed` or a parse error. Always install yq with `pip3 install yq`. If Homebrew's yq is already on your PATH, either remove it (`brew uninstall yq`) or make sure the pip one wins — check with `yq --help | head -1`: python-yq says *"yq: Command-line YAML/XML processor"*, the Go one says *"a lightweight and portable command-line YAML processor"*.
+
+Verify all three resolve:
+
+```bash
+jq --version && yq --version && bc --version | head -1
 ```
 
 ---
@@ -269,11 +283,10 @@ chmod +x ~/oci-provision/retry-provision.sh
 
 Keep `retry-provision` in the filename — the auto-disable step runs `crontab -l | grep -v "retry-provision" | crontab -`, so renaming it silently breaks the "stop when finished" behaviour.
 
-**Now edit your copy — three lines matter:**
+**Now edit your copy — two lines matter:**
 
 | Line | Ships as | Change to | Why |
 |---|---|---|---|
-| `FULL_OCPUS` / `FULL_MEM` (~L19-20) | `4` / `24` | **`2`** / **`12`** | Post-15-Jun-2026 Arm allowance. Leave it at 4/24 on a new tenancy and the resize can never succeed, so the script never reaches "full", never self-disables, and retries a doomed API call every 5 minutes forever. |
 | `SSH_KEY_PATH` (~L14) | `~/.ssh/id_ed25519.pub` | your actual **SSH public key** | Baked into the instance at launch and your *only* way in. A wrong path fails the launch; a stale key gives you a box you can't log into. Must be an SSH public key (`ssh-ed25519 AAAA…`), **not** an OCI API key. |
 | `--boot-volume-size-in-gbs` (~L153) | `50` | **`100`** (up to 200) | 200 GB is your whole-tenancy volume budget and it's free. Growing later works online, but there's no reason to defer it. |
 
@@ -388,7 +401,7 @@ oci network public-ip list --scope AVAILABILITY_DOMAIN \
   --availability-domain "<Xxxx:REGION-AD-1>" \
   --compartment-id "<your-tenancy-ocid>" \
   | jq -r '.data[] | "\(.["ip-address"])  lifetime=\(.lifetime)"'
-  
+
 # lifetime=EPHEMERAL  → not permanent yet, do the rest of this step
 # lifetime=RESERVED   → already done
 ```
