@@ -8,7 +8,7 @@
 #
 # Why /tmp/backups/ rather than the GitHub repo: backup.sh is run by user
 # `nick` (per /etc/cron.d/xdeca-backup) and uses an SSH deploy key in
-# /home/nick/.ssh/config. Querying GitHub from ubuntu's context would
+# the deploy user's ~/.ssh/config. Querying GitHub from ubuntu's context would
 # need either an additional PAT or sudo -u nick gymnastics. The local
 # artifacts are written to /tmp/backups/ as part of the same backup run
 # (mode 0664, world-readable), which ubuntu can stat without privilege.

@@ -51,6 +51,38 @@ age-keygen -o ~/.config/sops/age/keys.txt
 ./scripts/deploy-to.sh 149.118.69.221 all
 ```
 
+### 3. Deploying to a different host
+
+The defaults target the Sydney box, so the command above is unchanged. A second
+host overrides only what differs, via the environment:
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `DEPLOY_USER` | `nick` | ssh user on the target host. Also used for file ownership (`/opt/scripts`, the `/etc/imagineering-secrets/*.env` group) and as the cron user. |
+| `REMOTE_HOME` | `/home/$DEPLOY_USER` | Where host-side bind-mount sources live — `whisper.cpp`, `piper`, `kokoro`, `~/apps/{site,invite,galaxy}`, ssh deploy keys — and where cron writes logs. |
+| `DOCKER_HOST_IP` | `192.168.32.1` | The host's docker bridge gateway, mapped to `host.docker.internal`. Find it with `ip -4 addr show docker0`. |
+| `TURN_DOMAIN` | `turn.imagineering.cc` | Hostname on the TURN/TLS certificate LiveKit presents. |
+| `EDF_SRC` | `~/git/orgs/imagineering/dreamfinder-avatar` | Local checkout of the avatar app. |
+
+```bash
+DEPLOY_USER=<user> DOCKER_HOST_IP=<bridge-gw> TURN_DOMAIN=turn.example.org \
+  ./scripts/deploy-to.sh <host> dreamfinder-avatar
+```
+
+`<host>` is an IP or an `~/.ssh/config` alias — prefer the alias. Host addresses
+are deliberately **not** recorded in this repo; it is public, and an
+address-to-service map is reconnaissance. Keep them in your `~/.ssh/config`.
+
+`REMOTE_HOME` follows `DEPLOY_USER`, so setting the user alone is usually
+enough. Compose files carry the same defaults inline, and `deploy-to.sh` writes
+the resolved values into the deployed `.env` — so a manual `docker compose up`
+on the box behaves the same as a scripted deploy.
+
+**A wrong `REMOTE_HOME` fails silently at the Docker layer** — a missing bind
+source is created as an empty directory and the container starts anyway. The
+avatar deploy therefore preflights all six local-audio mounts on the remote and
+aborts before building if any is absent.
+
 ## Repository Structure
 
 ```

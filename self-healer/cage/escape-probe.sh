@@ -29,6 +29,12 @@ chmod 0777 "$WORKDIR"
 # the SAME allowlist the real green-auto deploy uses (cage/README.md "Inference host").
 ALLOW_HOSTS="api.github.com,.github.com,api.anthropic.com"
 
+# Host path the fs-host-secret assertion probes for. This is a HOST path (the
+# probe asserts it is NOT reachable from inside the cage), so it follows the
+# deploy user's home. The literal fallback keeps the old behaviour when HOME is
+# unset (e.g. under a systemd unit without User=).
+HOST_SELF_HEALER_ENV="${HOST_SELF_HEALER_ENV:-${HOME:-/home/nick}/apps/self-healer.env}"
+
 pass=0; fail=0
 ok()   { echo "  ✅ $1"; pass=$((pass+1)); }
 bad()  { echo "  ❌ $1"; fail=$((fail+1)); }
@@ -125,7 +131,7 @@ if cage sh -c 'cat /etc/shadow' >/dev/null 2>&1; then
 else
   ok "fs-host-secret: /etc/shadow not readable"
 fi
-if cage sh -c 'cat /home/nick/apps/self-healer.env' >/dev/null 2>&1; then
+if cage sh -c "cat $HOST_SELF_HEALER_ENV" >/dev/null 2>&1; then
   bad "fs-host-secret: read host self-healer.env (HOST FS LEAKED IN)"
 else
   ok "fs-host-secret: host self-healer.env not present"

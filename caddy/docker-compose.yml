@@ -8,9 +8,13 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-      - /home/nick/apps/site:/srv/site:ro
-      - /home/nick/apps/invite:/srv/invite:ro
-      - /home/nick/apps/galaxy:/srv/galaxy:ro
+      # Static sites rsynced to the deploy user's ~/apps by deploy_site /
+      # deploy_invite / deploy_galaxy. REMOTE_HOME must match the user those
+      # functions deploy as; deploy-to.sh writes the resolved value to .env
+      # beside this file, and the default is Sydney's `nick` home.
+      - ${REMOTE_HOME:-/home/nick}/apps/site:/srv/site:ro
+      - ${REMOTE_HOME:-/home/nick}/apps/invite:/srv/invite:ro
+      - ${REMOTE_HOME:-/home/nick}/apps/galaxy:/srv/galaxy:ro
       - /srv/tech-world:/srv/tech-world:ro
 
 volumes:

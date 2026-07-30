@@ -20,7 +20,9 @@
 set -euo pipefail
 
 SVC="${1:?usage: deploy.sh <service>}"
-APP_DIR="${APP_DIR:-/home/nick/apps/$SVC}"
+# Runs on the host as the deploy user, so $HOME is the right default. The
+# literal fallback keeps the old behaviour if systemd starts this without HOME.
+APP_DIR="${APP_DIR:-${HOME:-/home/nick}/apps/$SVC}"
 # The compose service name may differ from the bus/instance name; default to
 # the same. Override via /etc/cd-bus/$SVC.env if the compose service differs.
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-$SVC}"

@@ -31,7 +31,9 @@ SVC="${1:?usage: subscribe.sh <service> (the systemd instance %i)}"
 #   HEALTHY_MIN_SECS hold >= this before a relay-closed stream counts healthy
 BUS_URL="${BUS_URL:-https://cd-bus.imagineering.cc}"
 SUBSCRIBE_TOKEN="${SUBSCRIBE_TOKEN:-}"
-APP_DIR="${APP_DIR:-/home/nick/apps/$SVC}"
+# Runs on the host as the deploy user, so $HOME is the right default. The
+# literal fallback keeps the old behaviour if systemd starts this without HOME.
+APP_DIR="${APP_DIR:-${HOME:-/home/nick}/apps/$SVC}"
 STATE="$APP_DIR/.cd-bus-last-event-id"
 DEPLOY="${DEPLOY:-/opt/cd-bus/deploy.sh}"
 HEALTHY_MIN_SECS="${HEALTHY_MIN_SECS:-60}"

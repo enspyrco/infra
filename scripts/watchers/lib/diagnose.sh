@@ -127,7 +127,7 @@ strip_ansi() {
 # placeholder so the watcher still fires its primary alert.
 
 # tail_backup_log
-#   Last 50 lines of /home/nick/logs/backup.log, ANSI-stripped.
+#   Last 50 lines of the deploy user's ~/logs/backup.log, ANSI-stripped.
 #   Distinguishes "backup ran but failed" from "backup never started" —
 #   the most useful single addition to backup-recency alerts.
 tail_backup_log() {

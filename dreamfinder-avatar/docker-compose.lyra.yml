@@ -26,7 +26,7 @@
 #   1. dreamfinder-avatar PR #65 merged into the deployed app branch (so the
 #      StrictHostKeyChecking=yes consuming code is actually built).
 #   2. The pinned host key generated ONCE on the deploy host:
-#          ssh-keyscan 207.211.145.30 > /home/nick/.ssh/lyra-known_hosts
+#          ssh-keyscan 207.211.145.30 > "$REMOTE_HOME"/.ssh/lyra-known_hosts
 #   3. DF_BRAIN=lyra-live set (which applies THIS override; see deploy-to.sh).
 # If the host file is missing/empty, the mount surfaces an empty/absent
 # known_hosts and StrictHostKeyChecking=yes makes ssh REFUSE the hop (fail
@@ -38,8 +38,9 @@ services:
     volumes:
       # Deploy key for the lyra-live ssh hop (read-only). Present ONLY when this
       # override is applied — i.e. only in lyra-live mode.
-      - /home/nick/.ssh/lyra-deploy:/app/.ssh/lyra-deploy:ro
+      # REMOTE_HOME matches the base compose file; default is Sydney's.
+      - ${REMOTE_HOME:-/home/nick}/.ssh/lyra-deploy:/app/.ssh/lyra-deploy:ro
       # Pinned host key (known_hosts) the JS verifies robins-oci against — the
       # server-identity half of the auth. Generate on the host with the
       # ssh-keyscan above before enabling lyra-live (fail-closed if absent).
-      - /home/nick/.ssh/lyra-known_hosts:/app/.ssh/known_hosts:ro
+      - ${REMOTE_HOME:-/home/nick}/.ssh/lyra-known_hosts:/app/.ssh/known_hosts:ro

@@ -8,8 +8,14 @@ services:
       - "3015:3000"
     networks:
       - imagineering
+    # The host's docker bridge gateway, so the container can reach a service
+    # bound on the host (the brain's default BRAIN_URL points here). This is
+    # per-host — find it with `ip -4 addr show docker0` — and the default is
+    # Sydney's. Unlike the stage selectors below, a default is correct here: an
+    # empty value makes compose emit a malformed extra_hosts entry rather than
+    # anything diagnosable. deploy-to.sh writes the resolved value into .env.
     extra_hosts:
-      - "host.docker.internal:192.168.32.1"
+      - "host.docker.internal:${DOCKER_HOST_IP:-192.168.32.1}"
     environment:
       - AUTH_PASSWORD=${AUTH_PASSWORD:-}
       - AUTH_SECRET=${AUTH_SECRET:-}
@@ -68,12 +74,19 @@ services:
       - INTERNAL_SCOPE_KEY=${INTERNAL_SCOPE_KEY:-}
     volumes:
       - dreamfinder-avatar-data:/data
-      - /home/nick/whisper.cpp/build/bin:/opt/whisper/bin:ro
-      - /home/nick/whisper.cpp/build/src:/opt/whisper/lib:ro
-      - /home/nick/whisper.cpp/build/ggml/src:/opt/whisper/ggml-lib:ro
-      - /home/nick/whisper.cpp/models:/opt/whisper/models:ro
-      - /home/nick/piper:/opt/piper:ro
-      - /home/nick/kokoro:/opt/kokoro:ro
+      # Local-audio (whisper.cpp / piper / kokoro) binaries and models, built on
+      # the host rather than baked into the image. REMOTE_HOME is where they
+      # live; the default is Sydney's `nick` home. A WRONG value here fails
+      # SILENTLY — docker creates the missing source as an empty directory and
+      # the container starts with a dead local-audio path — so deploy-to.sh
+      # checks all six exist on the remote before building
+      # (check_remote_mounts). Keep that check in sync with this list.
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/bin:/opt/whisper/bin:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/src:/opt/whisper/lib:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/ggml/src:/opt/whisper/ggml-lib:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/models:/opt/whisper/models:ro
+      - ${REMOTE_HOME:-/home/nick}/piper:/opt/piper:ro
+      - ${REMOTE_HOME:-/home/nick}/kokoro:/opt/kokoro:ro
       # NOTE: the lyra-live ssh deploy key is intentionally NOT mounted here.
       # It is added by docker-compose.lyra.yml only when DF_BRAIN=lyra-live, so
       # the default (api) container never holds the key. See that file + the

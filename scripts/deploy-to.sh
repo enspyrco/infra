@@ -18,7 +18,66 @@ fi
 IP=$1
 SERVICE=${2:-all}
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REMOTE="nick@$IP"
+
+# ---------------------------------------------------------------------------
+# Per-host configuration.
+#
+# Every value here was previously hardcoded to the Sydney box (149.118.69.221).
+# The defaults reproduce that host exactly, so an existing deploy is unchanged
+# by this block; a second host overrides what differs via the environment.
+#
+# These are host-SHAPE facts (who to ssh as, where bind-mount sources live,
+# what the docker bridge gateway is), not pipeline selectors. That distinction
+# matters: dreamfinder-avatar/docker-compose.yml deliberately refuses to default
+# STT/BRAIN/TTS because a wrong substrate must crash the boot. A wrong host path
+# can't be caught that way — it mounts an empty directory and the container
+# starts fine — so it gets a default plus the preflight check in
+# check_remote_mounts() below.
+#
+#   DEPLOY_USER     ssh user on the target host.
+#   REMOTE_HOME     Where host-side bind-mount sources live (whisper.cpp, piper,
+#                   kokoro, ssh deploy keys). Derived from DEPLOY_USER so setting
+#                   the user alone is usually enough.
+#   DOCKER_HOST_IP  The host's docker bridge gateway, mapped to
+#                   host.docker.internal so a container can reach a service on
+#                   the host. Find it with: ip -4 addr show docker0
+#   TURN_DOMAIN     Hostname on the TURN/TLS certificate LiveKit presents.
+# ---------------------------------------------------------------------------
+DEPLOY_USER="${DEPLOY_USER:-nick}"
+REMOTE_HOME="${REMOTE_HOME:-/home/$DEPLOY_USER}"
+DOCKER_HOST_IP="${DOCKER_HOST_IP:-192.168.32.1}"
+TURN_DOMAIN="${TURN_DOMAIN:-turn.imagineering.cc}"
+
+REMOTE="$DEPLOY_USER@$IP"
+
+# Verify host paths a compose file is about to bind-mount actually exist on the
+# remote, BEFORE building. Docker silently creates a missing bind source as an
+# empty directory and starts the container anyway, so a wrong REMOTE_HOME
+# otherwise surfaces as a mute avatar rather than a deploy error.
+#
+# Usage: check_remote_mounts <label> <path>...
+check_remote_mounts() {
+    local label=$1
+    shift
+    local missing=()
+    local p
+    for p in "$@"; do
+        if ! ssh "$REMOTE" "test -e '$p'" 2>/dev/null; then
+            missing+=("$p")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: $label — these bind-mount sources do not exist on $REMOTE:" >&2
+        for p in "${missing[@]}"; do
+            echo "  $p" >&2
+        done
+        echo "" >&2
+        echo "Docker would create them as empty directories and the container would" >&2
+        echo "start with a broken mount. Either build/install them on the host, or" >&2
+        echo "set REMOTE_HOME to where they live (currently: $REMOTE_HOME)." >&2
+        return 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Secret-safe value quoting helpers (defense-in-depth).
@@ -113,12 +172,12 @@ deploy_scripts() {
         chmod 0600 "$SECRETS_TMP"
         scp -q "$SECRETS_TMP" "$REMOTE":/tmp/telegram.env
         ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
-            sudo install -m 0640 -o root -g nick /tmp/telegram.env /etc/imagineering-secrets/telegram.env && \
+            sudo install -m 0640 -o root -g $DEPLOY_USER /tmp/telegram.env /etc/imagineering-secrets/telegram.env && \
             rm -f /tmp/telegram.env"
         rm -f "$SECRETS_TMP"
         # Restore the prior EXIT trap (empty string clears, if none existed).
         eval "${SECRETS_PREV_TRAP:-trap - EXIT}"
-        echo "  Telegram envfile installed (mode 0640 root:nick)"
+        echo "  Telegram envfile installed (mode 0640 root:$DEPLOY_USER)"
     else
         echo "NOTE: No Telegram credentials in backups/secrets.yaml — alerts disabled"
         echo "  Add telegram_bot_token, telegram_chat_id, telegram_thread_id to enable alerts"
@@ -131,7 +190,7 @@ deploy_scripts() {
         'SHELL=/bin/bash' \
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
         'MAILTO=' \
-        '0 * * * * nick /opt/scripts/health-check.sh >> /home/nick/logs/health-check.log 2>&1' \
+        \"0 * * * * $DEPLOY_USER /opt/scripts/health-check.sh >> $REMOTE_HOME/logs/health-check.log 2>&1\" \
         | sudo tee /etc/cron.d/health-check > /dev/null && \
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
     echo "Health check cron installed (hourly)"
@@ -143,7 +202,7 @@ deploy_site() {
     # imagineering.cc landing page. Source: separate website/ repo.
     #
     # Destination is ~/apps/site (NOT /srv/site) — the Caddy container
-    # bind-mounts /home/nick/apps/site -> /srv/site:ro at the path the
+    # bind-mounts $REMOTE_HOME/apps/site -> /srv/site:ro at the path the
     # Caddyfile references. See caddy/docker-compose.yml. Same convention as
     # the invite mount. Previously this rsynced to host /srv/site, which is
     # not visible inside the Caddy container's filesystem — the script was
@@ -171,9 +230,9 @@ deploy_invite() {
     # website/ repo), so we rsync straight from $REPO_ROOT/invite.
     #
     # Destination is ~/apps/invite (NOT /srv/invite) — the Caddy container
-    # bind-mounts /home/nick/apps/invite -> /srv/invite:ro at the path the
+    # bind-mounts $REMOTE_HOME/apps/invite -> /srv/invite:ro at the path the
     # Caddyfile references. See caddy/docker-compose.yml. Same convention as
-    # the existing /home/nick/apps/site mount. (deploy_site itself currently
+    # the existing $REMOTE_HOME/apps/site mount. (deploy_site itself currently
     # writes to /srv/site, which is a pre-existing bug — tracked separately.)
     local INVITE_SRC="$REPO_ROOT/invite"
 
@@ -198,7 +257,7 @@ deploy_galaxy() {
     # dreamfinder-avatar. Split out of this repo 2026-06-21.
     #
     # Destination is ~/apps/galaxy — the Caddy container bind-mounts
-    # /home/nick/apps/galaxy -> /srv/galaxy:ro (see caddy/docker-compose.yml).
+    # $REMOTE_HOME/apps/galaxy -> /srv/galaxy:ro (see caddy/docker-compose.yml).
     local GALAXY_SRC="$HOME/git/orgs/imagineering/galaxy"
 
     # Preflight before a --delete sync: require BOTH the shell and an inner
@@ -279,6 +338,17 @@ deploy_service() {
     echo "Deploying $svc..."
     ssh "$REMOTE" "mkdir -p ~/apps/$svc"
     rsync -avz --delete "$REPO_ROOT/$svc/" "$REMOTE":~/apps/"$svc"/
+
+    # Host-shape config for compose interpolation (see the config block at the
+    # top of this script). Written AFTER rsync, because --delete would remove a
+    # file the source tree doesn't have. Not secrets — a home path and a bridge
+    # IP — so a plain heredoc is fine; secrets still go through
+    # dotenv_quote/shell_env_line.
+    ssh "$REMOTE" "cat > ~/apps/$svc/.env" <<ENVEOF
+REMOTE_HOME=$REMOTE_HOME
+DOCKER_HOST_IP=$DOCKER_HOST_IP
+ENVEOF
+
     if [ "$svc" = "caddy" ]; then
         # Caddyfile is bind-mounted as one file; rsync replaces its inode.
         # Recreate the container so its mount follows the newly deployed file.
@@ -455,9 +525,9 @@ deploy_backups() {
     # deterministically (no separate chmod/chown races).
     ssh "$REMOTE" "sudo mkdir -p /opt/scripts/lib \
         && sudo rsync -a --delete '$rstage/lib/' /opt/scripts/lib/ \
-        && sudo chown -R nick:nick /opt/scripts/lib \
-        && sudo install -o nick -g nick -m 0755 '$rstage/backup.sh'  /opt/scripts/backup.sh \
-        && sudo install -o nick -g nick -m 0755 '$rstage/restore.sh' /opt/scripts/restore.sh \
+        && sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/scripts/lib \
+        && sudo install -o $DEPLOY_USER -g $DEPLOY_USER -m 0755 '$rstage/backup.sh'  /opt/scripts/backup.sh \
+        && sudo install -o $DEPLOY_USER -g $DEPLOY_USER -m 0755 '$rstage/restore.sh' /opt/scripts/restore.sh \
         && rm -rf '$rstage'" \
         || { echo "ERROR: remote install failed"; ssh "$REMOTE" "rm -rf '$rstage'" 2>/dev/null; return 1; }
     # Post-install falsifier: deploy exit 0 must mean "the cron won't abort on a
@@ -479,7 +549,7 @@ deploy_backups() {
     # Set up backup cron job and log directory
     echo "Setting up backup cron job..."
     ssh "$REMOTE" "mkdir -p ~/logs"
-    ssh "$REMOTE" "echo '0 4 * * * nick /opt/scripts/backup.sh all >> /home/nick/logs/backup.log 2>&1' | sudo tee /etc/cron.d/backup > /dev/null"
+    ssh "$REMOTE" "echo \"0 4 * * * $DEPLOY_USER /opt/scripts/backup.sh all >> $REMOTE_HOME/logs/backup.log 2>&1\" | sudo tee /etc/cron.d/backup > /dev/null"
 
     # --- GitHub backup setup ---
     echo ""
@@ -569,12 +639,12 @@ SSHEOF'
         chmod 0600 "$MATRIX_SECRETS_TMP"
         scp -q "$MATRIX_SECRETS_TMP" "$REMOTE":/tmp/matrix.env
         ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
-            sudo install -m 0640 -o root -g nick /tmp/matrix.env /etc/imagineering-secrets/matrix.env && \
+            sudo install -m 0640 -o root -g $DEPLOY_USER /tmp/matrix.env /etc/imagineering-secrets/matrix.env && \
             rm -f /tmp/matrix.env"
         rm -f "$MATRIX_SECRETS_TMP"
         # Restore the prior EXIT trap (empty string clears, if none existed).
         eval "${MATRIX_PREV_TRAP:-trap - EXIT}"
-        echo "  Matrix envfile installed (mode 0640 root:nick)"
+        echo "  Matrix envfile installed (mode 0640 root:$DEPLOY_USER)"
     else
         echo "NOTE: matrix_admin_token not found in $MATRIX_SECRETS — Continuwuity backup disabled"
         echo "  Add matrix_admin_token + backup_age_recipient to matrix/secrets.yaml to enable"
@@ -788,7 +858,9 @@ deploy_embodied_dreamfinder() {
     echo "Deploying Embodied Dreamfinder (voice avatar)..."
 
     local EDF_SECRETS="$REPO_ROOT/dreamfinder-avatar/secrets.yaml"
-    local EDF_SRC="$HOME/git/orgs/imagineering/dreamfinder-avatar"
+    # Local checkout of the app. Override with EDF_SRC when the repo lives
+    # elsewhere (the default assumes the ~/git/orgs/<org>/<repo> layout).
+    local EDF_SRC="${EDF_SRC:-$HOME/git/orgs/imagineering/dreamfinder-avatar}"
 
     # Check for secrets file
     if [ ! -f "$EDF_SECRETS" ]; then
@@ -857,6 +929,13 @@ deploy_embodied_dreamfinder() {
         # same container, so this one value reaches both. <16 chars → server disables the
         # override (fail-closed). See dreamfinder-avatar server.js localhost branch.
         printf 'INTERNAL_SCOPE_KEY=%s\n'    "$(dotenv_quote "$(edf_field '.internal_scope_key')")"
+        # ---- Per-host shape (not secrets; see the config block at the top) ----
+        # The compose file carries the same defaults, so an existing host is
+        # unaffected. Writing the resolved values here means a manual
+        # `docker compose up` on the box behaves identically to a scripted
+        # deploy, instead of silently falling back to the compose defaults.
+        printf 'REMOTE_HOME=%s\n'           "$(dotenv_quote "$REMOTE_HOME")"
+        printf 'DOCKER_HOST_IP=%s\n'        "$(dotenv_quote "$DOCKER_HOST_IP")"
     } > "$REPO_ROOT/dreamfinder-avatar/.env"
 
     # Base compose only. lyra-live (and its docker-compose.lyra.yml key mount)
@@ -880,6 +959,18 @@ deploy_embodied_dreamfinder() {
 
     # Ensure shared network exists (allows voice brain to reach text brain)
     ssh "$REMOTE" "docker network inspect imagineering >/dev/null 2>&1 || docker network create imagineering"
+
+    # Fail loudly on a wrong REMOTE_HOME rather than mounting empty dirs.
+    # These are the local-audio (whisper/piper/kokoro) sources from
+    # docker-compose.yml; a cloud-STT/TTS-only host still needs them present
+    # because the mounts are unconditional in the base compose file.
+    check_remote_mounts "dreamfinder-avatar local-audio mounts" \
+        "$REMOTE_HOME/whisper.cpp/build/bin" \
+        "$REMOTE_HOME/whisper.cpp/build/src" \
+        "$REMOTE_HOME/whisper.cpp/build/ggml/src" \
+        "$REMOTE_HOME/whisper.cpp/models" \
+        "$REMOTE_HOME/piper" \
+        "$REMOTE_HOME/kokoro"
 
     # Build and start (override applied only in lyra-live mode — see above)
     ssh "$REMOTE" "cd ~/apps/dreamfinder-avatar && DOCKER_BUILDKIT=1 docker compose $EDF_COMPOSE_ARGS build --pull && docker compose $EDF_COMPOSE_ARGS up -d"
@@ -916,9 +1007,12 @@ deploy_livekit() {
     # quoted YAML scalar. The template `keys:` map has exactly one placeholder
     # entry (LIVEKIT_API_KEY: LIVEKIT_API_SECRET); we replace the whole map with
     # the real key->secret pair, and set rtc.node_ip when an external IP is given.
-    LK_KEY="$API_KEY" LK_SECRET="$API_SECRET" yq eval '
+    # turn.domain is templated the same way for the same reason: it lands in a
+    # YAML scalar, so it goes through strenv rather than sed.
+    LK_KEY="$API_KEY" LK_SECRET="$API_SECRET" LK_TURN_DOMAIN="$TURN_DOMAIN" yq eval '
         .keys = {} |
-        .keys[strenv(LK_KEY)] = strenv(LK_SECRET)
+        .keys[strenv(LK_KEY)] = strenv(LK_SECRET) |
+        .turn.domain = strenv(LK_TURN_DOMAIN)
     ' "$REPO_ROOT/livekit/livekit.yaml" > "$REPO_ROOT/livekit/livekit-generated.yaml"
 
     # Inject node_ip if external IP is set
@@ -947,7 +1041,7 @@ deploy_livekit() {
 
     echo "LiveKit SFU deployed!"
     echo "  Signaling: https://livekit.imagineering.cc"
-    echo "  TURN: turn.imagineering.cc:5349"
+    echo "  TURN: $TURN_DOMAIN:5349"
     echo "  Check logs: ssh $REMOTE 'docker logs -f livekit'"
 }
 
