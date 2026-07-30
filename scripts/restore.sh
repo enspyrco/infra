@@ -883,20 +883,27 @@ restore_continuwuity() {
     cleanup_backups; exit 1
   fi
 
+  # Capture the start instant BEFORE restarting, so the health check reads ONLY
+  # this boot's logs. `docker compose logs` retains the PRE-restore boot across
+  # stop/start, so a `--since 90s` window would match the OLD "Services startup
+  # complete" while the NEW process crash-loops — a false pass right after the keys
+  # moved (cage-match #141 r4 Tesla). Epoch since is unambiguous across TZ.
+  local start_ts; start_ts=$(date +%s)
   ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) \
     || { error "restore installed but restart FAILED — run: cd $MATRIX_COMPOSE_DIR && docker compose start continuwuity"; cleanup_backups; exit 1; }
 
-  # Verify the LIVE server actually came up on the swapped-in tree. The validate
-  # boot used an INJECTED prune flag + log chord; the real restart uses the ON-DISK
-  # compose, so `compose start` exit-0 only means "container started", not "opened
-  # the DB and passed the media check". A missing prune_missing_media on disk =
-  # crash-loop AFTER the keys are already swapped (cage-match #141 r3 Tesla).
-  log "Verifying live continuwuity startup..."
+  # Verify the LIVE server came up on the swapped-in tree. `compose start` exit-0
+  # only means "container started", not "opened the DB + passed the media check" —
+  # a missing on-disk prune_missing_media = crash-loop after the swap. Same CHORD as
+  # validate (startup complete AND non-zero sequence — r4 Tesla: live verify had
+  # dropped the sequence half), scoped to logs since $start_ts (this boot only).
+  log "Verifying live continuwuity startup (this boot only)..."
   local live_ok=0 _i
   for _i in $(seq 1 20); do
     sleep 3
-    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since 90s continuwuity 2>/dev/null )
-    echo "$llog" | grep -q "Services startup complete" && { live_ok=1; break; }
+    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since "$start_ts" continuwuity 2>/dev/null )
+    if echo "$llog" | grep -q "Services startup complete" \
+       && echo "$llog" | grep -qE "Opened database.*sequence=[1-9]"; then live_ok=1; break; fi
     echo "$llog" | grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" && break
   done
   if [ "$live_ok" != "1" ]; then

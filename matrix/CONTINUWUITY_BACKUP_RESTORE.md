@@ -2,7 +2,8 @@
 
 Status: **in build** (branch `harden/continuwuity-media-restore`). Replaces the
 manual `ldb`-guidance stub in `restore_continuwuity` with an automated, validated,
-atomic, **DB-only** restore.
+**DB-only** restore with completion-oracle rollback (not single-rename atomic — a
+volume root can't be renamed; see the swap step for the exact recovery guarantee).
 
 ## What we protect, and why (the decision behind this)
 

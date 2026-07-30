@@ -524,13 +524,23 @@ prune_repo_history_if_needed() {
       | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
       | sort -ru | tail -n +$((keep + 1)))
     if [ -n "$old_tags" ]; then
-      local del_out
-      # shellcheck disable=SC2086
-      if del_out=$(git -C "$repo" push --delete origin $old_tags 2>&1); then
-        log "archive-tag retention: kept newest $keep, pruned $(echo "$old_tags" | wc -l | tr -d ' ') old tag(s)"
+      local del_count; del_count=$(printf '%s\n' "$old_tags" | wc -l | tr -d ' ')
+      # Fail-closed blast-radius cap (cage-match #141 r4 Tesla): a malformed ls-remote
+      # parse must not vacuum the entire archive set in one unattended cron tick.
+      # Steady state deletes 0-1 tags; refuse an implausibly large batch and alert.
+      local del_ceiling=${ARCHIVE_TAG_DELETE_CEILING:-30}
+      if [ "$del_count" -gt "$del_ceiling" ]; then
+        error "archive-tag retention: $del_count tags queued for delete exceeds ceiling $del_ceiling — REFUSING (possible bad ls-remote parse), no tags deleted"
+        send_telegram_alert "$(printf '<b>Backup Retention BLOCKED</b>\n%s archive tags queued for delete (ceiling %s) — refused as a likely parse error; no tags deleted.' "$del_count" "$del_ceiling")" || true
       else
-        error "archive-tag retention: some old tags not deleted (non-fatal, retried next run): $del_out"
-        send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed; repo-bloat pruning incomplete this run.')" || true
+        local del_out
+        # shellcheck disable=SC2086
+        if del_out=$(git -C "$repo" push --delete origin $old_tags 2>&1); then
+          log "archive-tag retention: kept newest $keep, pruned $del_count old tag(s)"
+        else
+          error "archive-tag retention: some old tags not deleted (non-fatal, retried next run): $del_out"
+          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed; repo-bloat pruning incomplete this run.')" || true
+        fi
       fi
     fi
   fi
