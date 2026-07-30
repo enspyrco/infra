@@ -507,7 +507,13 @@ prune_repo_history_if_needed() {
   # (cage-match #141 Kelvin/Carnot/Tesla: the old `2>/dev/null` + pipe-to-`tail`
   # fail-open let bloat resume in the dark — and the `| tail` masked git's own exit,
   # the very pipe-masks-exit class this PR exists to kill).
+  # Fail-closed on this destructive op (cage-match #141 Carnot): a non-positive-int
+  # retention (0 / empty / negative / garbage from a bad cron env) would compute
+  # `tail -n +1` and delete EVERY archive tag. Refuse it and fall back to the safe
+  # default rather than mass-deleting the PITR window.
   local keep=${ARCHIVE_TAG_RETENTION:-7}
+  case "$keep" in ''|*[!0-9]*) error "ARCHIVE_TAG_RETENTION='$keep' not a non-negative integer — using 7"; keep=7;; esac
+  [ "$keep" -lt 1 ] && { error "ARCHIVE_TAG_RETENTION=$keep < 1 would delete ALL archive tags — using 7"; keep=7; }
   local remote_tags
   if ! remote_tags=$(git -C "$repo" ls-remote --tags origin 2>&1); then
     error "archive-tag retention: ls-remote failed — bloat pruning SKIPPED this run (retries next run): $remote_tags"
@@ -524,6 +530,7 @@ prune_repo_history_if_needed() {
         log "archive-tag retention: kept newest $keep, pruned $(echo "$old_tags" | wc -l | tr -d ' ') old tag(s)"
       else
         error "archive-tag retention: some old tags not deleted (non-fatal, retried next run): $del_out"
+        send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed; repo-bloat pruning incomplete this run.')" || true
       fi
     fi
   fi

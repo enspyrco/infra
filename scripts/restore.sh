@@ -841,6 +841,12 @@ restore_continuwuity() {
         # false-closed when CURRENT moved early in a partial promote).
         find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT \
           | while IFS= read -r p; do mv "$p" ./; done
+        # Promote CURRENT ONLY once every non-CURRENT staged file has actually moved.
+        # `find | while` runs in a subshell, so an mv failure inside does NOT abort
+        # under set -e (cage-match #141 Carnot) — without this guard CURRENT could be
+        # promoted onto a partial tree and defeat the CURRENT-absent rollback oracle.
+        [ -z "$(find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT)" ] \
+          || { echo "promote incomplete (staged files remain) — aborting before CURRENT" >&2; exit 1; }
         [ -f .restore-staging/CURRENT ] && mv .restore-staging/CURRENT ./
         rmdir .restore-staging 2>/dev/null || true
         # Completeness gate — not just CURRENT: a whole tree has CURRENT + a media/
@@ -856,6 +862,11 @@ restore_continuwuity() {
         # SST already promoted is harmless — RocksDB ignores SSTs absent from the
         # rescued MANIFEST.
         if [ ! -f CURRENT ] && [ -d ".rescue-$ts" ]; then
+          # Clear any partially-promoted candidate residue from root first (the real
+          # old tree is safe in rescue), so the restored tree carries no orphan
+          # candidate files (cage-match #141 Carnot), then restore rescue incl dotfiles.
+          find . -mindepth 1 -maxdepth 1 ! -name ".rescue-$ts" ! -name ".restore-staging" \
+            | while IFS= read -r p; do rm -rf "$p"; done
           find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
             | while IFS= read -r p; do mv "$p" ./; done
           rmdir ".rescue-$ts" 2>/dev/null || true
