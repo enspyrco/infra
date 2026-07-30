@@ -760,7 +760,13 @@ restore_continuwuity() {
         # then take the leading token, so a (hypothetical) suffixless name is a
         # no-op rather than becoming NAME.sst.sst.
         for f in "$bk"/shared_checksum/*.sst; do
-          b=$(basename "$f" .sst); cp "$f" "/live/.restore-staging/${b%%_*}.sst"
+          b=$(basename "$f" .sst); t="/live/.restore-staging/${b%%_*}.sst"
+          # Fail-closed on a file-number collision (cage-match #141 r4/r5 Carnot): a
+          # valid latest backup has unique SST numbers (we wipe before each backup, so
+          # shared_checksum holds one backup only), but the signing-key path must PROVE
+          # it rather than silently overwrite if that ever changes.
+          [ -e "$t" ] && { echo "SST collision: two sources map to $(basename "$t") — aborting" >&2; exit 1; }
+          cp "$f" "$t"
         done
         cp -a "$bk/private/$id/." /live/.restore-staging/   # -a . copies dotfiles too
         # Empty media/ dir must EXIST (not just be absent): prune_missing_media

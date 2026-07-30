@@ -529,6 +529,11 @@ prune_repo_history_if_needed() {
       # parse must not vacuum the entire archive set in one unattended cron tick.
       # Steady state deletes 0-1 tags; refuse an implausibly large batch and alert.
       local del_ceiling=${ARCHIVE_TAG_DELETE_CEILING:-30}
+      # Validate the ceiling too (cage-match #141 r5 Carnot): a garbage env value
+      # would error the integer test and FALL THROUGH to deleting the full set —
+      # the same fail-open class the retention validation above closes.
+      case "$del_ceiling" in ''|*[!0-9]*) error "ARCHIVE_TAG_DELETE_CEILING='$del_ceiling' not an integer — using 30"; del_ceiling=30;; esac
+      [ "$del_ceiling" -lt 1 ] && del_ceiling=30
       if [ "$del_count" -gt "$del_ceiling" ]; then
         error "archive-tag retention: $del_count tags queued for delete exceeds ceiling $del_ceiling — REFUSING (possible bad ls-remote parse), no tags deleted"
         send_telegram_alert "$(printf '<b>Backup Retention BLOCKED</b>\n%s archive tags queued for delete (ceiling %s) — refused as a likely parse error; no tags deleted.' "$del_count" "$del_ceiling")" || true
