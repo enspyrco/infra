@@ -834,41 +834,49 @@ restore_continuwuity() {
         # root would coexist with the restored DB). Exclude only our own work dirs.
         find . -mindepth 1 -maxdepth 1 ! -name ".restore-staging" ! -name ".rescue-*" \
           | while IFS= read -r p; do mv "$p" ".rescue-$ts/"; done
-        # Promote the staged tree, CURRENT LAST. RocksDB cannot open without CURRENT,
-        # so CURRENT-at-root is a reliable "promotion completed" oracle: a partial
-        # promotion (ENOSPC / kill mid-move) leaves CURRENT ABSENT, and the rollback
-        # below keys on exactly that (cage-match #141: the old [ -f CURRENT ] gate
-        # false-closed when CURRENT moved early in a partial promote).
+        # PROMOTE only once the OLD tree is ENTIRELY in rescue (root == just our work
+        # dirs). `find | while` runs in a subshell, so an mv failure inside does NOT
+        # abort under set -e (cage-match #141 r3 Carnot/Tesla) — assert emptiness so
+        # promote is an INSTALL onto a clean root, never a MERGE onto old remnants.
+        [ -z "$(find . -mindepth 1 -maxdepth 1 ! -name ".restore-staging" ! -name ".rescue-*")" ] \
+          || { echo "rescue move incomplete (live entries remain at root) — aborting before promote" >&2; exit 1; }
+        # Promote the staged tree, CURRENT LAST (RocksDB cannot open without it).
         find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT \
           | while IFS= read -r p; do mv "$p" ./; done
         # Promote CURRENT ONLY once every non-CURRENT staged file has actually moved.
-        # `find | while` runs in a subshell, so an mv failure inside does NOT abort
-        # under set -e (cage-match #141 Carnot) — without this guard CURRENT could be
-        # promoted onto a partial tree and defeat the CURRENT-absent rollback oracle.
         [ -z "$(find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT)" ] \
           || { echo "promote incomplete (staged files remain) — aborting before CURRENT" >&2; exit 1; }
         [ -f .restore-staging/CURRENT ] && mv .restore-staging/CURRENT ./
         rmdir .restore-staging 2>/dev/null || true
-        # Completeness gate — not just CURRENT: a whole tree has CURRENT + a media/
-        # dir (our invariant: missing dir = boot I/O error) + at least one SST.
+        # Completeness gate — CURRENT + media/ dir + >=1 SST. NOTE: this runs AFTER
+        # CURRENT is seated, so a failure HERE leaves CURRENT present — which is why
+        # the rollback below keys on .rescue-$ts/CURRENT (the OLD tree, outside this
+        # blast radius), NOT root CURRENT (cage-match #141 r3: Kelvin/Carnot/Tesla).
         { [ -f CURRENT ] && [ -d media ] && ls ./*.sst >/dev/null 2>&1; } \
           || { echo "post-swap sanity failed (incomplete tree)" >&2; exit 1; }
       '; then
     error "SWAP FAILED — rolling back to the rescued live tree..."
     docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
         ts="'"$ts"'"; cd /live
-        # CURRENT-last promotion ⇒ CURRENT-absent means the promote did not complete;
-        # restore the rescued tree (incl dotfiles) back to root. Any orphan staged
-        # SST already promoted is harmless — RocksDB ignores SSTs absent from the
-        # rescued MANIFEST.
-        if [ ! -f CURRENT ] && [ -d ".rescue-$ts" ]; then
-          # Clear any partially-promoted candidate residue from root first (the real
-          # old tree is safe in rescue), so the restored tree carries no orphan
-          # candidate files (cage-match #141 Carnot), then restore rescue incl dotfiles.
+        # Rollback is entered ONLY on swap-container failure, so we ALWAYS want the
+        # old tree back — the key question is whether it is safe to clear root first.
+        # Oracle: .rescue-$ts/CURRENT. It sits OUTSIDE the promote blast radius (root
+        # CURRENT does not, which is why keying on root CURRENT false-closed when a
+        # post-CURRENT step failed — cage-match #141 r3 Kelvin/Carnot/Tesla).
+        if [ -f ".rescue-$ts/CURRENT" ]; then
+          # OLD tree fully in rescue (its CURRENT moved there) ⇒ root holds only
+          # candidate residue; clear it, then restore the rescued tree incl dotfiles.
           find . -mindepth 1 -maxdepth 1 ! -name ".rescue-$ts" ! -name ".restore-staging" \
             | while IFS= read -r p; do rm -rf "$p"; done
           find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
             | while IFS= read -r p; do mv "$p" ./; done
+          rmdir ".rescue-$ts" 2>/dev/null || true
+        elif [ -d ".rescue-$ts" ]; then
+          # Old CURRENT is NOT in rescue ⇒ the live→rescue move did not complete, so
+          # part of the old tree is still at root. Do NOT clear root (would lose it);
+          # just merge any rescued entries back, reuniting the old tree in place.
+          find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
+            | while IFS= read -r p; do mv "$p" ./ 2>/dev/null || true; done
           rmdir ".rescue-$ts" 2>/dev/null || true
         fi' 2>/dev/null || error "ROLLBACK ALSO FAILED — inspect volume ${CONTINUWUITY_DATA_VOL} manually"
     ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) || error "restart after rollback FAILED — start continuwuity manually"
@@ -877,6 +885,24 @@ restore_continuwuity() {
 
   ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) \
     || { error "restore installed but restart FAILED — run: cd $MATRIX_COMPOSE_DIR && docker compose start continuwuity"; cleanup_backups; exit 1; }
+
+  # Verify the LIVE server actually came up on the swapped-in tree. The validate
+  # boot used an INJECTED prune flag + log chord; the real restart uses the ON-DISK
+  # compose, so `compose start` exit-0 only means "container started", not "opened
+  # the DB and passed the media check". A missing prune_missing_media on disk =
+  # crash-loop AFTER the keys are already swapped (cage-match #141 r3 Tesla).
+  log "Verifying live continuwuity startup..."
+  local live_ok=0 _i
+  for _i in $(seq 1 20); do
+    sleep 3
+    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since 90s continuwuity 2>/dev/null )
+    echo "$llog" | grep -q "Services startup complete" && { live_ok=1; break; }
+    echo "$llog" | grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" && break
+  done
+  if [ "$live_ok" != "1" ]; then
+    error "Restore installed, but live continuwuity did NOT reach 'Services startup complete'. Most likely the on-disk compose lacks CONTINUWUITY_PRUNE_MISSING_MEDIA=true — deploy the matrix compose change first. Swapped tree is live; prior tree at .rescue-$ts. Inspect: cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity"
+    cleanup_backups; exit 1
+  fi
 
   cleanup_backups
   log "Continuwuity restored (DB-only; media refs pruned as cache). Previous tree kept in the volume"
