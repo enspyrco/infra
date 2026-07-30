@@ -28,6 +28,12 @@ CONTINUWUITY_HOMESERVER='https://matrix.imagineering.cc'
 # exceeds this size, prune_repo_history_if_needed collapses history to a
 # fresh root commit (loses non-essential git history; keeps current files).
 RETENTION_PRUNE_THRESHOLD_MB=300
+# Keep only the newest N archive-* tags. Each prune pins the pre-prune HEAD in an
+# archive-DATE tag; the ~100MB encrypted (undeltable) continuwuity blob it holds is
+# a fresh object GitHub keeps forever while the tag references it. Unbounded, that
+# was 45 tags / 4.37GB (2026-07-30). Capping retention keeps a rolling PITR window
+# without the runaway growth. Structural fix (object storage) tracked separately.
+ARCHIVE_TAG_RETENTION=${ARCHIVE_TAG_RETENTION:-7}
 
 # Colors for output
 RED='\033[0;31m'
@@ -491,6 +497,24 @@ prune_repo_history_if_needed() {
   else
     error "Failed to force-push pruned history; manual intervention needed"
     return 1
+  fi
+
+  # Cap archive-tag retention (best-effort; a failed delete is non-fatal — it just
+  # leaves an extra tag for next run). List archive tags on ORIGIN (a shallow clone
+  # has no local tags), keep the newest N, delete the rest. The end-anchored grep
+  # excludes any `^{}` deref lines; sort -ru gives newest-first, unique.
+  local keep=${ARCHIVE_TAG_RETENTION:-7}
+  local old_tags
+  old_tags=$(git -C "$repo" ls-remote --tags origin 2>/dev/null \
+    | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
+    | sort -ru | tail -n +$((keep + 1)))
+  if [ -n "$old_tags" ]; then
+    # shellcheck disable=SC2086
+    if git -C "$repo" push --delete origin $old_tags 2>&1 | tail -2; then
+      log "archive-tag retention: kept newest $keep, pruned $(echo "$old_tags" | wc -l | tr -d ' ') old tag(s)"
+    else
+      error "archive-tag retention: some old tags not deleted (non-fatal, retried next run)"
+    fi
   fi
 }
 
