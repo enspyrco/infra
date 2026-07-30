@@ -117,6 +117,87 @@ _validate_sqlite_db() {
   return 0
 }
 
+# Atomically restore a postgres DB from a plain dump WITHOUT ever leaving the live
+# DB empty (#29 Phase 2). The postgres analog of _restore_island_core's temp-file +
+# atomic-mv: load the dump into a TEMP database, integrity-gate it, then swap it into
+# place with two ALTER DATABASE renames — keeping the prior live DB as a timestamped
+# rescue. The old restore_kanbn/outline dropped the live DB FIRST then loaded, so a
+# dump that passed validation but errored mid-replay left the DB EMPTY. Here the live
+# DB is untouched until a fully-replayed, non-empty candidate exists.
+#
+# Validated end-to-end against postgres:alpine (cage-match #138 → #29 Phase 2):
+# good dump swaps in with the old DB preserved as rescue; a truncated dump fails the
+# temp load and the live DB is never touched.
+#
+# Args: <svc> <container> <pguser> <db> <composedir> <dumpfile>
+# Requires the dump to have already passed _validate_pg_dump.
+_restore_pg_atomic() {
+  local svc="$1" container="$2" user="$3" db="$4" composedir="$5" dumpfile="$6"
+  local ts temp rescue
+  ts=$(date +%Y%m%d_%H%M%S)
+  temp="${db}_restore_${ts}"
+  rescue="${db}_rescue_${ts}"
+
+  cd "$composedir" || { error "$svc: cannot cd $composedir"; return 1; }
+  docker compose up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+  docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 || { error "$svc: postgres not ready after 30s"; return 1; }
+
+  # 1. Load into a fresh temp DB — live $db untouched. --single-transaction +
+  #    ON_ERROR_STOP so a mid-replay error aborts with the temp DB discarded.
+  log "$svc: loading dump into temp DB $temp (live $db untouched)..."
+  docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+  docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "CREATE DATABASE \"$temp\";" >/dev/null 2>&1 \
+    || { error "$svc: could not create temp DB $temp — live $db untouched"; return 1; }
+  if ! docker exec -i "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U "$user" -d "$temp" < "$dumpfile" >/dev/null 2>&1; then
+    error "$svc: dump failed to replay into temp DB — live $db UNTOUCHED. Dropping temp; investigate the dump before retrying."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # 2. Integrity gate: the candidate must have loaded at least one public table.
+  local ntables
+  ntables=$(docker exec "$container" psql -U "$user" -d "$temp" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null)
+  if ! [ "$ntables" -ge 1 ] 2>/dev/null; then
+    error "$svc: temp DB has no public tables (empty/wrong dump) — live $db UNTOUCHED. Dropping temp."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
+  #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
+  log "$svc: stopping app for the atomic swap..."
+  docker compose stop >/dev/null 2>&1
+  docker compose up -d postgres >/dev/null 2>&1
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+
+  # 4. Atomic swap: rename live->rescue then temp->live. Terminate any stragglers
+  #    first. If the second rename fails, roll rescue back so live is never lost.
+  docker exec "$container" psql -U "$user" -d postgres -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('$db','$temp') AND pid <> pg_backend_pid();" >/dev/null 2>&1
+  if ! docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$db\" RENAME TO \"$rescue\";" >/dev/null 2>&1; then
+    error "$svc: could not rename live $db -> rescue (connections still open?) — live UNTOUCHED, temp $temp left for inspection."
+    docker compose up -d >/dev/null 2>&1
+    return 1
+  fi
+  if ! docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$temp\" RENAME TO \"$db\";" >/dev/null 2>&1; then
+    error "$svc: rename temp -> live FAILED after live moved to rescue — rolling back rescue -> live."
+    if docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$rescue\" RENAME TO \"$db\";" >/dev/null 2>&1; then
+      error "$svc: rolled back — live $db is the original; temp $temp left for inspection."
+    else
+      error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue', candidate under '$temp'. Manual recovery needed; app NOT restarted."
+      return 1
+    fi
+    docker compose up -d >/dev/null 2>&1
+    return 1
+  fi
+
+  # 5. Success — previous live kept as $rescue (drop it manually once satisfied).
+  log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). Bringing app up..."
+  docker compose up -d >/dev/null 2>&1
+  return 0
+}
+
 restore_kanbn() {
   log "Restoring Kan.bn..."
 
@@ -129,32 +210,12 @@ restore_kanbn() {
     cleanup_backups
     exit 1
   fi
-  # Validate BEFORE the destructive drop — a corrupt/truncated dump must never
-  # reach dropdb (the old code dropped first, then blind-loaded).
+  # Validate the dump, then atomically swap it in via a temp DB (never drops the
+  # live DB before a fully-replayed candidate exists — #29 Phase 2). The old code
+  # dropped+recreated FIRST then loaded, so a dump that errored mid-replay left the
+  # DB empty.
   _validate_pg_dump kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-
-  # Ensure Kan.bn postgres is running
-  cd ~/apps/kanbn
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i kanbn_postgres bash -c "psql -U kanbn -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kanbn' AND pid <> pg_backend_pid();\" postgres && dropdb -U kanbn kanbn && createdb -U kanbn kanbn"
-
-  # Atomic load: --single-transaction + ON_ERROR_STOP so a replay error rolls the
-  # WHOLE load back instead of leaving a half-populated DB. (The DB was just
-  # dropped+recreated, so on failure it ends EMPTY — surfaced loudly below, not
-  # silently logged as success.)
-  log "Restoring database..."
-  if ! docker exec -i kanbn_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U kanbn kanbn < "$BACKUP_FILE"; then
-    error "Kan.bn psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
-    cleanup_backups; exit 1
-  fi
-
-  log "Restarting Kan.bn..."
-  docker compose restart
+  _restore_pg_atomic kanbn kanbn_postgres kanbn kanbn ~/apps/kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Kan.bn restore complete!"
@@ -171,28 +232,9 @@ restore_outline() {
     cleanup_backups
     exit 1
   fi
-  # Validate BEFORE the destructive drop (see restore_kanbn).
+  # Validate + atomic temp-DB swap (see restore_kanbn / _restore_pg_atomic).
   _validate_pg_dump outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-
-  # Ensure Outline postgres is running
-  cd ~/apps/outline
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i outline_postgres bash -c "psql -U outline -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'outline' AND pid <> pg_backend_pid();\" postgres && dropdb -U outline outline && createdb -U outline outline"
-
-  # Atomic load (see restore_kanbn): rolls back on any replay error.
-  log "Restoring database..."
-  if ! docker exec -i outline_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U outline outline < "$BACKUP_FILE"; then
-    error "Outline psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
-    cleanup_backups; exit 1
-  fi
-
-  log "Restarting Outline..."
-  docker compose restart
+  _restore_pg_atomic outline outline_postgres outline outline ~/apps/outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Outline restore complete!"
