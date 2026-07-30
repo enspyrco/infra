@@ -737,15 +737,28 @@ restore_continuwuity() {
 
   local ts; ts=$(date +%Y%m%d-%H%M%S)
 
-  # ---- STAGE (live continuwuity still running; .restore-staging is hidden) ----
+  # Topology guard (fail-closed): the DB must live in the `db/` SUBDIR of the
+  # volume, not at the root. That is what makes the swap a single atomic dir
+  # rename. If `db/` is absent the box is on the OLD root layout — restoring here
+  # would strand the reconstructed tree in a subdir the live server never reads
+  # (and, worse, a plain `docker compose up` on the new compose would boot a FRESH
+  # homeserver with a NEW signing key). Refuse until the one-time migration runs.
+  if ! docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '[ -f /live/db/CURRENT ]'; then
+    error "Volume ${CONTINUWUITY_DATA_VOL} is not on the db/ subdir topology (no db/CURRENT)."
+    error "Run the one-time migration first: scripts/migrate-continuwuity-topology.sh"
+    cleanup_backups; exit 1
+  fi
+
+  # ---- STAGE (live continuwuity still running; db-staging is a SIBLING of db,
+  # OUTSIDE database_path, so it can never coexist inside the live DB tree) ----
   # Build the candidate tree INSIDE the live volume so the final install is a
-  # real same-filesystem atomic mv. Nothing here touches the live RocksDB files.
+  # real same-filesystem atomic mv. Nothing here touches the live db/ tree.
   log "Staging: reconstructing RocksDB from BackupEngine backup..."
   if ! ( set -o pipefail; age -d -i "$AGE_IDENTITY_FILE" "$db_enc" \
          | docker run --rm -i -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
         set -e
-        rm -rf /live/.restore-staging /live/.bk-scratch
-        mkdir -p /live/.bk-scratch /live/.restore-staging
+        rm -rf /live/db-staging /live/.bk-scratch
+        mkdir -p /live/.bk-scratch /live/db-staging
         tar xzf - -C /live/.bk-scratch
         bk=/live/.bk-scratch
         # Sentinel: a truncated/garbage tar aborts HERE, live untouched.
@@ -760,7 +773,7 @@ restore_continuwuity() {
         # then take the leading token, so a (hypothetical) suffixless name is a
         # no-op rather than becoming NAME.sst.sst.
         for f in "$bk"/shared_checksum/*.sst; do
-          b=$(basename "$f" .sst); t="/live/.restore-staging/${b%%_*}.sst"
+          b=$(basename "$f" .sst); t="/live/db-staging/${b%%_*}.sst"
           # Fail-closed on a file-number collision (cage-match #141 r4/r5 Carnot): a
           # valid latest backup has unique SST numbers (we wipe before each backup, so
           # shared_checksum holds one backup only), but the signing-key path must PROVE
@@ -768,17 +781,17 @@ restore_continuwuity() {
           [ -e "$t" ] && { echo "SST collision: two sources map to $(basename "$t") — aborting" >&2; exit 1; }
           cp "$f" "$t"
         done
-        cp -a "$bk/private/$id/." /live/.restore-staging/   # -a . copies dotfiles too
+        cp -a "$bk/private/$id/." /live/db-staging/   # -a . copies dotfiles too
         # Empty media/ dir must EXIST (not just be absent): prune_missing_media
         # prunes missing FILES, but a missing media DIR is a hard I/O error. With
         # the dir present + empty, the validate-boot prunes all dangling refs and
         # starts clean. Verified against the real DB (2755 refs -> pruned -> boots).
-        mkdir -p /live/.restore-staging/media
+        mkdir -p /live/db-staging/media
         rm -rf /live/.bk-scratch
-        echo "reconstructed $(ls /live/.restore-staging/*.sst | wc -l) SSTs (backup id $id)"
+        echo "reconstructed $(ls /live/db-staging/*.sst | wc -l) SSTs (backup id $id)"
       ' ); then
     error "RocksDB reconstruction failed (backup truncated/corrupt?). Live untouched."
-    docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c 'rm -rf /live/.restore-staging /live/.bk-scratch' 2>/dev/null || true
+    docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c 'rm -rf /live/db-staging /live/.bk-scratch' 2>/dev/null || true
     cleanup_backups; exit 1
   fi
 
@@ -791,42 +804,58 @@ restore_continuwuity() {
   docker rm -f continuwuity-restore-check >/dev/null 2>&1 || true
   docker run -d --name continuwuity-restore-check --network none \
     -e CONTINUWUITY_SERVER_NAME="$server_name" \
-    -e CONTINUWUITY_DATABASE_PATH=/var/lib/continuwuity/.restore-staging \
+    -e CONTINUWUITY_DATABASE_PATH=/var/lib/continuwuity/db-staging \
     -e CONTINUWUITY_ADDRESS=127.0.0.1 -e CONTINUWUITY_PORT=6167 \
     -e CONTINUWUITY_ALLOW_FEDERATION=false -e CONTINUWUITY_ALLOW_REGISTRATION=false \
     -e CONTINUWUITY_PRUNE_MISSING_MEDIA=true -e CONTINUWUITY_LOG=info \
+    -e CONTINUWUITY_LOG_COLORS=false \
     -v "${CONTINUWUITY_DATA_VOL}:/var/lib/continuwuity" \
     "$CONTINUWUITY_IMAGE" >/dev/null 2>&1 \
-    || { error "could not start validation container"; docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c 'rm -rf /live/.restore-staging' 2>/dev/null || true; cleanup_backups; exit 1; }
+    || { error "could not start validation container"; docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c 'rm -rf /live/db-staging' 2>/dev/null || true; cleanup_backups; exit 1; }
 
   local vok=0 vlogs=""
   for _ in $(seq 1 40); do
     sleep 3
-    vlogs=$(docker logs continuwuity-restore-check 2>&1)
+    # Strip ANSI at capture: continuwuity colorizes logs even when detached, and
+    # the color codes land BETWEEN `sequence` and `=` and the digit, which would
+    # otherwise defeat the `sequence=[1-9]` chord match (found via local test vs
+    # the current :latest image, which colorizes where an earlier build did not).
+    vlogs=$(docker logs continuwuity-restore-check 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
     # Success is a CHORD, not one note (cage-match #141 Tesla): reached full startup
     # AND opened the DB with a NON-ZERO sequence — the latter rejects a soft-wrong or
     # empty/fresh DB (sequence=0) that could otherwise still log "startup complete".
-    if echo "$vlogs" | grep -q "Services startup complete" \
-       && echo "$vlogs" | grep -qE "Opened database.*sequence=[1-9]"; then vok=1; break; fi
+    # Here-strings (grep <<<), NOT `echo | grep -q`: with a large log (thousands
+    # of media-prune lines) an EARLY match makes `grep -q` exit and SIGPIPE the
+    # `echo`, which returns 141 under `set -o pipefail` and silently reads as
+    # "no match" — a false-negative fail-closed on a healthy DB. A here-string has
+    # no upstream pipe to break, so the check is robust regardless of pipefail.
+    if grep -q "Services startup complete" <<< "$vlogs" \
+       && grep -qE "Opened database.*sequence=[1-9]" <<< "$vlogs"; then vok=1; break; fi
     # Fatal-only patterns. Deliberately NOT matching bare "missing"/"error":
     # offline startup (--network none) emits benign DNS/announcement errors; a
     # real missing-SST surfaces as "Corruption" or a container exit (both caught).
-    if echo "$vlogs" | grep -qiE "fresh database|thread .main. panicked|Critical error starting server|Failed to verify media|Corruption"; then vok=0; break; fi
+    if grep -qiE "fresh database|thread .main. panicked|Critical error starting server|Failed to verify media|Corruption" <<< "$vlogs"; then vok=0; break; fi
     [ "$(docker inspect -f '{{.State.Status}}' continuwuity-restore-check 2>/dev/null)" = "exited" ] && { vok=0; break; }
   done
-  echo "$vlogs" | sed 's/\x1b\[[0-9;]*m//g' | grep -iE "Opened database|Services startup complete|fresh database|panic|Critical|media|Corruption" | tail -8
+  echo "$vlogs" | grep -iE "Opened database|Services startup complete|fresh database|panic|Critical|media|Corruption" | tail -8
   # Clean SIGTERM stop (not rm -f/SIGKILL) so the staged RocksDB closes cleanly
   # before we promote it — avoids handing the live server a crash-recovery open.
   docker stop -t 15 continuwuity-restore-check >/dev/null 2>&1 || true
   docker rm -f continuwuity-restore-check >/dev/null 2>&1 || true
   if [ "$vok" != "1" ]; then
-    error "Validation FAILED — staged tree did not reach clean startup. Live homeserver UNTOUCHED. Staged tree left at .restore-staging in the volume for inspection; remove it with: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine rm -rf /live/.restore-staging"
+    error "Validation FAILED — staged tree did not reach clean startup. Live homeserver UNTOUCHED. Staged tree left at db-staging in the volume for inspection; remove it with: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine rm -rf /live/db-staging"
     cleanup_backups; exit 1
   fi
   log "Validation OK — staged tree boots cleanly with data + media."
 
-  # ---- SWAP (atomic, in-volume): the only step that touches live ----
-  log "Swapping: stopping continuwuity, installing staged tree (rescue kept)..."
+  # ---- SWAP (two atomic dir renames): the only step that touches live ----
+  # Because the DB is a self-contained subdir, install = rename. There is no
+  # per-file promote, no CURRENT-ordering, no dotfile-at-root hazard, no merge:
+  # the whole tree appears/disappears as one atomic rename(2). The only window is
+  # the microscopic gap BETWEEN the two renames where db/ momentarily does not
+  # exist; a crash there leaves db.rescue-$ts intact and recovery is one mv (the
+  # error message below spells it out).
+  log "Swapping: stopping continuwuity, renaming db-staging -> db (rescue kept)..."
   ( cd "$MATRIX_COMPOSE_DIR" && docker compose stop continuwuity ) \
     || { error "failed to stop continuwuity — aborting before swap, live untouched"; cleanup_backups; exit 1; }
 
@@ -834,57 +863,24 @@ restore_continuwuity() {
         set -e
         ts="'"$ts"'"
         cd /live
-        mkdir ".rescue-$ts"
-        # Move the ENTIRE live tree into rescue via find (NOT glob `*`, which skips
-        # dotfiles — cage-match #141 Kelvin/Carnot/Tesla: a stray dotfile left at
-        # root would coexist with the restored DB). Exclude only our own work dirs.
-        find . -mindepth 1 -maxdepth 1 ! -name ".restore-staging" ! -name ".rescue-*" \
-          | while IFS= read -r p; do mv "$p" ".rescue-$ts/"; done
-        # PROMOTE only once the OLD tree is ENTIRELY in rescue (root == just our work
-        # dirs). `find | while` runs in a subshell, so an mv failure inside does NOT
-        # abort under set -e (cage-match #141 r3 Carnot/Tesla) — assert emptiness so
-        # promote is an INSTALL onto a clean root, never a MERGE onto old remnants.
-        [ -z "$(find . -mindepth 1 -maxdepth 1 ! -name ".restore-staging" ! -name ".rescue-*")" ] \
-          || { echo "rescue move incomplete (live entries remain at root) — aborting before promote" >&2; exit 1; }
-        # Promote the staged tree, CURRENT LAST (RocksDB cannot open without it).
-        find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT \
-          | while IFS= read -r p; do mv "$p" ./; done
-        # Promote CURRENT ONLY once every non-CURRENT staged file has actually moved.
-        [ -z "$(find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT)" ] \
-          || { echo "promote incomplete (staged files remain) — aborting before CURRENT" >&2; exit 1; }
-        [ -f .restore-staging/CURRENT ] && mv .restore-staging/CURRENT ./
-        rmdir .restore-staging 2>/dev/null || true
-        # Completeness gate — CURRENT + media/ dir + >=1 SST. NOTE: this runs AFTER
-        # CURRENT is seated, so a failure HERE leaves CURRENT present — which is why
-        # the rollback below keys on .rescue-$ts/CURRENT (the OLD tree, outside this
-        # blast radius), NOT root CURRENT (cage-match #141 r3: Kelvin/Carnot/Tesla).
-        { [ -f CURRENT ] && [ -d media ] && ls ./*.sst >/dev/null 2>&1; } \
-          || { echo "post-swap sanity failed (incomplete tree)" >&2; exit 1; }
+        # Rescue the live DB, then promote the staged tree. Two renames, same fs.
+        # The topology guard above proved db/ exists, so the first rename must work;
+        # treat its failure as fatal BEFORE we have disturbed anything promotable.
+        mv db "db.rescue-$ts" || { echo "could not rescue live db/ — aborting, live intact" >&2; exit 1; }
+        if ! mv db-staging db; then
+          # Promote failed with db/ already moved aside: put it straight back.
+          echo "promote (mv db-staging db) failed — restoring rescued db/" >&2
+          mv "db.rescue-$ts" db 2>/dev/null || echo "ROLLBACK mv FAILED — db/ is at db.rescue-$ts" >&2
+          exit 1
+        fi
+        # Completeness gate on the promoted tree — CURRENT + media/ + >=1 SST.
+        { [ -f db/CURRENT ] && [ -d db/media ] && ls db/*.sst >/dev/null 2>&1; } \
+          || { echo "post-swap sanity failed (incomplete tree) — rolling back" >&2
+               rm -rf db; mv "db.rescue-$ts" db 2>/dev/null || echo "ROLLBACK mv FAILED — old tree at db.rescue-$ts" >&2
+               exit 1; }
       '; then
-    error "SWAP FAILED — rolling back to the rescued live tree..."
-    docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
-        ts="'"$ts"'"; cd /live
-        # Rollback is entered ONLY on swap-container failure, so we ALWAYS want the
-        # old tree back — the key question is whether it is safe to clear root first.
-        # Oracle: .rescue-$ts/CURRENT. It sits OUTSIDE the promote blast radius (root
-        # CURRENT does not, which is why keying on root CURRENT false-closed when a
-        # post-CURRENT step failed — cage-match #141 r3 Kelvin/Carnot/Tesla).
-        if [ -f ".rescue-$ts/CURRENT" ]; then
-          # OLD tree fully in rescue (its CURRENT moved there) ⇒ root holds only
-          # candidate residue; clear it, then restore the rescued tree incl dotfiles.
-          find . -mindepth 1 -maxdepth 1 ! -name ".rescue-$ts" ! -name ".restore-staging" \
-            | while IFS= read -r p; do rm -rf "$p"; done
-          find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
-            | while IFS= read -r p; do mv "$p" ./; done
-          rmdir ".rescue-$ts" 2>/dev/null || true
-        elif [ -d ".rescue-$ts" ]; then
-          # Old CURRENT is NOT in rescue ⇒ the live→rescue move did not complete, so
-          # part of the old tree is still at root. Do NOT clear root (would lose it);
-          # just merge any rescued entries back, reuniting the old tree in place.
-          find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
-            | while IFS= read -r p; do mv "$p" ./ 2>/dev/null || true; done
-          rmdir ".rescue-$ts" 2>/dev/null || true
-        fi' 2>/dev/null || error "ROLLBACK ALSO FAILED — inspect volume ${CONTINUWUITY_DATA_VOL} manually"
+    error "SWAP FAILED — see message above. The previous DB is preserved as db.rescue-* in the volume."
+    error "Manual recovery if needed: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'cd /live && rm -rf db && mv db.rescue-$ts db'"
     ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) || error "restart after rollback FAILED — start continuwuity manually"
     cleanup_backups; exit 1
   fi
@@ -907,20 +903,25 @@ restore_continuwuity() {
   local live_ok=0 _i
   for _i in $(seq 1 20); do
     sleep 3
-    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since "$start_ts" continuwuity 2>/dev/null )
-    if echo "$llog" | grep -q "Services startup complete" \
-       && echo "$llog" | grep -qE "Opened database.*sequence=[1-9]"; then live_ok=1; break; fi
-    echo "$llog" | grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" && break
+    # Strip ANSI (see validate loop) — the live container is governed by the
+    # compose file, which does not disable colors, so the chord match must be
+    # robust to colorized `docker compose logs` output.
+    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since "$start_ts" continuwuity 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' )
+    # Here-strings (see validate loop) — pipefail-safe against an early match on a
+    # large log SIGPIPE-ing the producer.
+    if grep -q "Services startup complete" <<< "$llog" \
+       && grep -qE "Opened database.*sequence=[1-9]" <<< "$llog"; then live_ok=1; break; fi
+    grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" <<< "$llog" && break
   done
   if [ "$live_ok" != "1" ]; then
-    error "Restore installed, but live continuwuity did NOT reach 'Services startup complete'. Most likely the on-disk compose lacks CONTINUWUITY_PRUNE_MISSING_MEDIA=true — deploy the matrix compose change first. Swapped tree is live; prior tree at .rescue-$ts. Inspect: cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity"
+    error "Restore installed, but live continuwuity did NOT reach 'Services startup complete'. Most likely the on-disk compose lacks CONTINUWUITY_PRUNE_MISSING_MEDIA=true — deploy the matrix compose change first. Swapped tree is live; prior tree at db.rescue-$ts. Inspect: cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity"
     cleanup_backups; exit 1
   fi
 
   cleanup_backups
-  log "Continuwuity restored (DB-only; media refs pruned as cache). Previous tree kept in the volume"
-  log "as .rescue-$ts — verify the homeserver, then remove it to reclaim space:"
-  log "  docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine rm -rf /live/.rescue-$ts"
+  log "Continuwuity restored (DB-only; media refs pruned as cache). Previous DB kept in the volume"
+  log "as db.rescue-$ts — verify the homeserver, then remove it to reclaim space:"
+  log "  docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine rm -rf /live/db.rescue-$ts"
 }
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the

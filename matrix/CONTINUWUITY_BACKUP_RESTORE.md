@@ -40,16 +40,35 @@ refs from the DB and boots clean. Requirement: the `media/` **dir must exist**
 `prune_missing_media=true` → `Opened database sequence=136357634` → `Services
 startup complete`, all 2755 dangling refs pruned.
 
+## Volume topology: the DB lives in a `db/` SUBDIR (not the volume root)
+
+`CONTINUWUITY_DATABASE_PATH=/var/lib/continuwuity/db` — the RocksDB tree +
+`media/` sit in a `db/` subdirectory of the `continuwuity_data` volume, **not at
+the volume root**. This is the single design decision that makes restore/rollback
+a **single atomic directory rename** instead of a per-file promote with ordering
+guarantees. Work dirs (`db-staging`, `db.rescue-<ts>`) are then *siblings* of
+`db/`, entirely outside `database_path`, so they can never coexist inside the tree
+RocksDB opens (the old root layout needed dotfile-exclusion `find` filters
+everywhere precisely because the work dirs polluted the DB directory).
+
+**One-time migration** from the old root layout:
+`scripts/migrate-continuwuity-topology.sh` (idempotent, fail-closed, refuses to run
+while continuwuity is up). It relocates the root DB tree into `db/`. This MUST run
+**before** the new compose starts continuwuity — on the new path an empty `db/`
+looks like a fresh homeserver and continuwuity would mint a NEW signing key.
+
 ## Restore design (`restore_continuwuity`)
 
-Mirror `_restore_island_core`: build the replacement **inside the live volume**
-(same filesystem → real atomic `mv`), never touch live bytes until a validated
-replacement exists, keep the old tree as a timestamped rescue.
+Build the replacement **inside the live volume** (same filesystem → real atomic
+`mv`), never touch live bytes until a validated replacement exists, keep the old
+DB as a timestamped rescue.
 
 1. `fetch_backups`; require `continuwuity.tar.gz.age`. Read `MATRIX_SERVER_NAME`
    from `~/apps/matrix/.env` (needed for the validate-boot).
 2. Typed-consent gate (`restore-continuwuity`) — irreversible.
-3. **Stage** into `continuwuity_data/.restore-staging/` (hidden; live still running):
+   **Topology guard (fail-closed):** assert `db/CURRENT` exists — refuse on the old
+   root layout and point at the migration script.
+3. **Stage** into `continuwuity_data/db-staging/` (sibling of `db/`; live still running):
    - Decrypt+extract the RocksDB backup to a scratch dir. **Sentinel**: assert
      `meta/`, `shared_checksum/*.sst`, and `private/<id>/CURRENT` present — a
      truncated tar aborts here, live untouched.
@@ -64,15 +83,17 @@ replacement exists, keep the old tree as a timestamped rescue.
    media`/`Corruption`. Exact prod image = real RocksDB (no `ldb` version-skew —
    `ldb checkconsistency` is rejected by continuwuity's newer OPTIONS keys). Clean
    `docker stop` (SIGTERM) so the staged DB closes before promotion.
-5. **Swap** (in-volume, completion-oracle rollback): stop continuwuity; move the
-   live tree into `.rescue-<ts>/` via `find` (dotfile-inclusive — never a glob `*`,
-   which skips dotfiles); promote the staged tree **CURRENT LAST** so
-   `CURRENT`-at-root is a reliable "promotion completed" signal; completeness-gate
-   on `CURRENT` + `media/` + ≥1 SST. On failure, rollback keys on `CURRENT`-absent
-   (the CURRENT-last ordering makes that correct even for a partial promote) and
-   restores the rescue. Keep the rescue tree. (Multi-`mv` is inherent — a volume
-   root can't be atomically renamed — so the guarantee is "CURRENT-last + rollback
-   on incomplete", not a single rename; cage-match #141.)
+5. **Swap** (two atomic dir renames): stop continuwuity; `mv db db.rescue-<ts>`
+   then `mv db-staging db`; completeness-gate the promoted `db/` on
+   `CURRENT` + `media/` + ≥1 SST. Because `db/` is a self-contained subdir, the
+   install is a single `rename(2)` — no per-file promote, no CURRENT-ordering, no
+   dotfile hazard, no merge onto remnants. The only window is the microscopic gap
+   *between* the two renames where `db/` momentarily doesn't exist; a crash there
+   leaves `db.rescue-<ts>` intact and recovery is one `mv` (spelled out in the
+   error). On any failure the rescue is moved straight back. Keep the rescue tree.
+   (This dissolves the CURRENT-last ordering + completion-oracle rollback that
+   cage-match #141 rounds 3–5 spent hardening — the complexity was a symptom of
+   the DB living at the volume root, fixed here by moving it down one level.)
 6. **Restart**; loud error + rescue path on restart failure.
 
 **Deploy-order gate:** the `prune_missing_media=true` compose change must be
