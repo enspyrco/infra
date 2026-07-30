@@ -68,6 +68,14 @@ _validate_pg_dump() {
   if ! grep -q 'CREATE TABLE' "$f"; then
     error "$svc: dump has no CREATE TABLE (empty/wrong DB) — refusing (live DB untouched)"; return 1
   fi
+  # Refuse dumps that can switch databases mid-replay: a `\connect`/`\c` meta-command
+  # or a `CREATE DATABASE` (as emitted by pg_dump --create / pg_dumpall) would make
+  # psql reconnect to the LIVE db and replay there, BEFORE the atomic swap — breaking
+  # the "temp DB only, live untouched" invariant (cage-match #140, Carnot). Our backups
+  # are plain `pg_dump <db>` (no --create), so a real backup never trips this.
+  if grep -qE '^[[:space:]]*(\\c|\\connect|CREATE DATABASE)\b' "$f"; then
+    error "$svc: dump contains \\connect / CREATE DATABASE (could reconnect to the live DB mid-replay) — refusing. Expected a plain 'pg_dump <db>' dump."; return 1
+  fi
   return 0
 }
 
@@ -158,8 +166,11 @@ _restore_pg_atomic() {
   # 2. Integrity gate: the candidate must have loaded at least one public table.
   local ntables
   ntables=$(docker exec "$container" psql -U "$user" -d "$temp" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null)
-  if ! [ "$ntables" -ge 1 ] 2>/dev/null; then
-    error "$svc: temp DB has no public tables (empty/wrong dump) — live $db UNTOUCHED. Dropping temp."
+  # Validate ntables is actually a number before the -ge (a failed docker exec /
+  # psql can emit a non-numeric error line, which would make `[ -ge ]` itself
+  # error — treat any non-digit result as a failed gate, live untouched).
+  if ! [[ "$ntables" =~ ^[0-9]+$ ]] || [ "$ntables" -lt 1 ]; then
+    error "$svc: temp DB integrity gate failed (no public tables, or count query errored: '$ntables') — live $db UNTOUCHED. Dropping temp."
     docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
     return 1
   fi
@@ -171,18 +182,26 @@ _restore_pg_atomic() {
   docker compose up -d postgres >/dev/null 2>&1
   for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
 
-  # 4. Atomic swap: rename live->rescue then temp->live. Terminate any stragglers
-  #    first. If the second rename fails, roll rescue back so live is never lost.
+  # 4. Atomic swap: rename live->rescue then temp->live. FENCE connections first —
+  #    ALLOW_CONNECTIONS false blocks new connects, so an external client/supervisor
+  #    outside this compose project can't reconnect between the terminate and the
+  #    rename (cage-match #140, Carnot). Terminate stragglers, then rename. If the
+  #    second rename fails, roll rescue back so live is never lost.
+  docker exec "$container" psql -U "$user" -d postgres -c \
+    "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS false; ALTER DATABASE \"$temp\" WITH ALLOW_CONNECTIONS false;" >/dev/null 2>&1
   docker exec "$container" psql -U "$user" -d postgres -c \
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('$db','$temp') AND pid <> pg_backend_pid();" >/dev/null 2>&1
   if ! docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$db\" RENAME TO \"$rescue\";" >/dev/null 2>&1; then
     error "$svc: could not rename live $db -> rescue (connections still open?) — live UNTOUCHED, temp $temp left for inspection."
+    # Un-fence live so the app can reconnect when it comes back up.
+    docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1
     docker compose up -d >/dev/null 2>&1
     return 1
   fi
   if ! docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$temp\" RENAME TO \"$db\";" >/dev/null 2>&1; then
     error "$svc: rename temp -> live FAILED after live moved to rescue — rolling back rescue -> live."
     if docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "ALTER DATABASE \"$rescue\" RENAME TO \"$db\";" >/dev/null 2>&1; then
+      docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1
       error "$svc: rolled back — live $db is the original; temp $temp left for inspection."
     else
       error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue', candidate under '$temp'. Manual recovery needed; app NOT restarted."
@@ -191,6 +210,8 @@ _restore_pg_atomic() {
     docker compose up -d >/dev/null 2>&1
     return 1
   fi
+  # Un-fence the new live DB (it inherited ALLOW_CONNECTIONS false from the temp).
+  docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1
 
   # 5. Success — previous live kept as $rescue (drop it manually once satisfied).
   log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). Bringing app up..."
