@@ -183,22 +183,28 @@ _restore_pg_atomic() {
   # leaning on `set -e` (cage-match #140 round 2: Carnot/Tesla/Wu all flagged bare
   # set -e commands with no recovery). _pgx runs a psql statement with ON_ERROR_STOP
   # and returns its status; _unfence best-effort re-enables connections on a DB.
+  # _pgx runs a CHECKED psql statement (ON_ERROR_STOP) — always used in `if !` so
+  # set -e never aborts on it. _unfence + _apprestart are BEST-EFFORT recovery: they
+  # end in `|| true` so a failure can never trip set -e and skip the recovery step
+  # that follows (cage-match #140 r3, Carnot+Tesla: "best-effort under set -e is a
+  # lie"). The critical path is the explicit `if !` checks, not set -e.
   _pgx() { docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "$1" >/dev/null 2>&1; }
-  _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1; }
+  _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1 || true; }
+  _apprestart() { docker compose up -d >/dev/null 2>&1 || true; }
 
   # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
   #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
   #    ASSERT readiness — a not-ready postgres must not proceed to fence/rename.
   log "$svc: stopping app for the atomic swap..."
-  docker compose stop >/dev/null 2>&1
+  docker compose stop >/dev/null 2>&1 || true
   if ! docker compose up -d postgres >/dev/null 2>&1; then
     error "$svc: postgres failed to restart for the swap — live $db UNTOUCHED, temp $temp left. Bringing app back up."
-    docker compose up -d >/dev/null 2>&1; return 1
+    _apprestart; return 1
   fi
   for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
   if ! docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1; then
     error "$svc: postgres not ready after restart — live $db UNTOUCHED, temp $temp left. Bringing app back up."
-    docker compose up -d >/dev/null 2>&1; return 1
+    _apprestart; return 1
   fi
 
   # 4. Atomic swap. FENCE connections first (ALLOW_CONNECTIONS false) so an external
@@ -208,17 +214,17 @@ _restore_pg_atomic() {
   #    the live rename, live is still $db and UNTOUCHED — un-fence it and restart.
   if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS false; ALTER DATABASE \"$temp\" WITH ALLOW_CONNECTIONS false;"; then
     error "$svc: could not fence connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
-    _unfence "$db"; docker compose up -d >/dev/null 2>&1; return 1
+    _unfence "$db"; _apprestart; return 1
   fi
   if ! _pgx "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('$db','$temp') AND pid <> pg_backend_pid();"; then
     error "$svc: could not terminate live connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
-    _unfence "$db"; docker compose up -d >/dev/null 2>&1; return 1
+    _unfence "$db"; _apprestart; return 1
   fi
   # Rename live->rescue, then temp->live. If the second rename fails, roll rescue
   # back so live is never lost.
   if ! _pgx "ALTER DATABASE \"$db\" RENAME TO \"$rescue\";"; then
     error "$svc: could not rename live $db -> rescue (connections still open?) — live UNTOUCHED, temp $temp left."
-    _unfence "$db"; docker compose up -d >/dev/null 2>&1; return 1
+    _unfence "$db"; _apprestart; return 1
   fi
   if ! _pgx "ALTER DATABASE \"$temp\" RENAME TO \"$db\";"; then
     error "$svc: rename temp -> live FAILED after live moved to rescue — rolling back rescue -> live."
@@ -226,26 +232,32 @@ _restore_pg_atomic() {
       _unfence "$db"
       error "$svc: rolled back — live $db is the original; temp $temp left for inspection."
     else
-      error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue', candidate under '$temp'. Manual recovery needed; app NOT restarted."
+      error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue' (run: ALTER DATABASE \"$rescue\" RENAME TO \"$db\"; ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;), candidate under '$temp'. Manual recovery needed; app NOT restarted."
       return 1
     fi
-    docker compose up -d >/dev/null 2>&1; return 1
+    _apprestart; return 1
   fi
 
   # 5. Un-fence the new live DB — CHECKED. It inherited ALLOW_CONNECTIONS false from
   #    the temp; if this fails, the app would come up against a DB that refuses
-  #    connections (a silent RC=0 false-success — Tesla). Error loudly instead.
+  #    connections (a silent RC=0 false-success — Tesla). Keep the app STOPPED and
+  #    error loudly (starting it against a fenced DB just crash-loops — Carnot r3).
   if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;"; then
-    error "$svc: swap done but FAILED to re-enable connections on live $db — the app cannot connect. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then restart. Previous live kept as '$rescue'."
-    docker compose up -d >/dev/null 2>&1; return 1
+    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose up -d'. Previous live kept as '$rescue'."
+    return 1
   fi
   # Re-enable the rescue DB too so operators can inspect it without a manual ALTER
-  # (it inherited the fence when it was still the live $db — Carnot :207).
+  # (it inherited the fence when it was still the live $db — Carnot :207). Best-effort.
   _unfence "$rescue"
 
-  # Success — previous live kept as $rescue (drop it manually once satisfied).
-  log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). Bringing app up..."
-  docker compose up -d >/dev/null 2>&1
+  # Success — previous live kept as $rescue (drop it manually once satisfied). Check
+  # the app restart: the data swap already succeeded, so a restart failure is a warn
+  # (not a data-loss error), but don't print "complete" as if the service is up.
+  if docker compose up -d >/dev/null 2>&1; then
+    log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). App restarted."
+    return 0
+  fi
+  warn "$svc: atomic swap complete and data is live, but 'docker compose up -d' failed to restart the app — run it manually. Previous live kept as '$rescue'."
   return 0
 }
 
