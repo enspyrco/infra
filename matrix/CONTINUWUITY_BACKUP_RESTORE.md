@@ -63,11 +63,28 @@ replacement exists, keep the old tree as a timestamped rescue.
    media`/`Corruption`. Exact prod image = real RocksDB (no `ldb` version-skew —
    `ldb checkconsistency` is rejected by continuwuity's newer OPTIONS keys). Clean
    `docker stop` (SIGTERM) so the staged DB closes before promotion.
-5. **Swap** (atomic, in-volume): stop continuwuity; `mv` the live tree (all
-   non-dot entries — continuwuity creates no dotfiles) into `.rescue-<ts>/`; `mv
-   .restore-staging/*` to root; `rmdir` staging; sanity-check `CURRENT` present.
-   Any failure → roll the rescue back. Keep the rescue tree.
+5. **Swap** (in-volume, completion-oracle rollback): stop continuwuity; move the
+   live tree into `.rescue-<ts>/` via `find` (dotfile-inclusive — never a glob `*`,
+   which skips dotfiles); promote the staged tree **CURRENT LAST** so
+   `CURRENT`-at-root is a reliable "promotion completed" signal; completeness-gate
+   on `CURRENT` + `media/` + ≥1 SST. On failure, rollback keys on `CURRENT`-absent
+   (the CURRENT-last ordering makes that correct even for a partial promote) and
+   restores the rescue. Keep the rescue tree. (Multi-`mv` is inherent — a volume
+   root can't be atomically renamed — so the guarantee is "CURRENT-last + rollback
+   on incomplete", not a single rename; cage-match #141.)
 6. **Restart**; loud error + rescue path on restart failure.
+
+**Deploy-order gate:** the `prune_missing_media=true` compose change must be
+deployed to the host BEFORE a media-less restore is run — otherwise the post-swap
+`docker compose start` uses an on-disk compose lacking the flag and crash-loops on
+the media check. Deploy `matrix` (compose) before exercising the restore.
+
+**Named tradeoff — `prune_missing_media` is permanent, not restore-only.** It has to
+be: a media-less restore's *real* post-swap boot uses the on-disk compose, so the
+flag can't be a restore-only injection. Consequence (accepted under media-as-cache):
+a transient real-media I/O miss on a NORMAL restart prunes those refs. Low
+consequence — media is re-fetchable cache — but it is a steady-state behavior
+change, not only a DR path.
 
 ## How the facts were established (local, zero prod load)
 
@@ -93,11 +110,19 @@ blob is a fresh 101 MB object every day, so every day trips the prune, mints a t
 and GitHub never GCs tagged commits. Growth ≈ 100 MB/day, unbounded. The prune
 meant to *stop* bloat is *causing* it.
 
-**Not fixed here.** Tracked separately: (a) reclaim ~4 GB now by deleting the stale
-`archive-*` tags (they pin *superseded* daily snapshots; the latest is what restore
-uses), and (b) move the continuwuity DB blob off git-tags to **object storage**
-(20 GB free on OCI, unused) with lifecycle expiry — the right home for daily binary
-snapshots. The restore logic here is agnostic to where the blob is stored.
+**Partially fixed here.** This PR adds `ARCHIVE_TAG_RETENTION` (default 7) to
+`prune_repo_history_if_needed`, so the prune now self-trims to the newest N archive
+tags each run — the runaway can't recur. The one-time reclaim of the 38 already-stale
+tags was done out-of-band (kept the newest 7; GitHub's GC of the ~3.8 GB is lazy).
+**Still tracked as #32** (the *structural* fix): move the continuwuity DB blob off
+git entirely to **object storage** (20 GB free on OCI, unused) with lifecycle
+expiry — the right home for daily binary snapshots. The restore logic here is
+agnostic to where the blob is stored.
+
+Known residual (pre-existing, not introduced here; → #32): the archive tag name is
+day-granular (`archive-$DATE`), so a second prune on the same UTC day collides on
+`git tag` and the function returns after a local orphan commit — self-heals on the
+next run's re-clone, but the object-storage move should retire the whole tag scheme.
 
 ## Deploy
 

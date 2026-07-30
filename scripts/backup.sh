@@ -499,21 +499,32 @@ prune_repo_history_if_needed() {
     return 1
   fi
 
-  # Cap archive-tag retention (best-effort; a failed delete is non-fatal — it just
-  # leaves an extra tag for next run). List archive tags on ORIGIN (a shallow clone
-  # has no local tags), keep the newest N, delete the rest. The end-anchored grep
-  # excludes any `^{}` deref lines; sort -ru gives newest-first, unique.
+  # Cap archive-tag retention. List archive tags on ORIGIN (a shallow clone has no
+  # local tags), keep the newest N, delete the rest. The end-anchored grep excludes
+  # any `^{}` deref lines; sort -ru gives newest-first, unique. Failures here don't
+  # fail the (already-succeeded) prune, but they are NOT silenced: an ls-remote
+  # failure means bloat pruning silently stopped, so it's surfaced + alerted
+  # (cage-match #141 Kelvin/Carnot/Tesla: the old `2>/dev/null` + pipe-to-`tail`
+  # fail-open let bloat resume in the dark — and the `| tail` masked git's own exit,
+  # the very pipe-masks-exit class this PR exists to kill).
   local keep=${ARCHIVE_TAG_RETENTION:-7}
-  local old_tags
-  old_tags=$(git -C "$repo" ls-remote --tags origin 2>/dev/null \
-    | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
-    | sort -ru | tail -n +$((keep + 1)))
-  if [ -n "$old_tags" ]; then
-    # shellcheck disable=SC2086
-    if git -C "$repo" push --delete origin $old_tags 2>&1 | tail -2; then
-      log "archive-tag retention: kept newest $keep, pruned $(echo "$old_tags" | wc -l | tr -d ' ') old tag(s)"
-    else
-      error "archive-tag retention: some old tags not deleted (non-fatal, retried next run)"
+  local remote_tags
+  if ! remote_tags=$(git -C "$repo" ls-remote --tags origin 2>&1); then
+    error "archive-tag retention: ls-remote failed — bloat pruning SKIPPED this run (retries next run): $remote_tags"
+    send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag ls-remote failed; repo-bloat pruning skipped this run. Repo growth may resume until the next successful run.')" || true
+  else
+    local old_tags
+    old_tags=$(printf '%s\n' "$remote_tags" \
+      | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
+      | sort -ru | tail -n +$((keep + 1)))
+    if [ -n "$old_tags" ]; then
+      local del_out
+      # shellcheck disable=SC2086
+      if del_out=$(git -C "$repo" push --delete origin $old_tags 2>&1); then
+        log "archive-tag retention: kept newest $keep, pruned $(echo "$old_tags" | wc -l | tr -d ' ') old tag(s)"
+      else
+        error "archive-tag retention: some old tags not deleted (non-fatal, retried next run): $del_out"
+      fi
     fi
   fi
 }

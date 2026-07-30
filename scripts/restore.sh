@@ -762,7 +762,7 @@ restore_continuwuity() {
         for f in "$bk"/shared_checksum/*.sst; do
           b=$(basename "$f" .sst); cp "$f" "/live/.restore-staging/${b%%_*}.sst"
         done
-        cp "$bk/private/$id/"* /live/.restore-staging/
+        cp -a "$bk/private/$id/." /live/.restore-staging/   # -a . copies dotfiles too
         # Empty media/ dir must EXIST (not just be absent): prune_missing_media
         # prunes missing FILES, but a missing media DIR is a hard I/O error. With
         # the dir present + empty, the validate-boot prunes all dangling refs and
@@ -797,7 +797,11 @@ restore_continuwuity() {
   for _ in $(seq 1 40); do
     sleep 3
     vlogs=$(docker logs continuwuity-restore-check 2>&1)
-    if echo "$vlogs" | grep -q "Services startup complete"; then vok=1; break; fi
+    # Success is a CHORD, not one note (cage-match #141 Tesla): reached full startup
+    # AND opened the DB with a NON-ZERO sequence — the latter rejects a soft-wrong or
+    # empty/fresh DB (sequence=0) that could otherwise still log "startup complete".
+    if echo "$vlogs" | grep -q "Services startup complete" \
+       && echo "$vlogs" | grep -qE "Opened database.*sequence=[1-9]"; then vok=1; break; fi
     # Fatal-only patterns. Deliberately NOT matching bare "missing"/"error":
     # offline startup (--network none) emits benign DNS/announcement errors; a
     # real missing-SST surfaces as "Corruption" or a container exit (both caught).
@@ -825,21 +829,35 @@ restore_continuwuity() {
         ts="'"$ts"'"
         cd /live
         mkdir ".rescue-$ts"
-        # Continuwuity/RocksDB create no top-level dotfiles, so `*` is exactly the
-        # live tree; our .restore-staging/.rescue-* are hidden and excluded.
-        for e in *; do
-          [ "$e" = "*" ] && continue           # nullglob guard (no live files)
-          mv "$e" ".rescue-$ts/"
-        done
-        mv .restore-staging/* ./
-        rmdir .restore-staging
-        [ -f CURRENT ] || { echo "post-swap sanity: CURRENT missing" >&2; exit 1; }
+        # Move the ENTIRE live tree into rescue via find (NOT glob `*`, which skips
+        # dotfiles — cage-match #141 Kelvin/Carnot/Tesla: a stray dotfile left at
+        # root would coexist with the restored DB). Exclude only our own work dirs.
+        find . -mindepth 1 -maxdepth 1 ! -name ".restore-staging" ! -name ".rescue-*" \
+          | while IFS= read -r p; do mv "$p" ".rescue-$ts/"; done
+        # Promote the staged tree, CURRENT LAST. RocksDB cannot open without CURRENT,
+        # so CURRENT-at-root is a reliable "promotion completed" oracle: a partial
+        # promotion (ENOSPC / kill mid-move) leaves CURRENT ABSENT, and the rollback
+        # below keys on exactly that (cage-match #141: the old [ -f CURRENT ] gate
+        # false-closed when CURRENT moved early in a partial promote).
+        find .restore-staging -mindepth 1 -maxdepth 1 ! -name CURRENT \
+          | while IFS= read -r p; do mv "$p" ./; done
+        [ -f .restore-staging/CURRENT ] && mv .restore-staging/CURRENT ./
+        rmdir .restore-staging 2>/dev/null || true
+        # Completeness gate — not just CURRENT: a whole tree has CURRENT + a media/
+        # dir (our invariant: missing dir = boot I/O error) + at least one SST.
+        { [ -f CURRENT ] && [ -d media ] && ls ./*.sst >/dev/null 2>&1; } \
+          || { echo "post-swap sanity failed (incomplete tree)" >&2; exit 1; }
       '; then
     error "SWAP FAILED — rolling back to the rescued live tree..."
     docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
         ts="'"$ts"'"; cd /live
+        # CURRENT-last promotion ⇒ CURRENT-absent means the promote did not complete;
+        # restore the rescued tree (incl dotfiles) back to root. Any orphan staged
+        # SST already promoted is harmless — RocksDB ignores SSTs absent from the
+        # rescued MANIFEST.
         if [ ! -f CURRENT ] && [ -d ".rescue-$ts" ]; then
-          for e in ".rescue-$ts"/*; do [ -e "$e" ] && mv "$e" ./; done
+          find ".rescue-$ts" -mindepth 1 -maxdepth 1 \
+            | while IFS= read -r p; do mv "$p" ./; done
           rmdir ".rescue-$ts" 2>/dev/null || true
         fi' 2>/dev/null || error "ROLLBACK ALSO FAILED — inspect volume ${CONTINUWUITY_DATA_VOL} manually"
     ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) || error "restart after rollback FAILED — start continuwuity manually"
@@ -850,7 +868,7 @@ restore_continuwuity() {
     || { error "restore installed but restart FAILED — run: cd $MATRIX_COMPOSE_DIR && docker compose start continuwuity"; cleanup_backups; exit 1; }
 
   cleanup_backups
-  log "Continuwuity restored (RocksDB + media). Previous tree kept in the volume"
+  log "Continuwuity restored (DB-only; media refs pruned as cache). Previous tree kept in the volume"
   log "as .rescue-$ts — verify the homeserver, then remove it to reclaim space:"
   log "  docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine rm -rf /live/.rescue-$ts"
 }
