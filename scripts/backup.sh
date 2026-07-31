@@ -543,16 +543,22 @@ prune_repo_history_if_needed() {
         # name ever contained whitespace and prone to an over-long argv. A per-tag
         # loop is boring and robust; del_count is 0-1 in steady state so the extra
         # calls are immaterial. del_fail stays in scope via a here-string (not a pipe).
-        local del_fail=0 tag
+        local del_fail=0 tag del_err last_err=""
         while IFS= read -r tag; do
           [ -n "$tag" ] || continue
-          git -C "$repo" push --delete origin "$tag" >/dev/null 2>&1 || del_fail=$((del_fail + 1))
+          # Capture stderr (cage-match #141 r7 Kelvin): a failed remote delete's WHY
+          # is diagnostic (auth revoked, protected ref, network) and must reach the
+          # log/alert, not /dev/null. Keep the last error for the alert body.
+          if ! del_err=$(git -C "$repo" push --delete origin "$tag" 2>&1); then
+            del_fail=$((del_fail + 1)); last_err="$del_err"
+            error "archive-tag retention: failed to delete '$tag': $del_err"
+          fi
         done <<< "$old_tags"
         if [ "$del_fail" -eq 0 ]; then
           log "archive-tag retention: kept newest $keep, pruned $del_count old tag(s)"
         else
           error "archive-tag retention: $del_fail of $del_count old tags not deleted (non-fatal, retried next run)"
-          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed for %s of %s tags; repo-bloat pruning incomplete this run.' "$del_fail" "$del_count")" || true
+          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed for %s of %s tags; repo-bloat pruning incomplete this run. Last error: %s' "$del_fail" "$del_count" "$last_err")" || true
         fi
       fi
     fi
