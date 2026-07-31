@@ -748,6 +748,14 @@ restore_continuwuity() {
     error "Run the one-time migration first: scripts/migrate-continuwuity-topology.sh"
     cleanup_backups; exit 1
   fi
+  # Refuse if a prior restore died in the between-renames gap (cage-match #141 r6):
+  # the marker names the rescue/candidate dirs. Re-running blindly could promote over
+  # a half-swapped tree — make the operator inspect + recover first.
+  if docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '[ -f /live/RESTORE_IN_PROGRESS ]'; then
+    error "A previous restore left RESTORE_IN_PROGRESS in ${CONTINUWUITY_DATA_VOL} — it may have died mid-swap."
+    error "Inspect and recover before retrying: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'cd /live && cat RESTORE_IN_PROGRESS && ls -d db db.rescue-* db-staging 2>/dev/null'"
+    cleanup_backups; exit 1
+  fi
 
   # ---- STAGE (live continuwuity still running; db-staging is a SIBLING of db,
   # OUTSIDE database_path, so it can never coexist inside the live DB tree) ----
@@ -863,23 +871,37 @@ restore_continuwuity() {
         set -e
         ts="'"$ts"'"
         cd /live
+        # Self-describing recovery marker written BEFORE the first rename and removed
+        # only on success (cage-match #141 r6 Carnot/Tesla/Maxwell). If the host dies
+        # in the between-renames gap, this marker names the rescue + candidate dirs so
+        # recovery is not folklore — and the topology guard at the top of a re-run
+        # refuses on its presence instead of seeing an absent db/ as "un-migrated".
+        printf "rescue=db.rescue-%s\ncandidate=db-staging\n" "$ts" > /live/RESTORE_IN_PROGRESS
         # Rescue the live DB, then promote the staged tree. Two renames, same fs.
         # The topology guard above proved db/ exists, so the first rename must work;
         # treat its failure as fatal BEFORE we have disturbed anything promotable.
-        mv db "db.rescue-$ts" || { echo "could not rescue live db/ — aborting, live intact" >&2; exit 1; }
+        mv db "db.rescue-$ts" || { echo "could not rescue live db/ — aborting, live intact" >&2; rm -f /live/RESTORE_IN_PROGRESS; exit 1; }
         if ! mv db-staging db; then
           # Promote failed with db/ already moved aside: put it straight back.
           echo "promote (mv db-staging db) failed — restoring rescued db/" >&2
           mv "db.rescue-$ts" db 2>/dev/null || echo "ROLLBACK mv FAILED — db/ is at db.rescue-$ts" >&2
+          rm -f /live/RESTORE_IN_PROGRESS
           exit 1
         fi
-        # Completeness gate on the promoted tree — CURRENT + media/ + >=1 SST.
-        { [ -f db/CURRENT ] && [ -d db/media ] && ls db/*.sst >/dev/null 2>&1; } \
-          || { echo "post-swap sanity failed (incomplete tree) — rolling back" >&2
-               rm -rf db; mv "db.rescue-$ts" db 2>/dev/null || echo "ROLLBACK mv FAILED — old tree at db.rescue-$ts" >&2
-               exit 1; }
+        # Completeness gate on the promoted tree — CURRENT + media/ + >=1 SST. On
+        # failure, move the incomplete candidate ASIDE (NOT rm -rf: never destroy a
+        # tree on the signing-key path — cage-match #141 r6 Tesla) then restore the
+        # rescued tree; both trees survive for inspection either way.
+        if ! { [ -f db/CURRENT ] && [ -d db/media ] && ls db/*.sst >/dev/null 2>&1; }; then
+          echo "post-swap sanity failed (incomplete tree) — rolling back (candidate kept as db.failed-$ts)" >&2
+          mv db "db.failed-$ts" 2>/dev/null || echo "WARN: could not set candidate aside" >&2
+          mv "db.rescue-$ts" db 2>/dev/null || echo "ROLLBACK mv FAILED — old tree at db.rescue-$ts" >&2
+          rm -f /live/RESTORE_IN_PROGRESS
+          exit 1
+        fi
+        rm -f /live/RESTORE_IN_PROGRESS
       '; then
-    error "SWAP FAILED — see message above. The previous DB is preserved as db.rescue-* in the volume."
+    error "SWAP FAILED — see message above. The previous DB is preserved as db.rescue-$ts in the volume (candidate, if any, as db.failed-$ts)."
     error "Manual recovery if needed: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'cd /live && rm -rf db && mv db.rescue-$ts db'"
     ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) || error "restart after rollback FAILED — start continuwuity manually"
     cleanup_backups; exit 1
@@ -914,7 +936,37 @@ restore_continuwuity() {
     grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" <<< "$llog" && break
   done
   if [ "$live_ok" != "1" ]; then
-    error "Restore installed, but live continuwuity did NOT reach 'Services startup complete'. Most likely the on-disk compose lacks CONTINUWUITY_PRUNE_MISSING_MEDIA=true — deploy the matrix compose change first. Swapped tree is live; prior tree at db.rescue-$ts. Inspect: cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity"
+    # AUTO-ROLLBACK to the rescued (old) identity (cage-match #141 r6 Carnot/Tesla):
+    # the completion oracle is the LIVE boot, not the swap — so a live-verify failure
+    # must restore the known-good old tree, not leave production pointing at a DB that
+    # won't come up. Preserve the failed candidate as db.failed-live-$ts (no rm on the
+    # signing-key path); the old tree booted fine before the swap, so it will boot now
+    # (it carries its own media — the prune flag it may lack is only needed by the
+    # media-less RESTORED tree, which is exactly what failed).
+    error "Live continuwuity did NOT reach 'Services startup complete' on the restored tree — rolling back to the previous DB."
+    ( cd "$MATRIX_COMPOSE_DIR" && docker compose stop continuwuity ) || error "WARN: could not stop continuwuity before rollback"
+    if docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
+          set -e; ts="'"$ts"'"; cd /live
+          [ -d "db.rescue-$ts" ] || { echo "rescue db.rescue-$ts missing — cannot roll back" >&2; exit 1; }
+          mv db "db.failed-live-$ts" 2>/dev/null || echo "WARN: could not set failed candidate aside" >&2
+          mv "db.rescue-$ts" db'; then
+      local rb_ts; rb_ts=$(date +%s)
+      ( cd "$MATRIX_COMPOSE_DIR" && docker compose start continuwuity ) || error "WARN: restart after rollback FAILED — start continuwuity manually"
+      local rb_ok=0
+      for _i in $(seq 1 20); do
+        sleep 3
+        local rblog; rblog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since "$rb_ts" continuwuity 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' )
+        if grep -q "Services startup complete" <<< "$rblog" \
+           && grep -qE "Opened database.*sequence=[1-9]" <<< "$rblog"; then rb_ok=1; break; fi
+      done
+      if [ "$rb_ok" = "1" ]; then
+        error "ROLLED BACK: previous DB is live again (verified). Failed restored tree kept as db.failed-live-$ts for inspection. Likely cause: on-disk compose lacks CONTINUWUITY_PRUNE_MISSING_MEDIA=true, or a wrong MATRIX_SERVER_NAME/image. Fix, then re-run the restore."
+      else
+        error "ROLLBACK INSTALLED the previous DB but it did NOT verify clean either — inspect: cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity. Old tree at db/, failed restored tree at db.failed-live-$ts."
+      fi
+    else
+      error "AUTO-ROLLBACK FAILED — restored tree is still at db/, previous tree at db.rescue-$ts. Recover manually: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'cd /live && mv db db.failed-live-$ts && mv db.rescue-$ts db' then: cd $MATRIX_COMPOSE_DIR && docker compose up -d continuwuity"
+    fi
     cleanup_backups; exit 1
   fi
 

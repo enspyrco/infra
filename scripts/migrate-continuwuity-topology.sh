@@ -60,9 +60,20 @@ docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
   set -e
   cd /live
 
-  # Already migrated? (complete db/ tree present) -> no-op.
+  # Split-brain guard (cage-match #141 r6 Carnot/Tesla): db/CURRENT alone is NOT
+  # proof of a clean migration. If db/ has a DB *and* the root still has a RocksDB
+  # tree, two generations coexist — the dangerous case being the new compose having
+  # booted a FRESH homeserver under db/ (new signing key) while the REAL key DB sits
+  # untouched at the root. Blessing that as "already migrated" would orphan the real
+  # signing key. Fail closed and force an operator decision instead of a silent no-op.
   if [ -f db/CURRENT ]; then
-    echo "[migrate-topology] db/CURRENT already present — already migrated, nothing to do."
+    if [ -f CURRENT ] || ls ./*.sst >/dev/null 2>&1; then
+      echo "[migrate-topology] ERROR: SPLIT BRAIN — db/CURRENT exists AND a RocksDB tree remains at the volume root." >&2
+      echo "[migrate-topology] Two DB generations coexist. The root tree may be the REAL signing-key DB and db/ a fresh-key DB minted by an early compose start." >&2
+      echo "[migrate-topology] Do NOT start continuwuity. Inspect both trees (compare sequence numbers by booting each read-only) and keep the correct one before migrating. Refusing to no-op." >&2
+      exit 1
+    fi
+    echo "[migrate-topology] db/CURRENT present and root is clean — already migrated, nothing to do."
     exit 0
   fi
 

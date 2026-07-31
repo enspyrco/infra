@@ -538,13 +538,21 @@ prune_repo_history_if_needed() {
         error "archive-tag retention: $del_count tags queued for delete exceeds ceiling $del_ceiling — REFUSING (possible bad ls-remote parse), no tags deleted"
         send_telegram_alert "$(printf '<b>Backup Retention BLOCKED</b>\n%s archive tags queued for delete (ceiling %s) — refused as a likely parse error; no tags deleted.' "$del_count" "$del_ceiling")" || true
       else
-        local del_out
-        # shellcheck disable=SC2086
-        if del_out=$(git -C "$repo" push --delete origin $old_tags 2>&1); then
+        # Delete one tag per call via a read loop (cage-match #141 r6 Carnot): the
+        # old single unquoted `$old_tags` leaned on word-splitting — brittle if a tag
+        # name ever contained whitespace and prone to an over-long argv. A per-tag
+        # loop is boring and robust; del_count is 0-1 in steady state so the extra
+        # calls are immaterial. del_fail stays in scope via a here-string (not a pipe).
+        local del_fail=0 tag
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          git -C "$repo" push --delete origin "$tag" >/dev/null 2>&1 || del_fail=$((del_fail + 1))
+        done <<< "$old_tags"
+        if [ "$del_fail" -eq 0 ]; then
           log "archive-tag retention: kept newest $keep, pruned $del_count old tag(s)"
         else
-          error "archive-tag retention: some old tags not deleted (non-fatal, retried next run): $del_out"
-          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed; repo-bloat pruning incomplete this run.')" || true
+          error "archive-tag retention: $del_fail of $del_count old tags not deleted (non-fatal, retried next run)"
+          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed for %s of %s tags; repo-bloat pruning incomplete this run.' "$del_fail" "$del_count")" || true
         fi
       fi
     fi
