@@ -735,10 +735,12 @@ restore_continuwuity() {
   # ---- SAFETY GUARD (replaces the entire swap/rescue/rollback apparatus) ----
   # Refuse to run if there is anything to lose. A dead-box DR restore expects an
   # EMPTY volume; if a DB is present or the server is up, this is the wrong tool.
-  # Here-string, not `docker ps | grep -q`: grep -q exits on first match and would
-  # SIGPIPE docker ps, which reads as 141 (no-match) under set -o pipefail — the same
-  # false-negative class this script fights elsewhere. A here-string has no pipe.
-  if grep -qx continuwuity <<< "$(docker ps --format '{{.Names}}')"; then
+  # Key on the compose SERVICE name (stable: 'continuwuity'), NOT the container
+  # name: compose names the container <project>-continuwuity-1 (e.g.
+  # matrix-continuwuity-1 in prod), so a `docker ps` name match on 'continuwuity'
+  # would silently never fire. `compose ps -q --status running <service>` is
+  # non-empty iff the service is up, regardless of project/container naming.
+  if [ -n "$( cd "$MATRIX_COMPOSE_DIR" && docker compose ps -q --status running continuwuity 2>/dev/null )" ]; then
     error "continuwuity is RUNNING — this is a dead-box DR tool, not a hot-swap."
     error "It refuses to replace a live homeserver. If you truly intend to wipe and"
     error "restore, stop it first: (cd $MATRIX_COMPOSE_DIR && docker compose down)."
