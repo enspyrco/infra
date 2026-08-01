@@ -686,16 +686,16 @@ case $SERVICE in
         FAILED_SERVICES+=("$matrix_svc")
       fi
     done
-    # Continuwuity is a single encrypted tarball. Don't run if matrix
-    # bridges failed catastrophically — we'd be wasting time on a single
-    # service in a broader-outage situation. But individual matrix-bridge
-    # failures are fine; continuwuity is independent of bridge state.
-    if backup_continuwuity; then
-      SUCCEEDED+=("continuwuity")
-    else
-      error "continuwuity backup failed"
-      FAILED_SERVICES+=("continuwuity")
-    fi
+    # Continuwuity DB is deliberately NOT backed up nightly (decision 2026-08-02).
+    # The only irreplaceable thing in it is the ~85-byte federation SIGNING KEY,
+    # which is IMMUTABLE — it is exported ONCE to a durable store (password
+    # manager), not re-copied daily. Everything else in the 136MB DB is a
+    # re-derivable mirror: message history lives in the bridged apps, room state
+    # re-federates, media is disposable cache. So a daily 100MB encrypted blob
+    # (the sole driver of backup-repo bloat, #32) bought only a no-re-login
+    # convenience restore. Disaster recovery is now: fresh homeserver + re-inject
+    # the saved signing key + re-bridge. The backup_continuwuity function is kept
+    # for manual use (backup.sh continuwuity) but is not part of the nightly set.
     if [ ${#SUCCEEDED[@]} -gt 0 ]; then
       backup_to_github "${SUCCEEDED[@]}" || FAILED_SERVICES+=("github-upload")
     fi
