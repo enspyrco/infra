@@ -28,6 +28,12 @@ CONTINUWUITY_HOMESERVER='https://matrix.imagineering.cc'
 # exceeds this size, prune_repo_history_if_needed collapses history to a
 # fresh root commit (loses non-essential git history; keeps current files).
 RETENTION_PRUNE_THRESHOLD_MB=300
+# Keep only the newest N archive-* tags. Each prune pins the pre-prune HEAD in an
+# archive-DATE tag; the ~100MB encrypted (undeltable) continuwuity blob it holds is
+# a fresh object GitHub keeps forever while the tag references it. Unbounded, that
+# was 45 tags / 4.37GB (2026-07-30). Capping retention keeps a rolling PITR window
+# without the runaway growth. Structural fix (object storage) tracked separately.
+ARCHIVE_TAG_RETENTION=${ARCHIVE_TAG_RETENTION:-7}
 
 # Colors for output
 RED='\033[0;31m'
@@ -491,6 +497,71 @@ prune_repo_history_if_needed() {
   else
     error "Failed to force-push pruned history; manual intervention needed"
     return 1
+  fi
+
+  # Cap archive-tag retention. List archive tags on ORIGIN (a shallow clone has no
+  # local tags), keep the newest N, delete the rest. The end-anchored grep excludes
+  # any `^{}` deref lines; sort -ru gives newest-first, unique. Failures here don't
+  # fail the (already-succeeded) prune, but they are NOT silenced: an ls-remote
+  # failure means bloat pruning silently stopped, so it's surfaced + alerted
+  # (cage-match #141 Kelvin/Carnot/Tesla: the old `2>/dev/null` + pipe-to-`tail`
+  # fail-open let bloat resume in the dark — and the `| tail` masked git's own exit,
+  # the very pipe-masks-exit class this PR exists to kill).
+  # Fail-closed on this destructive op (cage-match #141 Carnot): a non-positive-int
+  # retention (0 / empty / negative / garbage from a bad cron env) would compute
+  # `tail -n +1` and delete EVERY archive tag. Refuse it and fall back to the safe
+  # default rather than mass-deleting the PITR window.
+  local keep=${ARCHIVE_TAG_RETENTION:-7}
+  case "$keep" in ''|*[!0-9]*) error "ARCHIVE_TAG_RETENTION='$keep' not a non-negative integer — using 7"; keep=7;; esac
+  [ "$keep" -lt 1 ] && { error "ARCHIVE_TAG_RETENTION=$keep < 1 would delete ALL archive tags — using 7"; keep=7; }
+  local remote_tags
+  if ! remote_tags=$(git -C "$repo" ls-remote --tags origin 2>&1); then
+    error "archive-tag retention: ls-remote failed — bloat pruning SKIPPED this run (retries next run): $remote_tags"
+    send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag ls-remote failed; repo-bloat pruning skipped this run. Repo growth may resume until the next successful run.')" || true
+  else
+    local old_tags
+    old_tags=$(printf '%s\n' "$remote_tags" \
+      | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
+      | sort -ru | tail -n +$((keep + 1)))
+    if [ -n "$old_tags" ]; then
+      local del_count; del_count=$(printf '%s\n' "$old_tags" | wc -l | tr -d ' ')
+      # Fail-closed blast-radius cap (cage-match #141 r4 Tesla): a malformed ls-remote
+      # parse must not vacuum the entire archive set in one unattended cron tick.
+      # Steady state deletes 0-1 tags; refuse an implausibly large batch and alert.
+      local del_ceiling=${ARCHIVE_TAG_DELETE_CEILING:-30}
+      # Validate the ceiling too (cage-match #141 r5 Carnot): a garbage env value
+      # would error the integer test and FALL THROUGH to deleting the full set —
+      # the same fail-open class the retention validation above closes.
+      case "$del_ceiling" in ''|*[!0-9]*) error "ARCHIVE_TAG_DELETE_CEILING='$del_ceiling' not an integer — using 30"; del_ceiling=30;; esac
+      [ "$del_ceiling" -lt 1 ] && del_ceiling=30
+      if [ "$del_count" -gt "$del_ceiling" ]; then
+        error "archive-tag retention: $del_count tags queued for delete exceeds ceiling $del_ceiling — REFUSING (possible bad ls-remote parse), no tags deleted"
+        send_telegram_alert "$(printf '<b>Backup Retention BLOCKED</b>\n%s archive tags queued for delete (ceiling %s) — refused as a likely parse error; no tags deleted.' "$del_count" "$del_ceiling")" || true
+      else
+        # Delete one tag per call via a read loop (cage-match #141 r6 Carnot): the
+        # old single unquoted `$old_tags` leaned on word-splitting — brittle if a tag
+        # name ever contained whitespace and prone to an over-long argv. A per-tag
+        # loop is boring and robust; del_count is 0-1 in steady state so the extra
+        # calls are immaterial. del_fail stays in scope via a here-string (not a pipe).
+        local del_fail=0 tag del_err last_err=""
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          # Capture stderr (cage-match #141 r7 Kelvin): a failed remote delete's WHY
+          # is diagnostic (auth revoked, protected ref, network) and must reach the
+          # log/alert, not /dev/null. Keep the last error for the alert body.
+          if ! del_err=$(git -C "$repo" push --delete origin "$tag" 2>&1); then
+            del_fail=$((del_fail + 1)); last_err="$del_err"
+            error "archive-tag retention: failed to delete '$tag': $del_err"
+          fi
+        done <<< "$old_tags"
+        if [ "$del_fail" -eq 0 ]; then
+          log "archive-tag retention: kept newest $keep, pruned $del_count old tag(s)"
+        else
+          error "archive-tag retention: $del_fail of $del_count old tags not deleted (non-fatal, retried next run)"
+          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed for %s of %s tags; repo-bloat pruning incomplete this run. Last error: %s' "$del_fail" "$del_count" "$last_err")" || true
+        fi
+      fi
+    fi
   fi
 }
 
