@@ -1,6 +1,8 @@
 # Free Cloud Servers with OCI Always Free Tier
 
-This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately powerful machines (4 CPU cores, 24GB RAM) and they're **free forever** on Oracle's Always Free tier.
+This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately capable machines (2 CPU cores, 12GB RAM) and they're **free** on Oracle's Always Free tier.
+
+> ⚠️ **Oracle halved the Ampere allowance on 15 June 2026**, from 4 OCPU / 24 GB to **2 OCPU / 12 GB**, with no announcement — just a docs edit. This guide reflects the post-halving numbers.
 
 The catch? Everyone wants one, so they're almost always "out of capacity." Hence the retry script — it tries every 5 minutes until one slips through.
 
@@ -22,14 +24,16 @@ But the ARM instance is just the headliner. The Always Free tier comes with a lo
 
 ### The Full Always Free Inventory
 
-**Compute** — 4.25 CPUs and 26 GB RAM total, across two separate CPU budgets:
+**Compute** — 2.25 CPUs and 14 GB RAM total, across two separate CPU budgets:
 
 | Shape | CPUs | RAM | Max Instances | Notes |
 |-------|------|-----|---------------|-------|
-| VM.Standard.A1.Flex (Arm) | 4 OCPUs | 24 GB | 4 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances |
+| VM.Standard.A1.Flex (Arm) | 2 OCPUs | 12 GB | 2 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances. **Halved from 4/24 on 15 Jun 2026** |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 OCPU each | 1 GB each | 2 | **Independent CPU budget** — doesn't touch the Arm allocation. Burstable above baseline |
 
-The Micro instances are the sleeper pick. They run on completely different x86 hardware, so you're getting extra compute on top of the 4 Arm cores. Each gets its own public IP and 50 Mbps internet bandwidth. Good for monitoring, cron runners, small proxies, or a Tailscale exit node.
+The Arm allowance is metered as **1,500 OCPU-hours + 9,000 GB-hours per month**, which is what 2 OCPU / 12 GB running 24×7 works out to. Because it's hours rather than instances, splitting into 2 × 1 OCPU / 6 GB later costs a rebuild, not quota.
+
+The Micro instances are the sleeper pick. They run on completely different x86 hardware, so you're getting extra compute on top of the 2 Arm cores. Each gets its own public IP and 50 Mbps internet bandwidth. Good for monitoring, cron runners, small proxies, or a Tailscale exit node. They also tend to *have* capacity when Arm doesn't — useful if you want an always-on host to run the retry loop itself.
 
 **Storage:**
 
@@ -188,13 +192,25 @@ Your tenancy OCID doubles as the root compartment ID. You already have this from
 
 ### 4b. Create a VCN (Virtual Network)
 
-OCI Console → Networking → Virtual Cloud Networks → Start VCN Wizard → "Create VCN with Internet Connectivity"
+OCI Console → Networking → Virtual Cloud Networks → **Start VCN Wizard** → "Create VCN with Internet Connectivity"
 
 - Name it whatever you want (e.g., `my-vcn`)
 - Accept defaults
 - Click Create
 
 Once created, go into the VCN → Subnets → click the **Public Subnet** → copy the **Subnet OCID**.
+
+> ⚠️ **Use the wizard, not the plain "Create VCN" button next to it.** *Create VCN* builds a **private-only** network — no internet gateway, empty route table. Everything downstream still appears to work: the script provisions successfully, the instance reaches RUNNING, and OCI assigns it a real public IP. But nothing can reach it and it can't reach anything, and the console gives you no hint that the network is the problem.
+>
+> A public IP is **not** the same as internet reachability. Three layers must all line up — internet gateway → route rule → security list — and plain *Create VCN* gives you only the third.
+
+**Verify before moving on.** This costs 30 seconds and is the cheap version of a multi-hour debug. On the VCN's detail page:
+
+- **Internet Gateways** → lists one, state *Available*. **Empty means you used the wrong button.**
+- **Route Tables** → the table on your public subnet has a rule `0.0.0.0/0 → <your internet gateway>`. An empty rules list is the same fault.
+- **Security Lists** → ingress includes TCP 22.
+
+If a gateway is missing you do **not** need to rebuild — see ["SSH connection times out"](#ssh-connection-times-out) in Troubleshooting for the two commands that repair it in place on a running instance.
 
 ### 4c. Find an ARM Image ID
 
@@ -227,14 +243,28 @@ This creates a key pair. The script will pass the public key to Oracle when crea
 
 ## Step 6: Install Dependencies
 
-On your local machine:
+The script needs three tools on the machine you're running it from: **jq** (parses OCI's JSON), **yq** (reads `accounts.yaml`), and **bc** (compares OCPU counts).
+
+**Linux (Debian/Ubuntu):**
 
 ```bash
-# jq for parsing JSON responses from OCI
 sudo apt-get install -y jq bc
-
-# yq for parsing the accounts config file
 pip3 install yq
+```
+
+**macOS:**
+
+```bash
+brew install jq          # bc ships with macOS already
+pip3 install yq          # NOT `brew install yq` — see the warning below
+```
+
+> ⚠️ **On macOS, do not `brew install yq`.** Homebrew's `yq` is the **Go** implementation (mikefarah), which uses different syntax. The script calls `yq -r '.accounts | length'`, which is **python-yq** (a `jq` wrapper) syntax — the Go version errors on it, and provisioning dies at the dependency check with `ERROR: yq not installed` or a parse error. Always install yq with `pip3 install yq`. If Homebrew's yq is already on your PATH, either remove it (`brew uninstall yq`) or make sure the pip one wins — check with `yq --help | head -1`: python-yq says *"yq: Command-line YAML/XML processor"*, the Go one says *"a lightweight and portable command-line YAML processor"*.
+
+Verify all three resolve:
+
+```bash
+jq --version && yq --version && bc --version | head -1
 ```
 
 ---
@@ -250,6 +280,17 @@ mkdir -p ~/oci-provision
 cp scripts/oci-retry-provision.sh ~/oci-provision/retry-provision.sh
 chmod +x ~/oci-provision/retry-provision.sh
 ```
+
+Keep `retry-provision` in the filename — the auto-disable step runs `crontab -l | grep -v "retry-provision" | crontab -`, so renaming it silently breaks the "stop when finished" behaviour.
+
+**Now edit your copy — two lines matter:**
+
+| Line | Ships as | Change to | Why |
+|---|---|---|---|
+| `SSH_KEY_PATH` (~L14) | `~/.ssh/id_ed25519.pub` | your actual **SSH public key** | Baked into the instance at launch and your *only* way in. A wrong path fails the launch; a stale key gives you a box you can't log into. Must be an SSH public key (`ssh-ed25519 AAAA…`), **not** an OCI API key. |
+| `--boot-volume-size-in-gbs` (~L153) | `50` | **`100`** (up to 200) | 200 GB is your whole-tenancy volume budget and it's free. Growing later works online, but there's no reason to defer it. |
+
+Leave `SMALL_OCPUS=1` / `SMALL_MEM=6` alone — that's the small-first strategy, and raising it is what gets you refused.
 
 Create `~/oci-provision/accounts.yaml` with your details:
 
@@ -307,12 +348,12 @@ When it finally works, you'll see:
 
 Then a few cycles later:
 ```
-🎉 Resize initiated! Instance will reboot with 4 OCPUs.
+🎉 Resize initiated! Instance will reboot with 2 OCPUs.
 ```
 
 And finally:
 ```
-✅ Full instance running (4 OCPUs) at 123.45.67.89 — nothing to do!
+✅ Full instance running (2 OCPUs) at 123.45.67.89 — nothing to do!
 All instances at full capacity! Disabling cron job. 🎊
 ```
 
@@ -327,7 +368,99 @@ Once the instance is running:
 ssh ubuntu@<your-instance-ip>
 ```
 
-Docker is already installed (cloud-init did that). Your 4-core ARM server with 24GB of RAM is ready to go.
+Your 2-core ARM server with 12GB of RAM is ready to go.
+
+**Verify cloud-init actually did its job — don't assume it:**
+
+```bash
+docker --version              # should print a version
+cat /etc/cron.d/keep-alive    # should show the 6-hourly job
+```
+
+> ⚠️ **Cloud-init runs once, at first boot, and marks itself `done` whether or not the commands inside it succeeded.** If the network was broken at that moment (see the Step 4b warning), the `apt-get install docker.io docker-compose` half died with `Network is unreachable` while the parts needing no network — the keep-alive heredoc — completed perfectly. You get a box that looks provisioned and has **no Docker**. Fixing the network afterwards does not retroactively install anything, and cloud-init will never retry.
+>
+> ```bash
+> cloud-init status                                    # "done" even on failure — not a health check
+> grep -iE "Network is unreachable|Failed to fetch" /var/log/cloud-init-output.log
+> sudo apt-get update && sudo apt-get install -y htop curl docker.io docker-compose
+> ```
+>
+> Note cloud-init installs the distro's `docker.io` + **compose v1**. If you want upstream Docker CE with the `docker compose` v2 plugin, install it *before* anything is running: `curl -fsSL https://get.docker.com | sudo sh`.
+
+---
+
+## Step 11: Reserve a Static IP (do this before anything points at the box)
+
+The public IP the script assigned at launch is **ephemeral** — it's released and replaced whenever the instance stops and starts (a maintenance reboot, a resize, an accidental stop). Anything pinned to it — DNS records, SSH config, firewall allow-lists on other hosts — silently breaks the next time that happens. Converting to a **reserved** IP fixes the address for the life of the tenancy. It's free, and it's the one piece that's genuinely painful to retrofit once things depend on the address.
+
+**Check what you have first.** `lifetime` tells you:
+
+```bash
+# The ephemeral IP lives at AD scope; a reserved one lives at REGION scope
+oci network public-ip list --scope AVAILABILITY_DOMAIN \
+  --availability-domain "<Xxxx:REGION-AD-1>" \
+  --compartment-id "<your-tenancy-ocid>" \
+  | jq -r '.data[] | "\(.["ip-address"])  lifetime=\(.lifetime)"'
+
+# lifetime=EPHEMERAL  → not permanent yet, do the rest of this step
+# lifetime=RESERVED   → already done
+```
+
+> ⚠️ **Reserved IPs come from Oracle's pool — you get a *new* address, not a promotion of the current one.** There is no ephemeral→reserved conversion: the API can only *delete* an ephemeral IP, and reserved addresses are allocated from Oracle's block. So this step changes the box's public IP exactly once. Update DNS / SSH config / allow-lists to the new address afterwards — then it never changes again. Plan a couple of minutes where the box has no public IP mid-swap; existing SSH sessions survive it, new ones need the new address.
+
+### The console path (simplest)
+
+1. Instance → **Attached VNICs** → click the VNIC → **IPv4 Addresses**.
+2. On the row with the public IP, the **⋮** menu → **Edit**.
+3. Set **Public IP type** to **Reserved**, choose **Create a new reserved public IP** (or pick an existing unassigned one), and save. The ephemeral is released and the reserved one takes its place — note the new address.
+
+### The CLI path
+
+Assigning a reserved IP requires the target private IP to have **no** public IP, so the ephemeral must go first. Order matters — do it in one sitting:
+
+```bash
+COMP="<your-tenancy-ocid>"
+INSTANCE_ID="<your-instance-ocid>"          # from the launch log, or: oci compute instance list --compartment-id "$COMP"
+
+# Resolve the primary private IP by walking instance → VNIC → private IP.
+# You never type these OCIDs by hand — each is found from the one before it.
+VNIC_ID=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" \
+  | jq -r '.data[] | select(.["is-primary"]) | .id')
+PRIVATE_IP_ID=$(oci network private-ip list --vnic-id "$VNIC_ID" \
+  | jq -r '.data[] | select(.["is-primary"]) | .id')
+
+# 1. Create a reserved IP in your pool (unassigned — no --private-ip-id yet).
+#    Do NOT pass --scope: it's a create-time error. RESERVED is always regional;
+#    scope is derived from --lifetime. --wait-for-state makes it synchronous so
+#    $RESERVED_ID is populated before step 3 uses it.
+RESERVED_ID=$(oci network public-ip create --lifetime RESERVED \
+  --compartment-id "$COMP" --display-name my-static-ip \
+  --wait-for-state AVAILABLE | jq -r '.data.id')
+
+# 2. Delete the ephemeral (unassigns + frees it — the box briefly has no public IP).
+#    Find its OCID by matching the ephemeral assigned to your private IP.
+#    --all silences a pagination warning and ensures your IP isn't on page 2.
+EPHEMERAL_ID=$(oci network public-ip list --scope AVAILABILITY_DOMAIN --all \
+  --availability-domain "<Xxxx:REGION-AD-1>" --compartment-id "$COMP" \
+  | jq -r --arg p "$PRIVATE_IP_ID" '.data[] | select(.["assigned-entity-id"]==$p) | .id')
+oci network public-ip delete --public-ip-id "$EPHEMERAL_ID" --force --wait-for-state TERMINATED
+
+# 3. Assign the reserved IP to the primary private IP. Asynchronous — wait for it,
+#    or a read-back in step 4 can race and still show the old state.
+oci network public-ip update --public-ip-id "$RESERVED_ID" --private-ip-id "$PRIVATE_IP_ID" \
+  --wait-for-state ASSIGNED
+
+# 4. Read back the new permanent address
+oci network public-ip get --public-ip-id "$RESERVED_ID" | jq -r '.data | "\(.["ip-address"])  lifetime=\(.lifetime)  state=\(.["lifecycle-state"])"'
+```
+
+**Verify** on the new address — pass your key explicitly if you don't have an SSH-config alias yet, since the raw `ubuntu@ip` form won't pick up `oci_key` on its own:
+
+```bash
+ssh -i ~/.ssh/oci_key ubuntu@<new-reserved-ip> 'hostname && echo reachable'
+```
+
+Then **update everything that referenced the old address** — DNS A-records, `~/.ssh/config` `HostName` lines, and any remote firewall allow-lists. One more gotcha: the new IP is a new entry in `~/.ssh/known_hosts`, so the first connection re-prompts to accept the host key even though it's the same box. That's expected, not a MITM warning — unless you *also* see a "REMOTE HOST IDENTIFICATION HAS CHANGED" block, which would mean the new IP was recycled from another host you'd previously connected to (clear it with `ssh-keygen -R <new-ip>`).
 
 ---
 
@@ -335,7 +468,9 @@ Docker is already installed (cloud-init did that). Your 4-core ARM server with 2
 
 ### Small-First Strategy
 
-Oracle has limited ARM capacity. Requesting the full 4 OCPU/24GB almost always fails. But requesting 1 OCPU/6GB succeeds much more often. Once you have a small instance, resizing it is easier because you already have a placement — Oracle just needs to allocate more resources on the same host.
+Oracle has limited ARM capacity. Requesting the full 2 OCPU/12GB often fails. But requesting 1 OCPU/6GB succeeds much more often. Once you have a small instance, resizing it is easier because you already have a placement — Oracle just needs to allocate more resources on the same host.
+
+Don't "optimise" `SMALL_OCPUS` up to 2 to skip a step — asking for the full allocation up front is precisely the request that gets refused, and you lose the placement advantage.
 
 ### Random Jitter
 
@@ -375,12 +510,87 @@ Then install the ntfy app on your phone and subscribe to your topic. No account,
 Sprinkle `notify` calls after the success messages:
 ```bash
 notify "Instance Created!" "Small instance provisioned — resize coming next cycle"
-notify "Resize Complete!" "Full 4 OCPU / 24GB instance is running at $IP" "high"
+notify "Resize Complete!" "Full 2 OCPU / 12GB instance is running at $IP" "high"
 ```
 
 ---
 
 ## Troubleshooting
+
+### Can't reach the instance — start with *which* error
+
+The exact failure text names the layer. Check it before changing anything, because these have nothing to do with each other:
+
+| Symptom | Means | Look at |
+|---|---|---|
+| `Operation timed out` | Packets vanished silently. Nothing rejected them — there was **no path**. | Cloud network: gateway, route table, security list. **Not the box.** |
+| `Connection refused` | Packets **arrived** and something said no. Network is fine. | The box: sshd down, or host iptables `REJECT`. |
+| `Could not resolve hostname` | Never left your machine. | Your `~/.ssh/config`. |
+| `Permission denied (publickey)` | Network *and* sshd are both fine. | Wrong key, or wrong user — it's `ubuntu`, not `root`. |
+
+Timeout vs. refused is the whole diagnosis. **A timeout means stop looking at the instance** — you can't fix a missing route by rebooting a VM, and the console will happily show RUNNING, green, with a valid public IP the entire time.
+
+### SSH connection times out
+
+Almost always the Step 4b fault: a VCN built without an internet gateway. Check the three layers, outermost first:
+
+```bash
+COMP=ocid1.tenancy.oc1..…
+VCN=ocid1.vcn.oc1.<region>.…
+SUBNET=ocid1.subnet.oc1.<region>.…
+
+# 1. Does an internet gateway exist at all?  (empty output = the fault)
+oci network internet-gateway list --compartment-id "$COMP" --vcn-id "$VCN" \
+  | jq -r '.data[] | "\(.["display-name"]) enabled=\(.["is-enabled"])"'
+
+# 2. Does the subnet's route table point at it?  (empty rules = the fault)
+RT=$(oci network subnet get --subnet-id "$SUBNET" | jq -r '.data["route-table-id"]')
+oci network route-table get --rt-id "$RT" \
+  | jq -r '.data["route-rules"][] | "\(.destination) -> \(.["network-entity-id"])"'
+
+# 3. Is port 22 open?
+SL=$(oci network subnet get --subnet-id "$SUBNET" | jq -r '.data["security-list-ids"][0]')
+oci network security-list get --security-list-id "$SL" \
+  | jq -r '.data["ingress-security-rules"][] | "proto=\(.protocol) src=\(.source) ports=\(.["tcp-options"]["destination-port-range"] // "all")"'
+```
+
+**Fix, if 1 or 2 came back empty.** No rebuild needed — this repairs in place on a running instance and takes effect in seconds:
+
+```bash
+IGW=$(oci network internet-gateway create \
+  --compartment-id "$COMP" --vcn-id "$VCN" \
+  --is-enabled true --display-name my-igw | jq -r '.data.id')
+
+oci network route-table update --rt-id "$RT" --force \
+  --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"$IGW\"}]"
+```
+
+SSH succeeding only proves **inbound** works. Confirm outbound too, then go re-check cloud-init (Step 10) — if the gateway was missing at first boot, the package install already failed silently:
+
+```bash
+ssh ubuntu@<ip> 'curl -s -o /dev/null -w "%{http_code}\n" http://ports.ubuntu.com/ubuntu-ports/'   # want 200
+```
+
+### `Connection refused` on ports 80/443 (but 22 works)
+
+OCI's Ubuntu images ship **host-level iptables rules** blocking everything except 22, *in addition to* the cloud security list. Both layers must be open:
+
+```bash
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save        # survives reboot
+```
+
+Don't `ufw enable` on top of these without replicating the port 22 rule first — it will lock you out. Useful tell: a port missing from **iptables** gives `Connection refused`, while a port missing from the **security list** gives a timeout — so the error tells you which layer to fix.
+
+### Launch fails with a config error (not capacity)
+
+`Out of capacity` is normal and self-resolving. Anything else in `~/oci-provision.log` is a config bug that will never fix itself, so read the log rather than assuming you're just waiting. Two that cost real time:
+
+| Log line | Cause |
+|---|---|
+| `Invalid ssh public key type "-----BEGIN"` | `SSH_KEY_PATH` points at an **OCI API key** (`-----BEGIN RSA PUBLIC KEY-----`) instead of an SSH public key (`ssh-rsa AAAA…` / `ssh-ed25519 AAAA…`). Two different systems: the API key authenticates the CLI to Oracle, the SSH key logs you into the box. |
+| `key_file's value '…' must be a valid file path` | A path in `~/.oci/config` missing its leading `/`. The CLI does not expand it and every call fails. |
 
 ### "Out of capacity" forever
 - Upgrade to PAYG (seriously, this is the biggest factor)
