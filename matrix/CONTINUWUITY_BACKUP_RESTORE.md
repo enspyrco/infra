@@ -2,8 +2,14 @@
 
 Status: **in build** (branch `harden/continuwuity-media-restore`). Replaces the
 manual `ldb`-guidance stub in `restore_continuwuity` with an automated, validated,
-**DB-only** restore with completion-oracle rollback (not single-rename atomic — a
-volume root can't be renamed; see the swap step for the exact recovery guarantee).
+**DB-only DISASTER-RECOVERY** restore: reconstruct the DB from the backup onto a
+box with no live data, validate it boots offline, then start it. It is deliberately
+**not** a hot-swap-over-a-running-server tool — a real recovery happens on a fresh/
+dead box, so there is no live DB to preserve and no swap/rollback machinery is
+needed. It **fails closed** if a DB already exists or continuwuity is running, so it
+can never clobber a healthy homeserver. (Earlier revisions on this branch built an
+atomic-swap-over-live design with rescue + rollback; that was deleted once we
+established the only real use is dead-box recovery — see git history.)
 
 ## What we protect, and why (the decision behind this)
 
@@ -40,73 +46,63 @@ refs from the DB and boots clean. Requirement: the `media/` **dir must exist**
 `prune_missing_media=true` → `Opened database sequence=136357634` → `Services
 startup complete`, all 2755 dangling refs pruned.
 
-## Volume topology: the DB lives in a `db/` SUBDIR (not the volume root)
+## Why dead-box DR (and why the swap machinery is gone)
 
-`CONTINUWUITY_DATABASE_PATH=/var/lib/continuwuity/db` — the RocksDB tree +
-`media/` sit in a `db/` subdirectory of the `continuwuity_data` volume, **not at
-the volume root**. This is the single design decision that makes restore/rollback
-a **single atomic directory rename** instead of a per-file promote with ordering
-guarantees. Work dirs (`db-staging`, `db.rescue-<ts>`) are then *siblings* of
-`db/`, entirely outside `database_path`, so they can never coexist inside the tree
-RocksDB opens (the old root layout needed dotfile-exclusion `find` filters
-everywhere precisely because the work dirs polluted the DB directory).
+The one thing worth protecting — the signing key — is only ever needed back when
+the server/disk has **died** and we're rebuilding from scratch. In that situation
+there is no running homeserver and no live database to preserve. So the restore
+doesn't swap a new DB in underneath a live server or roll anything back; it just
+reconstructs the DB onto an **empty** volume and starts it.
 
-**One-time migration** from the old root layout:
-`scripts/migrate-continuwuity-topology.sh` (idempotent, fail-closed, refuses to run
-while continuwuity is up). It relocates the root DB tree into `db/`. This MUST run
-**before** the new compose starts continuwuity — on the new path an empty `db/`
-looks like a fresh homeserver and continuwuity would mint a NEW signing key.
+The volume stays on the **root layout** (`CONTINUWUITY_DATABASE_PATH=/var/lib/
+continuwuity`) — no `db/` subdir, so no one-time migration to deploy. The subdir
+existed only to make an atomic *swap* possible, and there is no swap.
+
+The safety that the old rescue/rollback provided ("don't lose the live DB if the
+restore fails") is replaced by a **fail-closed guard**: the restore refuses to run
+if continuwuity is running OR a DB already exists in the volume. It can't clobber a
+healthy homeserver because it won't touch a non-empty volume at all.
 
 ## Restore design (`restore_continuwuity`)
 
-Build the replacement **inside the live volume** (same filesystem → real atomic
-`mv`), never touch live bytes until a validated replacement exists, keep the old
-DB as a timestamped rescue.
-
 1. `fetch_backups`; require `continuwuity.tar.gz.age`. Read `MATRIX_SERVER_NAME`
    from `~/apps/matrix/.env` (needed for the validate-boot).
-2. Typed-consent gate (`restore-continuwuity`) — irreversible.
-   **Topology guard (fail-closed):** assert `db/CURRENT` exists — refuse on the old
-   root layout and point at the migration script.
-3. **Stage** into `continuwuity_data/db-staging/` (sibling of `db/`; live still running):
-   - Decrypt+extract the RocksDB backup to a scratch dir. **Sentinel**: assert
-     `meta/`, `shared_checksum/*.sst`, and `private/<id>/CURRENT` present — a
-     truncated tar aborts here, live untouched.
-   - Reconstruct: strip the `_s<session>_<size>` suffix off every
-     `shared_checksum/*.sst` (names are already `%06d`-padded — re-`printf %06d`
-     hits busybox **octal** on e.g. `000824`), copy `private/<latest-id>/*`.
-     Verified byte-identical to `ldb restore`.
+2. **Safety guard (fail-closed):** refuse if the `continuwuity` container is
+   running, or if the volume already holds a DB (root `CURRENT`/`*.sst`, or a
+   leftover `db/` subdir). To deliberately replace an existing DB, the operator
+   stops the server and clears the volume first — a conscious, logged act.
+3. Typed-consent gate (`restore-continuwuity`) — irreversible.
+4. **Reconstruct** the RocksDB tree **directly into the (empty) volume root**:
+   - Decrypt+extract the backup to a scratch dir. **Sentinel**: assert `meta/`,
+     `shared_checksum/*.sst`, and `private/<id>/CURRENT` present — a truncated tar
+     aborts here.
+   - Strip the `_s<session>_<size>` suffix off every `shared_checksum/*.sst`
+     (names are already `%06d`-padded — re-`printf %06d` hits busybox **octal** on
+     e.g. `000824`); copy `private/<latest-id>/*`. Verified byte-identical to
+     `ldb restore`. Fail-closed on an SST filenumber collision.
    - `mkdir` an **empty** `media/` (so prune, not crash).
-4. **Validate** (fail-closed): boot `continuwuity:latest`, `--network none`,
-   `prune_missing_media=true`, real `MATRIX_SERVER_NAME`, timeout. Success =
-   `Services startup complete` and no `fresh database`/panic/`Failed to verify
-   media`/`Corruption`. Exact prod image = real RocksDB (no `ldb` version-skew —
-   `ldb checkconsistency` is rejected by continuwuity's newer OPTIONS keys). Clean
-   `docker stop` (SIGTERM) so the staged DB closes before promotion.
-5. **Swap** (two atomic dir renames): stop continuwuity; `mv db db.rescue-<ts>`
-   then `mv db-staging db`; completeness-gate the promoted `db/` on
-   `CURRENT` + `media/` + ≥1 SST. Because `db/` is a self-contained subdir, the
-   install is a single `rename(2)` — no per-file promote, no CURRENT-ordering, no
-   dotfile hazard, no merge onto remnants. The only window is the microscopic gap
-   *between* the two renames where `db/` momentarily doesn't exist; a crash there
-   leaves `db.rescue-<ts>` intact and recovery is one `mv` (spelled out in the
-   error). On any failure the rescue is moved straight back. Keep the rescue tree.
-   (This dissolves the CURRENT-last ordering + completion-oracle rollback that
-   cage-match #141 rounds 3–5 spent hardening — the complexity was a symptom of
-   the DB living at the volume root, fixed here by moving it down one level.)
-6. **Restart**; loud error + rescue path on restart failure.
+5. **Validate** (fail-closed): boot `continuwuity:latest` against the reconstructed
+   tree, `--network none` (a broken/wrong-identity DB can never federate before
+   we bless it), `prune_missing_media=true`, real `MATRIX_SERVER_NAME`. Success is
+   a CHORD: `Services startup complete` **and** a non-zero RocksDB `sequence`. ANSI
+   stripped at capture + here-string matching (pipefail-safe). Clean `docker stop`
+   (SIGTERM) so the DB closes before the real server opens it.
+6. **Start** the real server (`docker compose up -d continuwuity`) and verify the
+   same chord on its logs since start. On failure: loud error naming the likely
+   cause (on-disk compose lacking the prune flag, or wrong `MATRIX_SERVER_NAME`) —
+   nothing to roll back, the box was empty; inspect + re-run.
 
 **Deploy-order gate:** the `prune_missing_media=true` compose change must be
-deployed to the host BEFORE a media-less restore is run — otherwise the post-swap
-`docker compose start` uses an on-disk compose lacking the flag and crash-loops on
-the media check. Deploy `matrix` (compose) before exercising the restore.
+deployed to the host BEFORE a restore is run — otherwise the real `docker compose
+up` uses an on-disk compose lacking the flag and crash-loops on the media check.
+Deploy `matrix` (compose) before exercising the restore.
 
-**Named tradeoff — `prune_missing_media` is permanent, not restore-only.** It has to
-be: a media-less restore's *real* post-swap boot uses the on-disk compose, so the
-flag can't be a restore-only injection. Consequence (accepted under media-as-cache):
-a transient real-media I/O miss on a NORMAL restart prunes those refs. Low
-consequence — media is re-fetchable cache — but it is a steady-state behavior
-change, not only a DR path.
+**Named tradeoff — `prune_missing_media` is permanent, not restore-only.** A
+media-less restore's real boot uses the on-disk compose, so the flag can't be a
+restore-only injection. Consequence (accepted under media-as-cache): a transient
+real-media I/O miss on a NORMAL restart prunes those refs. Low consequence — media
+is re-fetchable cache — but it is a steady-state behavior change, not only a DR
+path.
 
 ## How the facts were established (local, zero prod load)
 

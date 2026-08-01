@@ -6,11 +6,7 @@ services:
       - "8008:6167"   # Client API
     environment:
       CONTINUWUITY_SERVER_NAME: ${MATRIX_SERVER_NAME}
-      # Database lives in a SUBDIR of the volume (not the volume root) so a
-      # restore/rollback is a single atomic directory rename (mv db db.rescue;
-      # mv db-staging db) instead of a per-file promote-with-ordering dance.
-      # One-time migration from the old root layout: scripts/migrate-continuwuity-topology.sh.
-      CONTINUWUITY_DATABASE_PATH: /var/lib/continuwuity/db
+      CONTINUWUITY_DATABASE_PATH: /var/lib/continuwuity
       # Enables `!admin server backup-database` (RocksDB online checkpoint via
       # hardlinks of SST files). Lives in a separate volume from the live
       # database so the backup script can read it without touching the
