@@ -521,9 +521,8 @@ SSHEOF'
     echo "============================================"
     echo ""
 
-    # --- Continuwuity backup prerequisites ---
-    # `backup_continuwuity` needs the `age` binary to encrypt the tarball
-    # before pushing. apt is idempotent; reinstall is a no-op if present.
+    # --- age binary (used by encrypted backups / restores) ---
+    # apt is idempotent; reinstall is a no-op if present.
     echo "Ensuring age is installed on $REMOTE..."
     ssh "$REMOTE" "command -v age >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq age"
 
@@ -589,7 +588,6 @@ SSHEOF'
     echo ""
     echo "Test with: ssh $REMOTE '/opt/scripts/backup.sh all'"
     echo "Test individual: ssh $REMOTE '/opt/scripts/backup.sh matrix'"
-    echo "Test continuwuity: ssh $REMOTE '/opt/scripts/backup.sh continuwuity'"
 }
 
 deploy_outline() {

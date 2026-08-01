@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unified backup script for all services
 # Dumps databases/data, pushes to GitHub (imagineering-cc/imagineering-backups)
-# Usage: ./backup.sh [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|continuwuity]
+# Usage: ./backup.sh [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix]
 #
 # NOTE: downstream-server's DB backup moved to the downstream repo
 # (nickmeinhold/downstream deploy/oci/scripts/backup-downstream.sh, cron
@@ -18,15 +18,10 @@ GITHUB_BACKUP_REPO="git@github-imagineering-backups:imagineering-cc/imagineering
 GITHUB_BACKUP_DIR="/tmp/imagineering-backups"
 GITHUB_REPO_SIZE_ALERT_MB=500
 
-# Continuwuity backup config. AGE_RECIPIENT and MATRIX_ADMIN_TOKEN are
-# sourced at runtime from MATRIX_ADMIN_SECRETS_FILE (see backup_continuwuity).
-# Decryption: `age -d -i <key> continuwuity.tar.gz.age | tar xzf -`.
-MATRIX_ADMIN_SECRETS_FILE="/etc/imagineering-secrets/matrix.env"
-CONTINUWUITY_ADMIN_ROOM='!L8ZmuakjgpeL1P3Jl8:imagineering.cc'
-CONTINUWUITY_HOMESERVER='https://matrix.imagineering.cc'
-# Continuwuity tarballs are large + opaque to git deltas. When the repo
-# exceeds this size, prune_repo_history_if_needed collapses history to a
-# fresh root commit (loses non-essential git history; keeps current files).
+# Backup-repo history guard. When the repo exceeds this size,
+# prune_repo_history_if_needed collapses history to a fresh root commit (loses
+# non-essential git history; keeps current files). Originally added to cap the
+# now-removed daily continuwuity blob (#32); retained as a general safety net.
 RETENTION_PRUNE_THRESHOLD_MB=300
 # Keep only the newest N archive-* tags. Each prune pins the pre-prune HEAD in an
 # archive-DATE tag; the ~100MB encrypted (undeltable) continuwuity blob it holds is
@@ -322,115 +317,6 @@ backup_aiko_island() {
   log "aiko-island backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
-# Triggers Continuwuity's online RocksDB checkpoint via the admin API
-# (`!admin server backup-database`). Each run wipes the in-volume backup
-# dir first, then triggers the admin command which writes a fresh
-# checkpoint, then tars+age-encrypts the output. RocksDB BackupEngine
-# uses hardlinks back to the live SST files so the operation is fast
-# and online — Continuwuity stays available throughout. Encryption is
-# critical: this tarball contains the homeserver signing keys
-# (irreplaceable identity).
-backup_continuwuity() {
-  log "Backing up Continuwuity..."
-
-  if ! command -v age &>/dev/null; then
-    error "age not installed; run apt-get install -y age"
-    return 1
-  fi
-  if [ ! -f "$MATRIX_ADMIN_SECRETS_FILE" ]; then
-    error "Matrix admin secrets file missing at $MATRIX_ADMIN_SECRETS_FILE"
-    return 1
-  fi
-  # Source secrets file FIRST so MATRIX_ADMIN_TOKEN and AGE_RECIPIENT are
-  # populated before the checks below.
-  # shellcheck source=/dev/null
-  . "$MATRIX_ADMIN_SECRETS_FILE"
-  if [ -z "${MATRIX_ADMIN_TOKEN:-}" ]; then
-    error "MATRIX_ADMIN_TOKEN not set in $MATRIX_ADMIN_SECRETS_FILE"
-    return 1
-  fi
-  if [ -z "${AGE_RECIPIENT:-}" ]; then
-    error "AGE_RECIPIENT not set; refusing to back up signing keys in plaintext"
-    return 1
-  fi
-
-  local backup_volume="matrix_continuwuity_backups"
-  local out="$BACKUP_DIR/continuwuity-$DATE.tar.gz.age"
-
-  # Continuwuity uses RocksDB's BackupEngine (not Checkpoint API). Each
-  # call adds an incremental backup into the same directory (meta/,
-  # private/, shared_checksum/). If left alone, the dir grows over time as
-  # incrementals accumulate — meaning each daily tarball grows too.
-  #
-  # We wipe the dir before each run so every tarball is a fresh, complete
-  # snapshot of constant size (~equal to a single full RocksDB backup,
-  # which for our scale is ~50MB encrypted). Safe because shared_checksum/
-  # only holds hardlinks back to the live data dir's SST files — deleting
-  # the hardlinks doesn't touch the live database.
-
-  # 1. Wipe previous backup contents so this run produces a clean snapshot.
-  log "  Wiping previous backup contents..."
-  docker run --rm -v "${backup_volume}:/data" alpine \
-    sh -c "rm -rf /data/* /data/.* 2>/dev/null; true" >/dev/null 2>&1 || true
-
-  # 2. Trigger the online backup via the admin room.
-  local txn; txn=$(date +%s%N)
-  local trigger_resp
-  trigger_resp=$(curl -sf -X PUT \
-    -H "Authorization: Bearer $MATRIX_ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    "$CONTINUWUITY_HOMESERVER/_matrix/client/v3/rooms/$CONTINUWUITY_ADMIN_ROOM/send/m.room.message/$txn" \
-    -d '{"msgtype":"m.text","body":"!admin server backup-database"}' 2>&1) || {
-    error "Failed to send backup-database admin command: $trigger_resp"
-    return 1
-  }
-
-  # 3. Wait for the backup to appear (meta/ subdir gets created when
-  # BackupEngine writes its first backup). 5 min cap is generous for
-  # multi-GB databases; typical completion is <10s.
-  local meta_exists=0
-  for _ in $(seq 1 60); do
-    sleep 5
-    if docker run --rm -v "${backup_volume}:/data:ro" alpine \
-         test -d /data/meta 2>/dev/null; then
-      meta_exists=1
-      break
-    fi
-  done
-  if [ "$meta_exists" -ne 1 ]; then
-    error "Continuwuity backup did not complete within 5 minutes (meta/ never appeared)"
-    return 1
-  fi
-  log "  Backup completed"
-
-  # 4. Tar the whole backups dir through age encryption. Alpine ships
-  # busybox tar (not GNU), so we avoid GNU-specific flags. The dir is
-  # static at this point (we just produced a fresh snapshot and won't
-  # call backup-database again until tomorrow), so no concurrent-write
-  # concerns.
-  # pipefail in a subshell so tar's failure propagates instead of being masked by
-  # age's exit (the pipe-masks-exit class — critical here: this tarball holds the
-  # homeserver SIGNING KEYS, so a silent-empty backup is unrecoverable identity loss).
-  if ! ( set -o pipefail; docker run --rm -v "${backup_volume}:/data:ro" alpine \
-       tar czf - -C /data . 2>/dev/null \
-       | age -r "$AGE_RECIPIENT" > "$out" ); then
-    error "Continuwuity tar/encrypt failed"
-    rm -f "$out"
-    return 1
-  fi
-  # Non-empty floor: age of a failed/empty tar can still write a tiny valid-looking
-  # ciphertext; refuse it rather than commit an unrestorable signing-key backup.
-  # (Completeness beyond non-empty — meta/ race, BackupEngine layout, min-size
-  # floor — is deferred to #29.)
-  if [ ! -s "$out" ]; then
-    error "Continuwuity encrypted tarball is empty — refusing"
-    rm -f "$out"
-    return 1
-  fi
-
-  log "Continuwuity backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
-}
-
 # Repo size management. Continuwuity tarballs are encrypted opaque binary
 # blobs — git cannot delta them, so each daily commit grows the .git pack
 # by roughly the tarball size. Rather than try to surgically remove old
@@ -686,16 +572,15 @@ case $SERVICE in
         FAILED_SERVICES+=("$matrix_svc")
       fi
     done
-    # Continuwuity DB is deliberately NOT backed up nightly (decision 2026-08-02).
-    # The only irreplaceable thing in it is the ~85-byte federation SIGNING KEY,
-    # which is IMMUTABLE — it is exported ONCE to a durable store (password
-    # manager), not re-copied daily. Everything else in the 136MB DB is a
-    # re-derivable mirror: message history lives in the bridged apps, room state
-    # re-federates, media is disposable cache. So a daily 100MB encrypted blob
-    # (the sole driver of backup-repo bloat, #32) bought only a no-re-login
-    # convenience restore. Disaster recovery is now: fresh homeserver + re-inject
-    # the saved signing key + re-bridge. The backup_continuwuity function is kept
-    # for manual use (backup.sh continuwuity) but is not part of the nightly set.
+    # Continuwuity DB is deliberately NOT backed up (decision 2026-08-02). The only
+    # irreplaceable thing in it is the ~85-byte federation SIGNING KEY, which is
+    # IMMUTABLE — exported ONCE to a durable store (password manager), not re-copied.
+    # Everything else in the 136MB DB is a re-derivable mirror: message history lives
+    # in the bridged apps, room state re-federates, media is disposable cache. So a
+    # daily 100MB encrypted blob (the sole driver of backup-repo bloat, #32) bought
+    # only a no-re-login convenience restore. DR is now: fresh homeserver + re-inject
+    # the saved signing key + re-bridge. The backup_continuwuity + restore_continuwuity
+    # functions were removed as dead code; see git history if ever needed again.
     if [ ${#SUCCEEDED[@]} -gt 0 ]; then
       backup_to_github "${SUCCEEDED[@]}" || FAILED_SERVICES+=("github-upload")
     fi
@@ -728,14 +613,11 @@ case $SERVICE in
       FAILED_SERVICES+=(matrix)
     fi
     ;;
-  continuwuity)
-    backup_continuwuity && backup_to_github continuwuity || FAILED_SERVICES+=(continuwuity)
-    ;;
   cleanup)
     cleanup_old_backups
     ;;
   *)
-    echo "Usage: $0 [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|continuwuity|cleanup]"
+    echo "Usage: $0 [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|cleanup]"
     exit 1
     ;;
 esac

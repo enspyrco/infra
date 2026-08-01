@@ -2,13 +2,7 @@
 # Restore script for all services
 # Restores from GitHub backup repo (imagineering-cc/imagineering-backups)
 # Usage: ./restore.sh <service>
-#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity
-#
-# Note: continuwuity requires the age private key path in $AGE_IDENTITY_FILE
-# (default: ~/.config/sops/age/keys.txt — same file SOPS uses; age will try
-# each key in the file until one matches). Restoring continuwuity replaces
-# the live homeserver state — only do it on a fresh instance or after
-# confirming the existing state is unrecoverable.
+#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix
 
 set -e
 
@@ -557,8 +551,8 @@ restore_aiko_island() {
 # Restore matrix bridges + relay-bot SQLite DBs from latest SQL dumps in the
 # backup repo. Each .sql file is replayed against a fresh SQLite DB inside
 # the bridge's volume. Bridges must be stopped before the replay (writing
-# to a live DB while replaying would corrupt it). Continuwuity itself is
-# NOT touched here — see restore_continuwuity for the homeserver.
+# to a live DB while replaying would corrupt it). The continuwuity homeserver
+# is NOT backed up or restored (its signing key is saved separately — 2026-08-02).
 restore_matrix() {
   log "Restoring matrix bridges + relay-bots..."
 
@@ -667,235 +661,7 @@ restore_matrix() {
 
 # Continuwuity restore constants. The image is the exact prod version so the
 # validate-boot exercises the real RocksDB (no ldb version-skew).
-CONTINUWUITY_IMAGE="${CONTINUWUITY_IMAGE:-forgejo.ellis.link/continuwuation/continuwuity:latest}"
-CONTINUWUITY_DATA_VOL="${CONTINUWUITY_DATA_VOL:-matrix_continuwuity_data}"
 MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
-
-# Restore Continuwuity — automated, atomic, DB-only (media is disposable cache).
-# Reconstructs the RocksDB database from the online BackupEngine backup, stages an
-# EMPTY media/ dir, VALIDATES by booting continuwuity against the staged tree with
-# prune_missing_media=true (dangling media refs are pruned, live boots clean), and
-# only then atomically swaps it into the live volume, keeping the prior tree as a
-# timestamped rescue. Mirrors _restore_island_core (build-in-volume + atomic mv +
-# rescue). Full design + the local evidence for every step:
-#   matrix/CONTINUWUITY_BACKUP_RESTORE.md
-#
-# Why DB-only: the backup captures RocksDB (holds the irreplaceable signing key +
-# all room/account state, ~100MB). Media (avatars, bridged-chat + federated files,
-# ~948MB) is re-fetchable cache and authoritatively lives in the source chats /
-# remote servers — NOT worth a backup. continuwuity must run with
-# prune_missing_media=true (set in matrix/docker-compose.yml) so a media-less
-# restore boots and drops the stale refs instead of crashing the media check.
-#
-# The reconstruction: RocksDB names SSTs %06d.sst; a BackupEngine backup stores
-# them in shared_checksum/ as <%06d>_s<session>_<size>.sst. So reconstruction is
-# a suffix-STRIP (names are already zero-padded — re-printf %06d would hit busybox
-# OCTAL parsing on e.g. 000824), plus copying the latest private/<id>/ files
-# (CURRENT/MANIFEST/OPTIONS/WAL). Verified byte-identical to `ldb restore`.
-#
-# CRITICAL: replaces live homeserver identity — signing keys, room state, all
-# messages, accounts. Irreversible; typed-consent gated.
-# Requires the age private key at $AGE_IDENTITY_FILE.
-restore_continuwuity() {
-  # DEAD-BOX DISASTER RECOVERY. This reconstructs the homeserver DB from the backup
-  # onto a box with NO live continuwuity data, validates it boots, then starts it.
-  #
-  # It is deliberately NOT a hot-swap-over-a-running-server tool. The only truly
-  # irreplaceable thing here is the federation signing key, which lives inside the
-  # RocksDB DB and cannot be exported or provided via config (verified against the
-  # continuwuity binary + docs), so a real recovery must restore the whole DB. But a
-  # real recovery happens on a FRESH/dead box — there is no live DB to preserve — so
-  # the elaborate atomic-swap + rescue + rollback machinery a live hot-swap would
-  # need simply does not apply. Instead we FAIL CLOSED if a DB already exists or
-  # continuwuity is running, so this can never clobber a healthy homeserver. To
-  # deliberately replace an existing DB, stop continuwuity and clear the volume
-  # first (a conscious, logged act) — see the refusal message.
-  log "Restoring Continuwuity (dead-box DR: reconstruct DB -> validate -> start)..."
-
-  if [ ! -f "$AGE_IDENTITY_FILE" ]; then
-    error "Age identity file not found at $AGE_IDENTITY_FILE"; exit 1
-  fi
-  if ! command -v age &>/dev/null; then
-    error "age not installed (apt-get install -y age)"; exit 1
-  fi
-  if [ ! -d "$MATRIX_COMPOSE_DIR" ]; then
-    error "Matrix compose dir not found at $MATRIX_COMPOSE_DIR"; exit 1
-  fi
-
-  # server_name for the validate-boot (the DB is keyed to it). deploy-to.sh writes
-  # it into ~/apps/matrix/.env.
-  local server_name=""
-  if [ -f "$MATRIX_COMPOSE_DIR/.env" ]; then
-    server_name=$(grep -E '^MATRIX_SERVER_NAME=' "$MATRIX_COMPOSE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '\042\047')
-  fi
-  if [ -z "$server_name" ]; then
-    error "MATRIX_SERVER_NAME not found in $MATRIX_COMPOSE_DIR/.env — cannot validate restore"; exit 1
-  fi
-
-  # ---- SAFETY GUARD (replaces the entire swap/rescue/rollback apparatus) ----
-  # Refuse to run if there is anything to lose. A dead-box DR restore expects an
-  # EMPTY volume; if a DB is present or the server is up, this is the wrong tool.
-  # Key on the compose SERVICE name (stable: 'continuwuity'), NOT the container
-  # name: compose names the container <project>-continuwuity-1 (e.g.
-  # matrix-continuwuity-1 in prod), so a `docker ps` name match on 'continuwuity'
-  # would silently never fire. `compose ps -q --status running <service>` is
-  # non-empty iff the service is up, regardless of project/container naming.
-  if [ -n "$( cd "$MATRIX_COMPOSE_DIR" && docker compose ps -q --status running continuwuity 2>/dev/null )" ]; then
-    error "continuwuity is RUNNING — this is a dead-box DR tool, not a hot-swap."
-    error "It refuses to replace a live homeserver. If you truly intend to wipe and"
-    error "restore, stop it first: (cd $MATRIX_COMPOSE_DIR && docker compose down)."
-    exit 1
-  fi
-  # A RocksDB tree at the volume root (CURRENT/*.sst), or a leftover db/ subdir from
-  # the earlier atomic-swap design, both count as "data present".
-  local existing
-  existing=$(docker run --rm -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
-    if [ -f /live/CURRENT ] || ls /live/*.sst >/dev/null 2>&1 || [ -e /live/db ]; then echo yes; else echo no; fi')
-  if [ "$existing" = "yes" ]; then
-    error "A continuwuity database already exists in ${CONTINUWUITY_DATA_VOL} — REFUSING to overwrite."
-    error "This tool only restores onto an EMPTY volume (real disaster recovery). To"
-    error "deliberately replace the existing DB, clear the volume first, e.g.:"
-    error "  (cd $MATRIX_COMPOSE_DIR && docker compose down)"
-    error "  docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'rm -rf /live/..?* /live/*'"
-    error "then re-run this restore."
-    exit 1
-  fi
-
-  fetch_backups
-  local db_enc="$BACKUP_CLONE_DIR/continuwuity.tar.gz.age"
-  if [ ! -f "$db_enc" ]; then
-    error "No continuwuity.tar.gz.age in backup repo"; cleanup_backups; exit 1
-  fi
-
-  warn "This installs the backup DB (signing keys, ALL rooms, messages, accounts)"
-  warn "into the EMPTY continuwuity volume, from the backup dated:"
-  warn "  db: $(stat -c %y "$db_enc" 2>/dev/null || echo unknown)"
-  warn "Media is NOT restored (it's re-fetchable cache); dangling media refs are"
-  warn "pruned on first boot. Federated media re-fetches on view."
-  read -r -p "Type 'restore-continuwuity' to confirm: " confirm
-  if [ "$confirm" != "restore-continuwuity" ]; then
-    log "Aborted"; cleanup_backups; exit 0
-  fi
-
-  # ---- RECONSTRUCT the RocksDB tree directly into the (empty) volume root ----
-  # The volume is guaranteed empty by the guard above, so there is no live tree to
-  # protect: reconstruct in place, no staging/rename/rescue. The reconstruction
-  # sentinels + SST-suffix strip + collision guard are about BACKUP INTEGRITY (a
-  # truncated/garbage/colliding backup must fail closed on the signing-key path),
-  # not swap machinery, so they stay.
-  log "Reconstructing RocksDB from the BackupEngine backup..."
-  if ! ( set -o pipefail; age -d -i "$AGE_IDENTITY_FILE" "$db_enc" \
-         | docker run --rm -i -v "${CONTINUWUITY_DATA_VOL}:/live" alpine sh -c '
-        set -e
-        rm -rf /live/.bk-scratch
-        mkdir -p /live/.bk-scratch
-        tar xzf - -C /live/.bk-scratch
-        bk=/live/.bk-scratch
-        # Sentinel: a truncated/garbage tar aborts HERE.
-        [ -d "$bk/meta" ]            || { echo "backup missing meta/ (truncated?)" >&2; exit 1; }
-        [ -d "$bk/shared_checksum" ] || { echo "backup missing shared_checksum/" >&2; exit 1; }
-        ls "$bk"/shared_checksum/*.sst >/dev/null 2>&1 || { echo "no SSTs in shared_checksum/" >&2; exit 1; }
-        # Latest numeric backup id (not hardcoded 1).
-        id=$(ls "$bk/private" 2>/dev/null | grep -E "^[0-9]+$" | sort -n | tail -1)
-        [ -n "$id" ]                     || { echo "no numeric backup id under private/" >&2; exit 1; }
-        [ -f "$bk/private/$id/CURRENT" ] || { echo "no CURRENT in private/$id" >&2; exit 1; }
-        # Reconstruct: strip the _s<session>_<size> suffix. basename .sst FIRST then
-        # take the leading token, so a (hypothetical) suffixless name is a no-op
-        # rather than becoming NAME.sst.sst.
-        for f in "$bk"/shared_checksum/*.sst; do
-          b=$(basename "$f" .sst); t="/live/${b%%_*}.sst"
-          # Fail-closed on a file-number collision (a valid latest backup has unique
-          # SST numbers): the signing-key path must PROVE uniqueness, not silently
-          # overwrite.
-          [ -e "$t" ] && { echo "SST collision: two sources map to $(basename "$t") — aborting" >&2; exit 1; }
-          cp "$f" "$t"
-        done
-        cp -a "$bk/private/$id/." /live/   # -a . copies dotfiles too (CURRENT/MANIFEST/OPTIONS/WAL)
-        # Empty media/ dir must EXIST (not just be absent): prune_missing_media prunes
-        # missing FILES, but a missing media DIR is a hard I/O error. Dir present +
-        # empty -> the boot prunes all dangling refs and starts clean.
-        mkdir -p /live/media
-        rm -rf /live/.bk-scratch
-        echo "reconstructed $(ls /live/*.sst | wc -l) SSTs (backup id $id)"
-      ' ); then
-    error "RocksDB reconstruction failed (backup truncated/corrupt?)."
-    error "The volume may hold a partial tree; clear it before retrying:"
-    error "  docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'rm -rf /live/..?* /live/*'"
-    cleanup_backups; exit 1
-  fi
-
-  # ---- VALIDATE (fail-closed): boot continuwuity against the reconstructed tree ----
-  # Exact prod image = real RocksDB (no ldb version-skew). --network none isolates it
-  # so a broken/wrong-identity DB can NEVER federate before we've blessed it. Success
-  # is a CHORD: "Services startup complete" AND a NON-ZERO RocksDB sequence (the
-  # latter rejects an empty/fresh DB that could still log startup-complete). ANSI is
-  # stripped at capture (continuwuity colorizes even when detached, splitting the
-  # `sequence=` token), and matching uses here-strings (grep <<<) so an early match
-  # can't SIGPIPE a producer under set -o pipefail and read as a false negative.
-  log "Validating: booting continuwuity against the reconstructed tree (offline, fail-closed)..."
-  docker rm -f continuwuity-restore-check >/dev/null 2>&1 || true
-  docker run -d --name continuwuity-restore-check --network none \
-    -e CONTINUWUITY_SERVER_NAME="$server_name" \
-    -e CONTINUWUITY_DATABASE_PATH=/var/lib/continuwuity \
-    -e CONTINUWUITY_ADDRESS=127.0.0.1 -e CONTINUWUITY_PORT=6167 \
-    -e CONTINUWUITY_ALLOW_FEDERATION=false -e CONTINUWUITY_ALLOW_REGISTRATION=false \
-    -e CONTINUWUITY_PRUNE_MISSING_MEDIA=true -e CONTINUWUITY_LOG=info \
-    -e CONTINUWUITY_LOG_COLORS=false \
-    -v "${CONTINUWUITY_DATA_VOL}:/var/lib/continuwuity" \
-    "$CONTINUWUITY_IMAGE" >/dev/null 2>&1 \
-    || { error "could not start validation container"; cleanup_backups; exit 1; }
-
-  local vok=0 vlogs=""
-  for _ in $(seq 1 40); do
-    sleep 3
-    vlogs=$(docker logs continuwuity-restore-check 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
-    if grep -q "Services startup complete" <<< "$vlogs" \
-       && grep -qE "Opened database.*sequence=[1-9]" <<< "$vlogs"; then vok=1; break; fi
-    if grep -qiE "fresh database|thread .main. panicked|Critical error starting server|Failed to verify media|Corruption" <<< "$vlogs"; then vok=0; break; fi
-    [ "$(docker inspect -f '{{.State.Status}}' continuwuity-restore-check 2>/dev/null)" = "exited" ] && { vok=0; break; }
-  done
-  echo "$vlogs" | grep -iE "Opened database|Services startup complete|fresh database|panic|Critical|media|Corruption" | tail -8
-  # Clean SIGTERM stop so the DB closes cleanly before the real server opens it
-  # (avoids handing the live boot a crash-recovery open).
-  docker stop -t 15 continuwuity-restore-check >/dev/null 2>&1 || true
-  docker rm -f continuwuity-restore-check >/dev/null 2>&1 || true
-  if [ "$vok" != "1" ]; then
-    error "Validation FAILED — the reconstructed tree did not reach clean startup."
-    error "The tree is left in ${CONTINUWUITY_DATA_VOL} for inspection. Clear it before"
-    error "retrying: docker run --rm -v ${CONTINUWUITY_DATA_VOL}:/live alpine sh -c 'rm -rf /live/..?* /live/*'"
-    cleanup_backups; exit 1
-  fi
-  log "Validation OK — reconstructed tree boots cleanly."
-
-  # ---- START the real server + verify it came up on the restored DB ----
-  # `up -d` (not `start`): on a fresh DR box the container may not exist yet.
-  local start_ts; start_ts=$(date +%s)
-  ( cd "$MATRIX_COMPOSE_DIR" && docker compose up -d continuwuity ) \
-    || { error "restore installed but 'compose up -d continuwuity' FAILED — run it manually in $MATRIX_COMPOSE_DIR"; cleanup_backups; exit 1; }
-
-  # `compose up` exit-0 only means the container started, not that it opened the DB
-  # and passed the media check. Same CHORD as validate, scoped to logs since
-  # $start_ts (this boot only) so a retained pre-restore line can't false-pass.
-  log "Verifying live continuwuity startup (this boot only)..."
-  local live_ok=0 _i
-  for _i in $(seq 1 40); do
-    sleep 3
-    local llog; llog=$( cd "$MATRIX_COMPOSE_DIR" && docker compose logs --since "$start_ts" continuwuity 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' )
-    if grep -q "Services startup complete" <<< "$llog" \
-       && grep -qE "Opened database.*sequence=[1-9]" <<< "$llog"; then live_ok=1; break; fi
-    grep -qiE "Failed to verify media|thread .main. panicked|Critical error starting" <<< "$llog" && break
-  done
-  if [ "$live_ok" != "1" ]; then
-    error "Restore installed, but live continuwuity did NOT reach 'Services startup complete'."
-    error "The reconstructed DB validated offline, so the likely cause is the on-disk"
-    error "compose (e.g. missing CONTINUWUITY_PRUNE_MISSING_MEDIA=true, or a wrong"
-    error "MATRIX_SERVER_NAME). Inspect: (cd $MATRIX_COMPOSE_DIR && docker compose logs continuwuity)"
-    cleanup_backups; exit 1
-  fi
-
-  cleanup_backups
-  log "Continuwuity restored and live (DB-only; media refs pruned as cache)."
-}
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the
 # functions (_restore_island_core + the aiko_island_* lib) without running the
@@ -912,13 +678,12 @@ fi
 # Deferred from the top of the file so the harness can source cleanly.
 if [ -z "$SERVICE" ]; then
   echo "Usage: $0 <service>"
-  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
   echo ""
   echo "Examples:"
   echo "  $0 kanbn         # Restore latest from GitHub backup"
   echo "  $0 outline       # Restore latest from GitHub backup"
   echo "  $0 matrix        # Restore all matrix bridges + relay-bots"
-  echo "  $0 continuwuity  # Restore homeserver (requires AGE_IDENTITY_FILE)"
   exit 1
 fi
 
@@ -947,12 +712,9 @@ case $SERVICE in
   matrix)
     restore_matrix
     ;;
-  continuwuity)
-    restore_continuwuity
-    ;;
   *)
     error "Unknown service: $SERVICE"
-    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
     exit 1
     ;;
 esac
