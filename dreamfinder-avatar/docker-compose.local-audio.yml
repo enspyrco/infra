@@ -1,0 +1,55 @@
+# docker-compose.local-audio.yml — OVERRIDE applied ONLY when the pipeline uses a
+# LOCAL speech engine (STT=whisper, or TTS=piper|kokoro).
+#
+# WHY THIS FILE EXISTS
+#   These mounts used to live in the base compose file, which meant every host
+#   had to carry whisper.cpp, piper and kokoro on disk even when it ran cloud
+#   STT/TTS. A host without them got six bind mounts whose sources docker
+#   silently creates as EMPTY DIRECTORIES — the container starts, /api/health is
+#   green, and local audio is a no-op. That is the mute-avatar failure class.
+#
+#   Compose merges `volumes` by APPENDING, so an override can add a mount but can
+#   never remove one. The base file therefore has to be the minimum every
+#   deployment needs (cloud STT/TTS, the common case), with each mode adding what
+#   it requires. This is the same shape as docker-compose.lyra.yml: the base
+#   never holds the lyra deploy key, and the override adds it only in lyra-live.
+#
+#   Applied automatically by scripts/deploy-to.sh when the generated .env selects
+#   a local engine. Manual equivalent:
+#     docker compose -f docker-compose.yml -f docker-compose.local-audio.yml up -d
+#
+# PREREQUISITE — build these on the host FIRST, or the mounts are empty dirs:
+#   $REMOTE_HOME/whisper.cpp/build/{bin,src,ggml/src}, $REMOTE_HOME/whisper.cpp/models,
+#   $REMOTE_HOME/piper, $REMOTE_HOME/kokoro
+#   deploy-to.sh's check_remote_mounts() asserts all six exist before building,
+#   but ONLY when this override is in play.
+#
+# CAPACITY WARNING: whisper and kokoro are CPU-bound. On a 2 OCPU / 12 GB box
+# shared with LiveKit, Redis, Caddy and the brain they will contend with the
+# media path. Local audio is for customers who contractually cannot send audio to
+# a third party — not a cost optimisation.
+services:
+  app:
+    environment:
+      # Container-side paths for the binaries and models mounted below. These are
+      # meaningless without the mounts, so they live in the same file: config and
+      # the thing it points at travel together.
+      - WHISPER_CLI=/opt/whisper/bin/whisper-cli
+      - WHISPER_MODEL=/opt/whisper/models/ggml-base.en.bin
+      - PIPER_BIN=/opt/piper/piper
+      - PIPER_VOICE=${PIPER_VOICE:-/opt/piper/voices/en_US-lessac-high.onnx}
+      - KOKORO_PYTHON=python3
+      - KOKORO_SCRIPT=/app/kokoro-tts.py
+      - KOKORO_VOICE=${KOKORO_VOICE:-bm_fable}
+      - KOKORO_MODEL_DIR=/opt/kokoro
+      - LD_LIBRARY_PATH=/opt/whisper/lib:/opt/whisper/ggml-lib
+    volumes:
+      # REMOTE_HOME is where the host-side builds live; the default is Sydney's
+      # `nick` home. Keep this list in sync with check_remote_mounts() in
+      # scripts/deploy-to.sh.
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/bin:/opt/whisper/bin:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/src:/opt/whisper/lib:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/build/ggml/src:/opt/whisper/ggml-lib:ro
+      - ${REMOTE_HOME:-/home/nick}/whisper.cpp/models:/opt/whisper/models:ro
+      - ${REMOTE_HOME:-/home/nick}/piper:/opt/piper:ro
+      - ${REMOTE_HOME:-/home/nick}/kokoro:/opt/kokoro:ro

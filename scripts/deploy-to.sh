@@ -945,6 +945,24 @@ deploy_embodied_dreamfinder() {
     local EDF_COMPOSE_ARGS
     EDF_COMPOSE_ARGS="-f docker-compose.yml"
 
+    # Local-audio override: added ONLY when the generated .env actually selects a
+    # local speech engine. The base compose deliberately carries no whisper/piper/
+    # kokoro mounts, because compose merges volumes by appending — an override can
+    # add a mount but never remove one, so a host on cloud STT/TTS would otherwise
+    # be stuck with six bind mounts docker silently creates as empty directories.
+    local EDF_STT EDF_TTS EDF_LOCAL_AUDIO=0
+    EDF_STT=$(sed -n 's/^STT=//p'  "$REPO_ROOT/dreamfinder-avatar/.env" | tr -d '"')
+    EDF_TTS=$(sed -n 's/^TTS=//p'  "$REPO_ROOT/dreamfinder-avatar/.env" | tr -d '"')
+    case "$EDF_STT" in whisper) EDF_LOCAL_AUDIO=1 ;; esac
+    case "$EDF_TTS" in piper|kokoro) EDF_LOCAL_AUDIO=1 ;; esac
+
+    if [ "$EDF_LOCAL_AUDIO" -eq 1 ]; then
+        echo "Local speech engine selected (STT=$EDF_STT TTS=$EDF_TTS) — applying local-audio override"
+        EDF_COMPOSE_ARGS="$EDF_COMPOSE_ARGS -f docker-compose.local-audio.yml"
+    else
+        echo "Cloud speech engines (STT=$EDF_STT TTS=$EDF_TTS) — skipping local-audio mounts"
+    fi
+
     # Deploy files
     ssh "$REMOTE" "mkdir -p ~/apps/dreamfinder-avatar/src"
 
@@ -960,10 +978,12 @@ deploy_embodied_dreamfinder() {
     # Ensure shared network exists (allows voice brain to reach text brain)
     ssh "$REMOTE" "docker network inspect imagineering >/dev/null 2>&1 || docker network create imagineering"
 
-    # Fail loudly on a wrong REMOTE_HOME rather than mounting empty dirs.
-    # These are the local-audio (whisper/piper/kokoro) sources from
-    # docker-compose.yml; a cloud-STT/TTS-only host still needs them present
-    # because the mounts are unconditional in the base compose file.
+    # Fail loudly on a wrong REMOTE_HOME rather than mounting empty dirs — but
+    # ONLY when the local-audio override is actually in play. On a cloud-STT/TTS
+    # host these paths are not merely absent, they are not wanted, and asserting
+    # them would push people toward creating empty directories to satisfy the
+    # check — manufacturing the exact silent failure it exists to prevent.
+    if [ "$EDF_LOCAL_AUDIO" -eq 1 ]; then
     check_remote_mounts "dreamfinder-avatar local-audio mounts" \
         "$REMOTE_HOME/whisper.cpp/build/bin" \
         "$REMOTE_HOME/whisper.cpp/build/src" \
@@ -971,8 +991,10 @@ deploy_embodied_dreamfinder() {
         "$REMOTE_HOME/whisper.cpp/models" \
         "$REMOTE_HOME/piper" \
         "$REMOTE_HOME/kokoro"
+    fi
 
-    # Build and start (override applied only in lyra-live mode — see above)
+    # Build and start (compose args include the local-audio override only when a
+    # local speech engine is selected — see above)
     ssh "$REMOTE" "cd ~/apps/dreamfinder-avatar && DOCKER_BUILDKIT=1 docker compose $EDF_COMPOSE_ARGS build --pull && docker compose $EDF_COMPOSE_ARGS up -d"
 
     echo "Embodied Dreamfinder deployed!"
