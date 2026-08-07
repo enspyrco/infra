@@ -52,6 +52,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # backup and restore can't drift apart (aiko_chat_gateway#1759).
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
+# Fail-closed container discovery — hardcoded names broke outline + kanbn for
+# months after a rename (see lib/resolve-container.sh).
+# shellcheck source=lib/resolve-container.sh
+. "$SCRIPT_DIR/lib/resolve-container.sh"
 
 check_repo_size() {
   if [ ! -d "$GITHUB_BACKUP_DIR" ]; then
@@ -81,7 +85,12 @@ backup_kanbn() {
   # Dump to a plain .sql first so pg_dump's REAL exit is seen — piping straight
   # to gzip masks it behind gzip's status, silently committing a truncated/empty
   # backup over the good one. Then require pg_dump's end-marker before gzip.
-  if ! docker exec kanbn_postgres pg_dump -U kanbn kanbn > "$tmp" 2>"$err"; then
+  local container
+  if ! container=$(resolve_container '^(imagineering|img)-kanbn-postgres$' kanbn 2>&1); then
+    error "Kan.bn container not resolved: $container"
+    return 1
+  fi
+  if ! docker exec "$container" pg_dump -U kanbn kanbn > "$tmp" 2>"$err"; then
     error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
@@ -127,7 +136,12 @@ backup_outline() {
 
   # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
   # then require the completion marker before gzip.
-  if ! docker exec outline_postgres pg_dump -U outline outline > "$tmp" 2>"$err"; then
+  local container
+  if ! container=$(resolve_container '^(imagineering|img)-outline-postgres$' outline 2>&1); then
+    error "Outline container not resolved: $container"
+    return 1
+  fi
+  if ! docker exec "$container" pg_dump -U outline outline > "$tmp" 2>"$err"; then
     error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
@@ -624,6 +638,13 @@ esac
 
 if [ ${#FAILED_SERVICES[@]} -gt 0 ]; then
   error "Backups failed for: ${FAILED_SERVICES[*]}"
+  # ALERT, don't just log. Repo-size and retention warnings already page via
+  # Telegram, but a total backup failure did not — so outline and kanbn failed
+  # every night for 40 nights into a log file nobody read, while the live
+  # outline DB had 93 documents and its backup had 0 bytes. Instrumenting the
+  # cheap annoyance and not the unrecoverable one is the wrong way round.
+  send_telegram_alert "$(printf '<b>Backup FAILED</b>\nServices: %s\nHost: %s\nSee /home/nick/logs/backup.log' \
+    "${FAILED_SERVICES[*]}" "$(hostname)")" || true
   exit 1
 fi
 
