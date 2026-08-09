@@ -91,6 +91,20 @@ jobs:
           REQUIRE_ALL: "1"
         run: ./scripts/test-restore-aiko-island.sh
 
+  backup-libs:
+    name: Backup Library Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hermetic unit tests for the backup helper libs — `docker` and `gh` are
+      # stubbed, so no daemon, no token, no network, and nothing real is
+      # mutated. These cover the fail-closed guards on container resolution,
+      # where a wrong answer silently backs up the WRONG tenant's data (see
+      # lib/resolve-container.sh) rather than failing visibly.
+      - name: Run resolve-container tests
+        run: ./scripts/test-resolve-container.sh
+
   caddy-validate:
     name: Caddyfile Validate
     runs-on: ubuntu-latest
