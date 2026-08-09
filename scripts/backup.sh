@@ -17,6 +17,17 @@ FAILED_SERVICES=()
 GITHUB_BACKUP_REPO="git@github-imagineering-backups:imagineering-cc/imagineering-backups.git"
 GITHUB_BACKUP_DIR="/tmp/imagineering-backups"
 GITHUB_REPO_SIZE_ALERT_MB=500
+# owner/repo form, for the REST API (releases). The SSH URL above is for git.
+GITHUB_BACKUP_SLUG="imagineering-cc/imagineering-backups"
+
+# Object-store archives are published as RELEASE ASSETS, never committed to the
+# tree. Two reasons, and the second is a hard stop rather than mere bloat:
+# a committed blob is in history forever (deleting the file reclaims nothing —
+# the whole reason prune_repo_history_if_needed exists), and GitHub blocks any
+# file over 100 MiB outright, which no history rewrite can help. Release assets
+# sit outside history, have no total-size limit, and a delete actually
+# reclaims — so retention here is an ordinary API call.
+OBJECT_RELEASE_RETENTION=${OBJECT_RELEASE_RETENTION:-7}
 
 # Backup-repo history guard. When the repo exceeds this size,
 # prune_repo_history_if_needed collapses history to a fresh root commit (loses
@@ -56,6 +67,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # months after a rename (see lib/resolve-container.sh).
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
+# Release-asset tier for large binaries (object stores) — see the file header
+# for why these can't be committed to the backup repo's tree.
+# shellcheck source=lib/release-assets.sh
+. "$SCRIPT_DIR/lib/release-assets.sh"
 
 check_repo_size() {
   if [ ! -d "$GITHUB_BACKUP_DIR" ]; then
@@ -183,6 +198,58 @@ backup_radicale() {
     error "Radicale backup is not a valid tar.gz (truncated/empty)"; rm -f "$out"; return 1
   fi
   log "Radicale backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
+}
+
+backup_minio() {
+  log "Backing up MinIO object store..."
+
+  local out="$BACKUP_DIR/minio-$DATE.tar.gz"
+
+  local container
+  if ! container=$(resolve_container_by_compose imagineering-outline minio 2>&1); then
+    error "MinIO container not resolved: $container"
+    return 1
+  fi
+
+  # Read the volume through a throwaway sidecar rather than exec'ing into
+  # MinIO. The minio/minio image is minimal — it ships `mc` and NO `tar`, so
+  # `docker exec <minio> tar` fails and, under `set -e`, dies without a
+  # message while leaving a plausible-looking file containing the runtime's
+  # error text. Mounted :ro so the backup can never write to live object data.
+  local vol
+  vol=$(docker inspect "$container" \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null)
+  if [ -z "$vol" ]; then
+    error "MinIO /data volume not resolved for $container"
+    return 1
+  fi
+
+  if ! docker run --rm -v "${vol}:/data:ro" alpine tar czf - -C /data . > "$out" 2>/dev/null; then
+    error "MinIO tar failed"; rm -f "$out"; return 1
+  fi
+
+  # Content gate, not just a readability gate. List ONCE to a file and grep
+  # that: piping `tar tzf` into `grep -q` under `set -o pipefail` is a
+  # false-negative trap — grep exits at the first match, tar takes SIGPIPE,
+  # and the pipeline reports failure on a perfectly good archive.
+  local listing
+  listing=$(mktemp)
+  if ! tar tzf "$out" > "$listing" 2>/dev/null; then
+    error "MinIO backup is not a valid tar.gz (truncated/empty)"
+    rm -f "$out" "$listing"; return 1
+  fi
+  # .minio.sys carries bucket policies. Without it a restored bucket serves
+  # 403s to Outline and Kan.bn — a restore that looks successful and isn't.
+  local missing=""
+  if ! grep -q "^\./\.minio\.sys/" "$listing"; then missing=".minio.sys"; fi
+  if ! grep -qE "^\./[a-z0-9.-]+/" "$listing"; then missing="${missing} (no buckets)"; fi
+  if [ -n "$missing" ]; then
+    error "MinIO backup is missing $missing — refusing (would restore to a broken bucket)"
+    rm -f "$out" "$listing"; return 1
+  fi
+  rm -f "$listing"
+
+  log "MinIO backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_claudius() {
@@ -478,6 +545,34 @@ prune_repo_history_if_needed() {
   fi
 }
 
+# Publish object-store archives as release assets, then prune aged-out
+# releases. Deliberately NOT routed through backup_to_github: that function
+# copies artifacts into the git tree, which is precisely where these must
+# never go.
+backup_objects_to_releases() {
+  local artifact="$BACKUP_DIR/minio-$DATE.tar.gz"
+
+  if [ ! -s "$artifact" ]; then
+    error "Object-store artifact missing or empty ($artifact) — nothing to publish"
+    return 1
+  fi
+
+  # Fail LOUDLY on a missing token rather than skipping quietly. A silent skip
+  # is how the object store went unbacked for the project's entire history in
+  # the first place; an absent credential must look like a failure, not like
+  # a successful run that happened to do less.
+  if ! release_auth_available; then
+    error "No GitHub release token (expected GH_TOKEN or /etc/imagineering-secrets/github-release.env) — object store NOT backed up"
+    return 1
+  fi
+
+  release_publish_asset "$GITHUB_BACKUP_SLUG" "objects-$DATE" "$artifact" || return 1
+  # Retention failures are non-fatal: the day's backup already landed, and
+  # storage growth is a slower problem than a missing backup. The prune
+  # surfaces and alerts on its own.
+  release_prune "$GITHUB_BACKUP_SLUG" "objects-" "$OBJECT_RELEASE_RETENTION"
+}
+
 backup_to_github() {
   local services=("$@")
 
@@ -611,7 +706,20 @@ case $SERVICE in
     if [ ${#SUCCEEDED[@]} -gt 0 ]; then
       backup_to_github "${SUCCEEDED[@]}" || FAILED_SERVICES+=("github-upload")
     fi
+    # Object store goes to RELEASE ASSETS, not the tree — so it is handled
+    # after backup_to_github and is deliberately absent from SUCCEEDED (which
+    # is that function's copy-into-git list). Tracked in FAILED_SERVICES the
+    # same way, so a failure reaches the nightly alert.
+    if backup_minio; then
+      backup_objects_to_releases || FAILED_SERVICES+=("minio-release")
+    else
+      error "minio backup failed"
+      FAILED_SERVICES+=("minio")
+    fi
     cleanup_old_backups
+    ;;
+  minio)
+    backup_minio && backup_objects_to_releases || FAILED_SERVICES+=(minio)
     ;;
   kanbn)
     backup_kanbn && backup_to_github kanbn || FAILED_SERVICES+=(kanbn)
