@@ -124,6 +124,39 @@ deploy_scripts() {
         echo "  Add telegram_bot_token, telegram_chat_id, telegram_thread_id to enable alerts"
     fi
 
+    # Install the GitHub release token (root:nick 0640). Deploy keys cannot
+    # create releases — they authenticate git-over-SSH only — so the
+    # object-store tier needs an API token the tree-committed path doesn't.
+    # Same build-locally / scp / install-with-perms shape as the block above,
+    # for the same reason: never put the token on a remote command line.
+    if [ -f "$BACKUP_SECRETS" ] && sops -d "$BACKUP_SECRETS" | yq -e '.github_release_token' > /dev/null 2>&1; then
+        echo "Installing /etc/imagineering-secrets/github-release.env..."
+        local RELEASE_TOKEN RELEASE_TMP RELEASE_PREV_TRAP
+        RELEASE_TOKEN=$(sops -d "$BACKUP_SECRETS" | yq -r '.github_release_token')
+        RELEASE_TMP=$(mktemp)
+        RELEASE_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand RELEASE_TMP now, intentional
+        trap "rm -f '$RELEASE_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/github-release.env' 2>/dev/null || true" EXIT
+        shell_env_line GH_TOKEN "$RELEASE_TOKEN" > "$RELEASE_TMP"
+        chmod 0600 "$RELEASE_TMP"
+        scp -q "$RELEASE_TMP" "$REMOTE":/tmp/github-release.env
+        ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
+            sudo install -m 0640 -o root -g nick /tmp/github-release.env /etc/imagineering-secrets/github-release.env && \
+            rm -f /tmp/github-release.env"
+        rm -f "$RELEASE_TMP"
+        eval "${RELEASE_PREV_TRAP:-trap - EXIT}"
+        echo "  GitHub release envfile installed (mode 0640 root:nick)"
+    else
+        echo "NOTE: No github_release_token in backups/secrets.yaml — object-store backups will FAIL loudly"
+        echo "  This is deliberate: a missing credential must not look like a successful smaller run"
+    fi
+
+    # `gh` is required for the release-asset tier (object stores). Without it
+    # backup_objects_to_releases fails loudly rather than skipping, so install
+    # it here rather than discovering the gap at 04:00.
+    echo "Ensuring gh (GitHub CLI) is installed on $REMOTE..."
+    ssh "$REMOTE" "command -v gh >/dev/null 2>&1 || (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh)"
+
     # Set up health check cron. Tokens are NOT inlined here any more — the
     # script reads /etc/imagineering-secrets/telegram.env via lib/telegram.sh.
     echo "Installing /etc/cron.d/health-check..."
