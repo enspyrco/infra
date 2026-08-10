@@ -73,16 +73,39 @@ The keys themselves stay on the box and are not in this repo.
 
 There is no automation for this yet; that is the point of the next section. By hand:
 
+**Diff before you overwrite `~/.ssh/config`.** That file is a full-file clobber, and
+the tracked version contains only `Include config.d/*` plus the `github-dreamfinder`
+block. Any `Host` block that exists on the box but never made it into this repo is
+**destroyed** by a naive `scp` — and `verify-matches-box.sh` will then report the box
+and repo as matching, because they will. That is the exact dual of the outage that
+prompted this directory: lyra broke because an alias was *absent*, and this would
+break something by making an alias absent. New host blocks belong in `ssh/config.d/`,
+which is additive.
+
 ```bash
 # from the repo root
+
+# 1. See what the box has that the repo doesn't, BEFORE writing anything.
+ssh imagineering 'cat ~/.ssh/config' | diff - avatar-deploy/ssh/config || true
+ssh imagineering 'ls ~/.ssh/config.d/' | diff - <(ls avatar-deploy/ssh/config.d/) || true
+#    Anything only on the box: import it here first, or you are about to delete it.
+
+# 2. Scripts are safe to push as a set — nothing on the box is authoritative there
+#    any more, and flip-brain-api.sh was deliberately removed (see below).
 scp avatar-deploy/bin/*.sh imagineering:~/bin/
+
+# 3. ssh config, once step 1 is clean.
 scp avatar-deploy/ssh/config imagineering:~/.ssh/config
 scp avatar-deploy/ssh/config.d/* imagineering:~/.ssh/config.d/
 ssh imagineering 'chmod 700 ~/bin/*.sh && chmod 600 ~/.ssh/config ~/.ssh/config.d/*'
 
-# then confirm the box matches the repo
+# 4. Confirm the box matches the repo.
 ./avatar-deploy/bin/verify-matches-box.sh
 ```
+
+Note that `verify-matches-box.sh` answers "are these bytes the same", not "is this
+right". It cannot tell you that a block you just deleted used to be load-bearing.
+Step 1 is the part that protects you; step 4 only confirms the copy landed.
 
 ## What stays on the box (deliberately)
 
@@ -128,6 +151,15 @@ deferred on purpose, with the reason — not overlooked. They are tracked as tas
   pass green on dreamfinder and dispatch load-balances across duplicates. Same
   reasoning as above: aligning it arms a new auto-rollback trigger pre-rehearsal.
   The misleading "exactly-one" comment is corrected in this PR; the gate is not.
+- **lyra's deploy mutates the live tree before any rollback is armed.**
+  `deploy-lyra-avatar.sh` checks out `$SHA` into `src/` — which *is* the running
+  code, via the bind mount — before `rollback()` is even defined, and then builds.
+  A build failure aborts under `set -e` with the tree already advanced. The live
+  container keeps serving the old code from memory, so the site stays up; but the
+  disk now holds an unbuilt release, and the next restart for any reason brings it
+  up. A latent armed state rather than an outage. The real fix is to stage the
+  checkout in a git worktree and swap only at cutover, which is a redesign of the
+  deploy shape, not a patch — it belongs with inverting the authority.
 - **The shellcheck action is pinned to `@master`.** `ludeeus/action-shellcheck@master`
   now lints the scripts that can roll production onto a vulnerable image, on a
   floating ref. Real supply-chain exposure, but it is the existing convention for

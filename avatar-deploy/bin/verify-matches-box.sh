@@ -26,6 +26,25 @@ PAIRS=(
   "ssh/config.d/xdeca-backups:\$HOME/.ssh/config.d/xdeca-backups"
 )
 
+# The pairing below matches on the $HOME-relative TAIL of each box path, which is
+# only sound while those tails are mutually non-suffixing. That holds today and is
+# invisible when it stops holding — a new entry whose tail is a suffix of another
+# would silently cross-wire two files' digests. Assert it rather than trust it: the
+# cost is eight string compares, and the failure it prevents is this tool
+# confidently reporting the wrong file as clean.
+for pair_a in "${PAIRS[@]}"; do
+  tail_a="${pair_a#*:}"; tail_a="${tail_a#\$HOME}"
+  for pair_b in "${PAIRS[@]}"; do
+    [ "$pair_a" = "$pair_b" ] && continue
+    tail_b="${pair_b#*:}"; tail_b="${tail_b#\$HOME}"
+    case "$tail_a" in *"$tail_b")
+      echo "FAIL: PAIRS tails are ambiguous — '$tail_a' ends with '$tail_b'."
+      echo "      Path-keyed matching would cross-wire these two entries. Fix PAIRS."
+      exit 1 ;;
+    esac
+  done
+done
+
 # One ssh round trip, not one per file — this runs against a production host.
 REMOTE_CMD=""
 for pair in "${PAIRS[@]}"; do

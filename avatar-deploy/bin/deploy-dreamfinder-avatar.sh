@@ -46,7 +46,14 @@ cp .env.next .env
 cp docker-compose.next.yml docker-compose.yml
 # override becomes opt-in again (its true name); BRAIN=oauth must not carry the lyra key
 [ -f docker-compose.override.yml ] && mv docker-compose.override.yml docker-compose.lyra.yml.was-override
-docker compose up -d
+# --force-recreate, matching lyra's deploy and both rollbacks. The log window was
+# taught to stop proxying "this boot"; the CUTOVER was still proxying "this
+# release". When compose elects a no-op (cached image, config that happens to
+# match), the container is never recreated and gates 2-4 sample the PREVIOUS
+# incarnation under a fresh contract narrative — a false GREEN, the mirror image
+# of the false RED that caused the 2026-08-10 regression. Forcing the recreate
+# makes "a new process started" a fact rather than an inference.
+docker compose up -d --force-recreate
 
 rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-dreamfinder-avatar.sh"; exit 1; }
 

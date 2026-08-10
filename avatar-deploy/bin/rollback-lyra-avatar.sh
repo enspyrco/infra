@@ -16,10 +16,38 @@ cd "$APP_DIR"
 
 echo "=== QUAD ROLLBACK lyra-avatar $(date -u "+%H:%M:%S UTC") ==="
 
-# --- leg 1: the src TREE (the thing the container actually runs) ---
+# --- leg 0: PREFLIGHT every input before mutating anything ---
+# Matches rollback-dreamfinder-avatar.sh. Previously leg 1 moved the live tree
+# FIRST and legs 2/3 were soft (`[ -f … ] && cp`), so a freeze missing env.file
+# produced PREV tree + CURRENT env + CURRENT compose — a fourth topology nobody
+# has ever run, assembled during an incident, while the banner still said "QUAD".
+# Soft-restoring an input is only kind if the caller can tell it was skipped; here
+# it was silent. Check everything, then commit to the whole rollback or none of it.
 PREV=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || true)
-[ -n "$PREV" ] || { echo "FATAL: no $FREEZE/PREV_SHA anchor — refusing to guess a target"; exit 1; }
+MISSING=""
+[ -n "$PREV" ] || MISSING="$MISSING PREV_SHA"
+[ -f "$FREEZE/env.file" ] || MISSING="$MISSING env.file"
+[ -f "$FREEZE/docker-compose.yml" ] || MISSING="$MISSING docker-compose.yml"
+[ -n "$PREV" ] && { git -C "$SRC_DIR" cat-file -e "${PREV}^{commit}" 2>/dev/null || MISSING="$MISSING PREV_SHA($PREV)-not-in-src-repo"; }
+if [ -n "$MISSING" ]; then
+  echo "FATAL: rollback inputs missing -$MISSING"
+  echo "       Nothing has been changed. Restore $FREEZE before rolling back."
+  exit 1
+fi
+
+# --- leg 1: the src TREE (the thing the container actually runs) ---
 git -C "$SRC_DIR" checkout -q "$PREV"
+# Materialise LFS blobs, exactly as the deploy path does after it pins a SHA.
+# Without this the rollback restores POINTER FILES: /api/health goes green, the
+# mesh 404s, and the spoken turn fails — the same soft lie as a stale log window,
+# one layer down. The deploy swept this class; the rollback half was missed.
+# Not currently load-bearing (neither repo has .gitattributes yet) — which is
+# exactly why it must go in now rather than the day LFS is switched on.
+if command -v git-lfs >/dev/null 2>&1; then
+  git -C "$SRC_DIR" lfs pull || { echo "FATAL: git lfs pull failed during rollback — the tree may be pointer files only"; exit 1; }
+else
+  echo "(git-lfs not installed — skipping lfs pull)"
+fi
 echo "leg 1 src -> $(git -C "$SRC_DIR" log -1 --oneline)"
 
 # --- leg 2: image ---
@@ -30,9 +58,9 @@ else
   echo "leg 2 image: no pre-traversal-fix anchor — leaving image as-is"
 fi
 
-# --- leg 3: env + compose ---
-[ -f "$FREEZE/env.file" ]           && cp "$FREEZE/env.file" .env                     && echo "leg 3a .env restored"
-[ -f "$FREEZE/docker-compose.yml" ] && cp "$FREEZE/docker-compose.yml" docker-compose.yml && echo "leg 3b compose restored"
+# --- leg 3: env + compose (existence already asserted in leg 0) ---
+cp "$FREEZE/env.file" .env                                  && echo "leg 3a .env restored"
+cp "$FREEZE/docker-compose.yml" docker-compose.yml          && echo "leg 3b compose restored"
 
 # --force-recreate is REQUIRED here, not optional tidiness. Leg 1 moved the src
 # TREE, and compose bind-mounts ./src:/app — but compose decides whether to

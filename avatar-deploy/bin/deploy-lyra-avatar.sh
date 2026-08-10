@@ -80,7 +80,16 @@ else
 fi
 git fetch origin
 git checkout -q "$SHA"
-command -v git-lfs >/dev/null 2>&1 && git lfs pull || echo "(git-lfs not configured — skipping lfs pull)"
+# NOT `cmd && git lfs pull || echo "…"`. In that idiom an INSTALLED git-lfs whose
+# pull FAILS (auth, network, LFS quota) falls into the `||` arm, prints "not
+# configured", and returns 0 — so the deploy walks into build and cutover with
+# pointer files instead of assets, having announced the opposite. An installed
+# client that fails must fail closed; only a genuinely absent one is skippable.
+if command -v git-lfs >/dev/null 2>&1; then
+  git lfs pull
+else
+  echo "(git-lfs not installed — skipping lfs pull)"
+fi
 echo "src: $PREV_SHA -> $(git log -1 --oneline)"
 cd "$APP_DIR"
 
