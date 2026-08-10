@@ -77,23 +77,16 @@ rollback() {
 # this check the sequence is: cutover goes live -> a gate fails -> the auto-rollback
 # refuses to run -> the bad release stays up, while the script header promises QUAD
 # recovery. An auto-rollback is a switch; this makes sure the breaker behind it is
-# actually installed. Seed-if-absent first (matching lyra), since the correct freeze
-# content IS the pre-cutover state we are standing in right now.
-[ -f "$FREEZE/env.file" ]                       || cp .env "$FREEZE/env.file"
-[ -f "$FREEZE/docker-compose.yml" ]             || cp docker-compose.yml "$FREEZE/docker-compose.yml"
-# The override is the awkward one: every green deploy RENAMES it to
-# docker-compose.lyra.yml.was-override (step 4 below), so after the first cutover
-# the file this seeds from no longer exists under that name. Wipe ~/demo-freeze
-# once and the deploy would refuse forever while its only seed source sat under
-# the other name — a refusal with no path out, written by the same script that
-# renamed it. Accept either name.
-if [ ! -f "$FREEZE/docker-compose.override.yml" ]; then
-  if [ -f docker-compose.override.yml ]; then
-    cp docker-compose.override.yml "$FREEZE/docker-compose.override.yml"
-  elif [ -f docker-compose.lyra.yml.was-override ]; then
-    cp docker-compose.lyra.yml.was-override "$FREEZE/docker-compose.override.yml"
-  fi
-fi
+# actually installed.
+#
+# It REFUSES rather than seeds. An earlier version of this check seeded the missing
+# files from the current app directory, which looked helpful and was worse: the
+# image anchor is `pre-engine` from a specific past release, so seeding env/compose
+# from whatever is live now assembles a freeze whose legs come from DIFFERENT
+# releases — a fourth topology, armed as the recovery path, and indistinguishable
+# from a real freeze once written. A rollback substrate that cannot prove all four
+# legs describe the same release should stop, not improvise. Refusing costs a human
+# five minutes; state alchemy costs an incident.
 FREEZE_MISSING=""
 for f in env.file docker-compose.yml docker-compose.override.yml; do
   [ -f "$FREEZE/$f" ] || FREEZE_MISSING="$FREEZE_MISSING $f"
