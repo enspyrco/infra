@@ -34,10 +34,16 @@ MISSING=""
 # mutated. Whether a pull will actually succeed cannot be preflighted; that depends
 # on the network and the LFS endpoint at the instant it runs, and leg 1 handles it
 # by stopping with an explicit state report (see the note there).
-if git -C "$SRC_DIR" ls-files 2>/dev/null | grep -q . && [ -f "$SRC_DIR/.gitattributes" ] \
-   && grep -q 'filter=lfs' "$SRC_DIR/.gitattributes" 2>/dev/null \
+# Read .gitattributes from $PREV — the tree we are about to check OUT — not from
+# the current working tree. Those are different commits and that is the whole
+# point: if the failed release dropped LFS tracking and PREV still uses it, a
+# check against the current tree says "no LFS needed", the pull is skipped, and
+# the container comes up on pointer files. The preflight must ask about the
+# destination, not the place we are leaving.
+if [ -n "$PREV" ] \
+   && git -C "$SRC_DIR" show "$PREV:.gitattributes" 2>/dev/null | grep -q 'filter=lfs' \
    && ! command -v git-lfs >/dev/null 2>&1; then
-  MISSING="$MISSING git-lfs(repo tracks LFS files but no client installed)"
+  MISSING="$MISSING git-lfs(target $PREV tracks LFS files but no client installed)"
 fi
 [ -n "$PREV" ] && { git -C "$SRC_DIR" cat-file -e "${PREV}^{commit}" 2>/dev/null || MISSING="$MISSING PREV_SHA($PREV)-not-in-src-repo"; }
 if [ -n "$MISSING" ]; then

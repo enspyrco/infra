@@ -59,5 +59,12 @@ STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar 2>/dev/
 BOOT_SINCE=""
 [ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 [ -n "$BOOT_SINCE" ] || { BOOT_SINCE=2m; echo "(could not read container StartedAt — falling back to a 2m wall-clock window, which may miss this boot)"; }
-docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -i "registered worker" | tail -3 || echo "(no registration line yet — check again in 30s)"
+REG=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -ci "registered worker" || true)
+docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -i "registered worker" | tail -3 || true
+# ZERO is absence, not health — matching rollback-lyra-avatar.sh. The previous
+# version printed "check again in 30s", which reads as patience rather than as a
+# problem, at exactly the moment an operator is deciding whether the rollback
+# worked and whether they can stop watching.
+[ "$REG" -ge 1 ] || echo "!! NO WORKER REGISTERED after rollback — the site is up but will not answer a spoken turn. Do NOT walk away from this."
+[ "$REG" -le 1 ] || echo "!! GHOST WORKER after rollback ($REG registrations) — dispatch will load-balance across duplicates"
 echo "=== rollback complete. VERIFY A SPOKEN TURN NOW (laptop, df.imagineering.cc) ==="

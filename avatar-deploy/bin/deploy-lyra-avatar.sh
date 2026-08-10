@@ -91,6 +91,36 @@ else
   }
   echo "rollback anchor unchanged ($ANCHOR) — tree already at target"
 fi
+# --- 2. idempotent rollback anchors (never clobber an existing anchor) ---
+docker image inspect lyra-avatar-app:pre-traversal-fix >/dev/null 2>&1 \
+  || docker tag lyra-avatar-app:latest lyra-avatar-app:pre-traversal-fix
+[ -f "$FREEZE/env.file" ]           || cp .env "$FREEZE/env.file"
+[ -f "$FREEZE/docker-compose.yml" ] || cp docker-compose.yml "$FREEZE/docker-compose.yml"
+
+# rollback() is defined BEFORE the cutover so everything from the first live
+# mutation onward has a recovery path in scope. `trap - ERR` inside it disarms the
+# trap armed below, so a failure DURING the rollback cannot recurse.
+rollback() {
+  trap - ERR
+  echo "GATE FAILED: $1 — rolling back"
+  "$HOME/bin/rollback-lyra-avatar.sh"
+  exit 1
+}
+
+# ARM the rollback BEFORE the tree moves, not after the cutover.
+#
+# lyra's live code IS the bind-mounted tree, so `git checkout "$SHA"` below is
+# already a production mutation — not staging. Arming only after `up -d` left a
+# window where a failed checkout, a failed lfs pull or a failed build exited under
+# `set -e` with the tree advanced and the old process still serving it: disk and
+# memory out of phase, no recovery, and the next container restart for any reason
+# brings up an unbuilt release. The freeze is seeded immediately above so that
+# rollback() has its inputs before the trap can possibly fire.
+#
+# A pre-cutover failure now costs one container recreate on the way back to PREV.
+# That is a cheap price for never leaving the tree ahead of the process.
+trap 'rollback "unhandled failure at line $LINENO"' ERR
+
 git fetch origin
 git checkout -q "$SHA"
 # NOT `cmd && git lfs pull || echo "…"`. In that idiom an INSTALLED git-lfs whose
@@ -106,21 +136,6 @@ fi
 echo "src: $PREV_SHA -> $(git log -1 --oneline)"
 cd "$APP_DIR"
 
-# rollback() is defined BEFORE the cutover so everything from the first live
-# mutation onward has a recovery path in scope. `trap - ERR` inside it disarms the
-# trap armed below, so a failure DURING the rollback cannot recurse.
-rollback() {
-  trap - ERR
-  echo "GATE FAILED: $1 — rolling back"
-  "$HOME/bin/rollback-lyra-avatar.sh"
-  exit 1
-}
-
-# --- 2. idempotent rollback anchors (never clobber an existing anchor) ---
-docker image inspect lyra-avatar-app:pre-traversal-fix >/dev/null 2>&1 \
-  || docker tag lyra-avatar-app:latest lyra-avatar-app:pre-traversal-fix
-[ -f "$FREEZE/env.file" ]           || cp .env "$FREEZE/env.file"
-[ -f "$FREEZE/docker-compose.yml" ] || cp docker-compose.yml "$FREEZE/docker-compose.yml"
 
 # --- 3. build. MANDATORY even though ./src is bind-mounted: ENV and CMD come
 #         from the image, node_modules is an anon volume seeded from the image,
@@ -136,12 +151,6 @@ docker compose build --pull
 # the 2026-08-10 incident was a false RED. Anonymous volumes (node_modules) are
 # preserved across a recreate; only --renew-anon-volumes would discard them.
 docker compose up -d --force-recreate
-
-# ARM the rollback for everything after the cutover — see the matching note in
-# deploy-dreamfinder-avatar.sh. Gate LOGIC failures called rollback(); gate
-# SCAFFOLDING failures exited under `set -e` with the new release already live and
-# no recovery fired.
-trap 'rollback "unhandled failure at line $LINENO"' ERR
 
 # --- 4. gate 1: health ---
 ok=""
@@ -206,7 +215,7 @@ echo "gate 4/5 exactly one worker registered"
 # the block mid-string on the first run and bash tried to execute `//` as a
 # command. A quoted heredoc passes the payload through verbatim.
 docker exec -i lyra-avatar node --input-type=module <<'ASSERT' || rollback "deployed-artifact allowlist assert"
-import { isRendererAsset } from "/app/lib/renderer-assets.js";
+import { isRendererAsset, isAllowedMeshPath } from "/app/lib/renderer-assets.js";
 // Written out by hand and NOT derived from the module's own exported constants:
 // deriving them would only assert that the module agrees with itself, and a
 // verifier sharing a representation with the thing it verifies is blind to bugs
@@ -228,13 +237,47 @@ const mustAllow = [
   "/avatar", "/engine/avatar-renderer.html", "/engine/avatar-renderer.js",
   "/engine/sparks.js", "/avatars/lyra.glb", "/engine/headaudio/headaudio.min.mjs",
 ];
+// isAllowedMeshPath guards the ?avatar= override on the UNAUTHENTICATED renderer
+// page — the module's own header calls it the one part of the extraction that
+// genuinely widened what an anonymous caller can reach: hand the origin a URL and
+// it becomes an open loader for remote geometry under our own domain. This gate
+// tested only isRendererAsset while dreamfinder's tested both, so the same shared
+// engine had one phase instrumented and the other silent.
+const meshMustDeny = [
+  "https://evil.example/payload.glb",         // absolute cross-origin
+  "//evil.example/payload.glb",               // protocol-relative reads as absolute
+  "data:model/gltf-binary;base64,AAAA",       // inline payload
+  "/avatars/../../etc/passwd.glb",            // traversal wearing a mesh extension
+  "/avatars/%2e%2e/x.glb",
+  "/avatars/lyra.glb%00.txt",                 // NUL truncation back to a mesh extension
+  "/avatars/notamesh.txt",                    // public but not geometry
+  "/engine/sparks.js",                        // readable, but not a mesh
+  "avatars/lyra.glb",                         // bare relative
+];
+const meshMustAllow = ["/avatars/lyra.glb"];
+
 const bad = mustDeny.filter(p => isRendererAsset(p));
 const broke = mustAllow.filter(p => !isRendererAsset(p));
+const meshBad = meshMustDeny.filter(p => isAllowedMeshPath(p));
+const meshBroke = meshMustAllow.filter(p => !isAllowedMeshPath(p));
 if (bad.length) { console.error("ALLOWLIST STILL MATCHES TRAVERSAL: " + bad.join(", ")); process.exit(1); }
 if (broke.length) { console.error("ALLOWLIST NOW DENIES LEGITIMATE ASSETS: " + broke.join(", ")); process.exit(1); }
-console.log("allowlist: " + mustDeny.length + " denied, " + mustAllow.length + " allowed");
+if (meshBad.length) { console.error("MESH GUARD ACCEPTS A FOREIGN/TRAVERSAL MESH: " + meshBad.join(", ")); process.exit(1); }
+if (meshBroke.length) { console.error("MESH GUARD NOW DENIES OUR OWN MESH: " + meshBroke.join(", ")); process.exit(1); }
+console.log("allowlist: " + mustDeny.length + " denied, " + mustAllow.length + " allowed; mesh guard: "
+  + meshMustDeny.length + " denied, " + meshMustAllow.length + " allowed");
 ASSERT
 echo "gate 5/5 allowlist assert OK"
+
+# DISARM. The trap covers the window from the first tree mutation to the last
+# gate — a failure in
+# there means the release is unverified and should be rolled back. Past this line
+# the release has PASSED all five gates, and everything remaining is bookkeeping:
+# docker inspect, a tag, writing deployed.txt. Leaving the trap armed wires the
+# record step into the recovery bus, so a full disk or a permissions slip would
+# roll back a release that was just proven good. "Any GATE failure rolls back" is
+# the contract; a bookkeeping spark is not a gate failure.
+trap - ERR
 
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" lyra-avatar)

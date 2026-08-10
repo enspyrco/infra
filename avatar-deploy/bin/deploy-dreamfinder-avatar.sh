@@ -71,6 +71,33 @@ rollback() {
   exit 1
 }
 
+# PREFLIGHT THE FREEZE before the cutover. rollback-dreamfinder-avatar.sh
+# hard-requires env.file, docker-compose.yml, docker-compose.override.yml and the
+# pre-engine image, and exits 1 having changed NOTHING if any is absent. Without
+# this check the sequence is: cutover goes live -> a gate fails -> the auto-rollback
+# refuses to run -> the bad release stays up, while the script header promises QUAD
+# recovery. An auto-rollback is a switch; this makes sure the breaker behind it is
+# actually installed. Seed-if-absent first (matching lyra), since the correct freeze
+# content IS the pre-cutover state we are standing in right now.
+[ -f "$FREEZE/env.file" ]                       || cp .env "$FREEZE/env.file"
+[ -f "$FREEZE/docker-compose.yml" ]             || cp docker-compose.yml "$FREEZE/docker-compose.yml"
+if [ ! -f "$FREEZE/docker-compose.override.yml" ] && [ -f docker-compose.override.yml ]; then
+  cp docker-compose.override.yml "$FREEZE/docker-compose.override.yml"
+fi
+FREEZE_MISSING=""
+for f in env.file docker-compose.yml docker-compose.override.yml; do
+  [ -f "$FREEZE/$f" ] || FREEZE_MISSING="$FREEZE_MISSING $f"
+done
+docker image inspect dreamfinder-avatar-app:pre-engine >/dev/null 2>&1 \
+  || FREEZE_MISSING="$FREEZE_MISSING image:pre-engine"
+if [ -n "$FREEZE_MISSING" ]; then
+  echo "FATAL: the rollback freeze is incomplete -$FREEZE_MISSING"
+  echo "       Refusing to cut over: the auto-rollback armed below could not run,"
+  echo "       so a gate failure would leave the new release live with no recovery."
+  echo "       Nothing has been changed."
+  exit 1
+fi
+
 # --- 4. ATOMIC cutover: env + compose + override flip together, then one up -d ---
 [ -f .env.next ] && [ -f docker-compose.next.yml ] || { echo "staged .env.next / docker-compose.next.yml missing"; exit 1; }
 grep -q "^BRAIN=" .env.next && grep -q "^STT=" .env.next && grep -q "^TTS=" .env.next && grep -q "^BRAIN_MODEL=" .env.next \
@@ -249,6 +276,15 @@ console.log("allowlist: " + mustDeny.length + " denied, " + mustAllow.length + "
   + meshMustDeny.length + " denied, " + meshMustAllow.length + " allowed");
 ASSERT
 echo "gate 5/5 allowlist assert OK"
+
+# DISARM. The trap covers the window from cutover to the last gate — a failure in
+# there means the release is unverified and should be rolled back. Past this line
+# the release has PASSED all five gates, and everything remaining is bookkeeping:
+# docker inspect, a tag, writing deployed.txt. Leaving the trap armed wires the
+# record step into the recovery bus, so a full disk or a permissions slip would
+# roll back a release that was just proven good. "Any GATE failure rolls back" is
+# the contract; a bookkeeping spark is not a gate failure.
+trap - ERR
 
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" dreamfinder-avatar)
