@@ -20,7 +20,6 @@ PAIRS=(
   "bin/deploy-lyra-avatar.sh:\$HOME/bin/deploy-lyra-avatar.sh"
   "bin/rollback-dreamfinder-avatar.sh:\$HOME/bin/rollback-dreamfinder-avatar.sh"
   "bin/rollback-lyra-avatar.sh:\$HOME/bin/rollback-lyra-avatar.sh"
-  "bin/flip-brain-api.sh:\$HOME/bin/flip-brain-api.sh"
   "ssh/config:\$HOME/.ssh/config"
   "ssh/config.d/imagineering-backups:\$HOME/.ssh/config.d/imagineering-backups"
   "ssh/config.d/lyra:\$HOME/.ssh/config.d/lyra"
@@ -41,20 +40,53 @@ fi
 
 # Fail closed: an md5 tool that is missing or a path that is absent must not
 # read as a match. Anything other than a byte-identical digest is drift.
+# Pair each output line to a repo path BY THE PATH THE REMOTE ECHOED BACK, not by
+# line number. Positional pairing assumes the remote emits exactly one line per
+# input, in order — an invariant nothing here can enforce. One dropped, doubled or
+# unexpected line under that scheme shifts every later comparison onto the wrong
+# repo path, and the report becomes confidently wrong in the one tool whose entire
+# job is to be trusted about drift. Matching on the echoed path removes the
+# ordering assumption rather than guarding it; the seen-set below then enforces
+# coverage, so a missing line fails closed instead of passing unexamined.
 drift=0
-i=0
+# A space-delimited string, NOT an associative array: macOS ships bash 3.2 as
+# /bin/bash and `declare -A` is a bash 4 feature, so an assoc array would abort
+# this script on the very laptop it is meant to be run from.
+SEEN=" "
+resolve_repo_path() {  # $1 = a path as reported by the box; echoes the repo path, or empty
+  local reported="$1" pair repo tail
+  for pair in "${PAIRS[@]}"; do
+    repo="${pair%%:*}"
+    # Match on the $HOME-relative tail, which is unique across PAIRS. The box
+    # paths travel over the wire with $HOME unexpanded inside the ABSENT branch's
+    # single quotes, so a literal whole-path compare would miss those.
+    tail="${pair#*:}"; tail="${tail#\$HOME}"
+    case "$reported" in *"$tail") echo "$repo"; return;; esac
+  done
+  echo ""
+}
+
 while IFS= read -r line; do
-  repo_path="${PAIRS[$i]%%:*}"
-  i=$((i + 1))
   [ -n "$line" ] || continue
 
   if [[ "$line" == ABSENT* ]]; then
+    repo_path=$(resolve_repo_path "${line#ABSENT }")
+    [ -n "$repo_path" ] || { echo "DRIFT  unrecognised remote line: $line"; drift=1; continue; }
+    SEEN="$SEEN$repo_path "
     echo "DRIFT  $repo_path — absent on the box"
     drift=1
     continue
   fi
 
   box_md5="${line%% *}"
+  repo_path=$(resolve_repo_path "${line##* }")
+  if [ -z "$repo_path" ]; then
+    echo "DRIFT  unrecognised remote line: $line"
+    drift=1
+    continue
+  fi
+  SEEN="$SEEN$repo_path "
+
   local_md5=$(md5sum "$HERE/$repo_path" 2>/dev/null | cut -d' ' -f1 \
     || md5 -q "$HERE/$repo_path" 2>/dev/null || true)
 
@@ -68,6 +100,18 @@ while IFS= read -r line; do
     echo "ok     $repo_path"
   fi
 done <<< "$REMOTE_OUT"
+
+# Coverage assert — the fail-closed half. Silence about a file is NOT agreement
+# about it, and without this a truncated remote response would print a short list
+# of "ok" lines and then certify the whole set as matching.
+for pair in "${PAIRS[@]}"; do
+  repo_path="${pair%%:*}"
+  case "$SEEN" in
+    *" $repo_path "*) ;;
+    *) echo "DRIFT  $repo_path — NO result returned by the box (truncated output?)"
+       drift=1 ;;
+  esac
+done
 
 if [ "$drift" -ne 0 ]; then
   echo

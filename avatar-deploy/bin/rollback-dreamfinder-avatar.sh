@@ -23,6 +23,11 @@ echo "--- worker registration (expect agentName dreamfinder, exactly one) ---"
 # Anchored to the container's own boot, not the wall clock — see the note in
 # rollback-lyra-avatar.sh. Informational here, but a spurious empty window during
 # a rollback rehearsal is exactly the wrong moment to mislead the operator.
-BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+# Guarded — see the matching note in rollback-lyra-avatar.sh. This tail is
+# informational and runs AFTER the rollback has already succeeded; under
+# `set -euo pipefail` an unguarded assignment here would abort and report a
+# completed rollback as a failure.
+BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar 2>/dev/null) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+[ -n "$BOOT_SINCE" ] || { BOOT_SINCE=2m; echo "(could not read container StartedAt — falling back to a 2m wall-clock window, which may miss this boot)"; }
 docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -i "registered worker" | tail -3 || echo "(no registration line yet — check again in 30s)"
 echo "=== rollback complete. VERIFY A SPOKEN TURN NOW (laptop, df.imagineering.cc) ==="

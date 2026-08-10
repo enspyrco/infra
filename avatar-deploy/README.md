@@ -56,11 +56,10 @@ happened, all traceable to that:
 ```
 avatar-deploy/
 ├── bin/
-│   ├── deploy-dreamfinder-avatar.sh    5 gates, auto-rollback on any failure
+│   ├── deploy-dreamfinder-avatar.sh    4 gates, auto-rollback on any failure
 │   ├── deploy-lyra-avatar.sh           5 gates, incl. in-container allowlist assert
 │   ├── rollback-dreamfinder-avatar.sh  QUAD rollback: image + env + compose + worker
 │   ├── rollback-lyra-avatar.sh         QUAD rollback: TREE first, then image + env + worker
-│   ├── flip-brain-api.sh               brain endpoint toggle
 │   └── verify-matches-box.sh           drift check: repo vs ~/bin and ~/.ssh on the box
 └── ssh/
     ├── config                          github-dreamfinder alias + Include config.d/*
@@ -109,6 +108,38 @@ State and secrets, never source:
    It must run **off-loopback**: `LOCALHOST_IPS` in `lib/scope.js` grants base scope, so a
    probe from the box returns 200 and reads as a false green. A probe holding a privilege
    the real caller lacks does not measure the real path.
+
+## Known-live inherited defects (found by review, deliberately NOT fixed here)
+
+These came in with the verbatim import and are still live on the box. Each is
+deferred on purpose, with the reason — not overlooked. They are tracked as tasks.
+
+- **Neither deploy script has a rollback trap.** `rollback()` is defined after the
+  cutover, and the scripts run under `set -euo pipefail`. A failure in the *gate
+  scaffolding* itself (a `docker inspect` name mismatch, an unexpected `StartedAt`
+  shape, a compose service rename) exits the script without ever calling
+  `rollback()` — after `docker compose up -d` has already gone live. Gate *logic*
+  failures roll back; gate *scaffolding* failures leave the new release running
+  unverified. Fixing this means arming an `ERR` trap that fires a rollback path
+  that has never been rehearsed, which is the same shape as the incident that
+  started all this. It waits for the rehearsal.
+- **dreamfinder's worker-registration gate is lower-bound only** (`-ge 1`), while
+  lyra enforces both bounds and rolls back on a ghost worker. Two registrations
+  pass green on dreamfinder and dispatch load-balances across duplicates. Same
+  reasoning as above: aligning it arms a new auto-rollback trigger pre-rehearsal.
+  The misleading "exactly-one" comment is corrected in this PR; the gate is not.
+- **`dreamfinder-avatar-app:pre-engine` is a one-way ratchet.** The anchor is only
+  tagged if absent, which correctly refuses to clobber a good freeze but means the
+  script cannot tell a *poisoned* anchor from a blessed one — and a poisoned anchor
+  is exactly what served a live auth bypass for ten minutes on 2026-08-10. It was
+  repointed by hand. A name-immortal anchor should become content-addressed, which
+  is properly part of inverting the authority (step 2 below).
+
+`flip-brain-api.sh` was imported and then **deleted** rather than deferred: it
+`cd`s to `~/apps/embodied-dreamfinder` and execs `~/bin/deploy-embodied-dreamfinder.sh`,
+and neither path exists on the box any more. Under `set -e` it dies on line 4. A
+break-glass tool that cannot break glass is worse than no tool, because someone
+reaches for it in an emergency. Its history is in this repo if it's ever wanted back.
 
 ## Known-unrehearsed
 

@@ -81,7 +81,14 @@ for V in VOICE_MODE BRAIN STT TTS BRAIN_MODEL CLAUDE_CODE_OAUTH_TOKEN; do
 done
 echo "gate 3/4 printenv OK"
 
-# --- 8. gate: exactly-one worker registered as dreamfinder ---
+# --- 8. gate: AT LEAST ONE worker registered as dreamfinder ---
+# NOTE the asymmetry with lyra, which also enforces an UPPER bound and rolls back
+# on a ghost worker. This gate is lower-bound only; two registrations pass green
+# here and dispatch then load-balances across duplicates. The comment used to read
+# "exactly-one", which described an enforcement that was never written.
+# Deliberately NOT aligned in this PR: arming a new auto-rollback trigger on a
+# script whose rollback path has never once been rehearsed is how the 2026-08-10
+# regression happened. Align it after the rehearsal — see the follow-up task.
 REG=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -ci "registered worker" || true)
 [ "$REG" -ge 1 ] || rollback "no worker registration in logs"
 echo "gate 4/4 worker registered (lines: $REG)"

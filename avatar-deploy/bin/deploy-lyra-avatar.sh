@@ -81,7 +81,16 @@ docker image inspect lyra-avatar-app:pre-traversal-fix >/dev/null 2>&1 \
 #         from the image, node_modules is an anon volume seeded from the image,
 #         and a dependency change would otherwise ship a tree the image cannot run.
 docker compose build --pull
-docker compose up -d
+# --force-recreate is REQUIRED for lyra specifically. The deploy unit here is the
+# src TREE (compose bind-mounts ./src:/app), but compose decides whether to
+# recreate from the IMAGE and config. A src-only change with a fully cached build
+# leaves the image id identical, so a bare `up -d` is a NO-OP: the old node
+# process keeps serving the old code from memory while the checkout says $SHA.
+# Every gate below would then sample the previous release and pass green, and
+# deployed.txt would record a release that never started — a false GREEN, where
+# the 2026-08-10 incident was a false RED. Anonymous volumes (node_modules) are
+# preserved across a recreate; only --renew-anon-volumes would discard them.
+docker compose up -d --force-recreate
 
 rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-lyra-avatar.sh"; exit 1; }
 
