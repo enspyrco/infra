@@ -159,9 +159,22 @@ backup_radicale() {
 
   local out="$BACKUP_DIR/radicale-$DATE.tar.gz"
 
+  # Resolve by compose project, NOT by name. `docker exec radicale` resolved to
+  # XDECA's container on this co-located box (imagineering's is `img-radicale`,
+  # project `radicale`; xdeca's is plain `radicale`, project `xdeca-radicale`),
+  # so this backup captured the wrong tenant's calendars while imagineering's
+  # own collections went unbacked. restore.sh drives the RIGHT container via
+  # `cd ~/apps/radicale && docker compose`, so the two halves disagreed: a
+  # restore would have overwritten imagineering's collections with xdeca's.
+  local container
+  if ! container=$(resolve_container_by_compose radicale radicale 2>&1); then
+    error "Radicale container not resolved: $container"
+    return 1
+  fi
+
   # Tar the collections from the Docker volume. The old code ignored tar's exit
   # AND never checked the artifact, so a failed/partial tar committed silently.
-  if ! docker exec radicale tar czf - /data/collections > "$out" 2>/dev/null; then
+  if ! docker exec "$container" tar czf - /data/collections > "$out" 2>/dev/null; then
     error "Radicale tar failed"; rm -f "$out"; return 1
   fi
   # Verify the archive is a readable, complete gzip'd tar (a truncated .tar.gz

@@ -45,3 +45,46 @@ resolve_container() {
   fi
   printf '%s\n' "$matches"
 }
+
+# Print the single running container for a compose PROJECT + SERVICE.
+#
+# Prefer this over resolve_container's name pattern whenever the two tenants
+# run the SAME service, because the compose project is the durable identity and
+# the container name is not. Radicale is the worked example: imagineering's
+# container is `img-radicale` (project `radicale`) and xdeca's is plain
+# `radicale` (project `xdeca-radicale`). backup.sh hardcoded `docker exec
+# radicale`, which therefore resolved to XDECA'S container — imagineering's
+# nightly radicale.tar contained xdeca's calendars, imagineering's own Radicale
+# (including dreamfinder's collections) was never backed up at all, and because
+# restore.sh drives the correct container via `cd ~/apps/radicale && docker
+# compose`, a restore would have wiped imagineering's collections and replaced
+# them with the other tenant's. A name pattern would have fixed this instance;
+# the project label makes the class unrepresentable, since two tenants cannot
+# share a compose project on one host.
+#
+# Usage:
+#   cid=$(resolve_container_by_compose radicale radicale) || return 1
+resolve_container_by_compose() {
+  local project=${1:-} service=${2:-} label=${3:-${1:-container}} matches count
+  if [ -z "$project" ] || [ -z "$service" ]; then
+    echo "resolve-container: both a compose project and service are required" >&2
+    return 1
+  fi
+  matches=$(docker ps \
+    --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=$service" \
+    --format '{{.Names}}' || true)
+  count=$(printf '%s' "$matches" | grep -c .)
+  # Fail closed on both edges, same as resolve_container: zero matches must
+  # never degrade to "back up nothing and report success", and an ambiguous
+  # match must never be resolved by picking arbitrarily between tenants.
+  if [ "$count" -eq 0 ]; then
+    echo "resolve-container: no running container for compose project '$project' service '$service' ($label)" >&2
+    return 1
+  fi
+  if [ "$count" -gt 1 ]; then
+    echo "resolve-container: >1 running container for compose project '$project' service '$service' ($(printf '%s' "$matches" | tr '\n' ' ')) — refusing to guess" >&2
+    return 1
+  fi
+  printf '%s\n' "$matches"
+}
