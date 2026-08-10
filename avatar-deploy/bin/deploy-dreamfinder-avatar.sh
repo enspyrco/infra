@@ -1,7 +1,17 @@
 #!/bin/bash
 # Gated deploy for dreamfinder-avatar (DF repo, pinned SHA).
-# Gates: health -> boot-banner contract -> printenv contract -> worker registration.
+# Gates: health -> boot-banner contract -> printenv contract -> worker
+# registration -> deployed-artifact assert on the auth-bypass allowlist.
 # ANY gate failure auto-runs the QUAD rollback (~/bin/rollback-dreamfinder-avatar.sh).
+#
+# NOTE ON GATE 5. The traversal fix cannot be verified over HTTP from this box:
+# lib/scope.js grants LOCALHOST_IPS base scope, so a loopback probe returns 200 for
+# everything and reads as a false green. That exact mistake was made on this exact
+# boundary, on THIS host — df.imagineering.cc/avatars/../server.js served 200 with
+# full source for ~10 minutes on 2026-08-10. Gate 5 therefore calls the pure
+# predicate inside the running container. The end-to-end proof is a NON-LOOPBACK
+# probe, printed as the closing instruction — it is not, and cannot be, automated
+# from here.
 set -euo pipefail
 APP_DIR="$HOME/apps/dreamfinder-avatar"
 SRC_DIR="$APP_DIR/src"
@@ -69,7 +79,7 @@ rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-dreamf
 ok=""
 for _ in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && { ok=1; break; }; sleep 2; done
 [ -n "$ok" ] || rollback "health"
-echo "gate 1/4 health OK"
+echo "gate 1/5 health OK"
 
 # --- 6. gate: boot-banner contract (exact line, from THIS boot) ---
 sleep 10
@@ -94,18 +104,18 @@ sleep 10
 STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar 2>/dev/null || true)
 BOOT_SINCE=""
 [ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
-[ -n "$BOOT_SINCE" ] || rollback "cannot read dreamfinder-avatar StartedAt — the boot anchor is unavailable, so gates 2-4 cannot be trusted"
+[ -n "$BOOT_SINCE" ] || rollback "cannot read dreamfinder-avatar StartedAt — the boot anchor is unavailable, so gates 2-5 cannot be trusted"
 echo "log window anchored to container boot: $BOOT_SINCE"
 BANNER=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
 [ "$BANNER" = "$CONTRACT" ] || { echo "banner: [$BANNER]"; echo "expect: [$CONTRACT]"; rollback "boot-banner contract"; }
-echo "gate 2/4 contract OK: $BANNER"
+echo "gate 2/5 contract OK: $BANNER"
 
 # --- 7. gate: container env (printenv, never the .env file) ---
 for V in VOICE_MODE BRAIN STT TTS BRAIN_MODEL CLAUDE_CODE_OAUTH_TOKEN; do
   VAL=$(docker exec dreamfinder-avatar printenv "$V" 2>/dev/null || true)
   [ -n "$VAL" ] || rollback "printenv $V empty"
 done
-echo "gate 3/4 printenv OK"
+echo "gate 3/5 printenv OK"
 
 # --- 8. gate: AT LEAST ONE worker registered as dreamfinder ---
 # NOTE the asymmetry with lyra, which also enforces an UPPER bound and rolls back
@@ -117,7 +127,89 @@ echo "gate 3/4 printenv OK"
 # regression happened. Align it after the rehearsal — see the follow-up task.
 REG=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -ci "registered worker" || true)
 [ "$REG" -ge 1 ] || rollback "no worker registration in logs"
-echo "gate 4/4 worker registered (lines: $REG)"
+echo "gate 4/5 worker registered (lines: $REG)"
+
+# --- 8b. gate 5: deployed-artifact assert on the auth-bypass allowlist.
+#          THIS host is where the hole actually bled. On 2026-08-10
+#          df.imagineering.cc/avatars/../server.js served 200 with full source for
+#          ~10 minutes. The fixes above address the false RED that caused the
+#          rollback ONTO the vulnerable image; this is the instrument that refuses
+#          a false GREEN while the hole is open. Health and the boot banner can
+#          both pass with a broken allowlist — they measure different things.
+#
+#          It CANNOT be an HTTP probe from this box. lib/scope.js grants
+#          LOCALHOST_IPS base scope, so a loopback request returns 200 for
+#          everything and reads as a false green. That exact mistake was made on
+#          this exact boundary. So: call the pure predicate inside the running
+#          container, against the artifact that was actually deployed.
+#
+#          Fed by QUOTED heredoc, not `node -e '...'`: a single-quoted shell
+#          argument cannot contain an apostrophe, and prose comments in here do.
+#          That broke lyra's version mid-string on its first run and bash tried to
+#          execute `//` as a command.
+docker exec -i dreamfinder-avatar node --input-type=module <<'ASSERT' || rollback "deployed-artifact allowlist assert"
+import { isRendererAsset, isAllowedMeshPath } from "/app/lib/renderer-assets.js";
+// Vectors are written out BY HAND and NOT derived from the module's exported
+// constants. Deriving them would only assert that the module agrees with itself,
+// and a verifier sharing a representation with the thing it verifies is blind to
+// bugs in that shared layer. The cost is real and must be paid deliberately when
+// the layout moves: lyra's pre-extraction list failed 3 of its 5 allow-vectors
+// after the engine subtree landed, i.e. it would have rolled back a good deploy.
+// Verified against the deployed /app/lib/renderer-assets.js on 2026-08-10.
+const mustDeny = [
+  // The vectors that were LIVE in production. /avatars/ is an allowlisted prefix,
+  // so a raw-path prefix match admitted these and express.static then resolved
+  // the traversal and served the file.
+  "/avatars/../server.js", "/avatars/../lib/scope.js", "/avatars/../package.json",
+  "/avatars/../data/last-night.json",
+  // encoding variants of the same idea
+  "/avatars/%2e%2e/package.json", "/avatars/..%2fpackage.json",
+  "/avatars/%252e%252e/server.js",            // double-encoded: decode is not a fixed point
+  "/avatars/..\\server.js",                   // backslash separator
+  "/avatars//../server.js", "/avatars/./../server.js",
+  "/avatars/%00/../server.js",                // NUL truncation
+  // moved-prefix regressions: public BEFORE the extraction, must not be now.
+  // If any of these start passing, the allowlist has drifted back.
+  "/headaudio/headaudio.min.mjs", "/avatar-renderer.js", "/sparks.js",
+  // engine internals sharing the /engine/ stem but NOT allowlisted
+  "/engine/README.md", "/engine/character.js", "/engine/agent-runner.js",
+  // and the ordinary protected surface
+  "/server.js", "/lib/scope.js",
+];
+const mustAllow = [
+  "/avatar", "/engine/avatar-renderer.html", "/engine/avatar-renderer.js",
+  "/engine/sparks.js", "/engine/headaudio/headaudio.min.mjs",
+  "/avatars/dreamfinder.glb", "/avatars/dreamfinder-compressed.glb",
+];
+// isAllowedMeshPath guards the ?avatar= override on the UNAUTHENTICATED renderer
+// page. The module's own header calls this the one part of the extraction that
+// genuinely widened what an anonymous caller can reach: an open loader fetching
+// arbitrary remote geometry under our origin. lyra's gate does not test it.
+const meshMustDeny = [
+  "https://evil.example/payload.glb",         // absolute cross-origin
+  "//evil.example/payload.glb",               // protocol-relative reads as absolute
+  "data:model/gltf-binary;base64,AAAA",       // inline payload
+  "/avatars/../../etc/passwd.glb",            // traversal wearing a mesh extension
+  "/avatars/%2e%2e/x.glb",
+  "/avatars/x.glb%00.txt",                    // NUL truncation back to a mesh extension
+  "/avatars/notamesh.txt",                    // public but not geometry
+  "/engine/sparks.js",                        // readable, but not a mesh
+  "avatars/dreamfinder.glb",                  // bare relative
+];
+const meshMustAllow = ["/avatars/dreamfinder.glb", "/avatars/dreamfinder-compressed.glb"];
+
+const bad = mustDeny.filter((p) => isRendererAsset(p));
+const broke = mustAllow.filter((p) => !isRendererAsset(p));
+const meshBad = meshMustDeny.filter((p) => isAllowedMeshPath(p));
+const meshBroke = meshMustAllow.filter((p) => !isAllowedMeshPath(p));
+if (bad.length) { console.error("ALLOWLIST STILL MATCHES TRAVERSAL: " + bad.join(", ")); process.exit(1); }
+if (broke.length) { console.error("ALLOWLIST NOW DENIES LEGITIMATE ASSETS: " + broke.join(", ")); process.exit(1); }
+if (meshBad.length) { console.error("MESH GUARD ACCEPTS A FOREIGN/TRAVERSAL MESH: " + meshBad.join(", ")); process.exit(1); }
+if (meshBroke.length) { console.error("MESH GUARD NOW DENIES OUR OWN MESH: " + meshBroke.join(", ")); process.exit(1); }
+console.log("allowlist: " + mustDeny.length + " denied, " + mustAllow.length + " allowed; mesh guard: "
+  + meshMustDeny.length + " denied, " + meshMustAllow.length + " allowed");
+ASSERT
+echo "gate 5/5 allowlist assert OK"
 
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" dreamfinder-avatar)
