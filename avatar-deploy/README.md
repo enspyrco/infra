@@ -128,6 +128,16 @@ deferred on purpose, with the reason — not overlooked. They are tracked as tas
   pass green on dreamfinder and dispatch load-balances across duplicates. Same
   reasoning as above: aligning it arms a new auto-rollback trigger pre-rehearsal.
   The misleading "exactly-one" comment is corrected in this PR; the gate is not.
+- **The shellcheck action is pinned to `@master`.** `ludeeus/action-shellcheck@master`
+  now lints the scripts that can roll production onto a vulnerable image, on a
+  floating ref. Real supply-chain exposure, but it is the existing convention for
+  every shellcheck step in this repo (`./scripts`, `./cd-bus`), so pinning only the
+  new one would be worse than either consistent state. Repo-wide decision, not this
+  PR's — tracked separately.
+- **`Host github-lyra` points at `IdentityFile ~/.ssh/embodied-lyra-deploy`.** Fossil
+  naming from before the repo rename, on a load-bearing key path. Renaming the key
+  is a box mutation, not a repo change, and at 3am a mismatched name reads as a
+  config bug rather than as history. Left as-is, named here so it doesn't surprise.
 - **`dreamfinder-avatar-app:pre-engine` is a one-way ratchet.** The anchor is only
   tagged if absent, which correctly refuses to clobber a good freeze but means the
   script cannot tell a *poisoned* anchor from a blessed one — and a poisoned anchor

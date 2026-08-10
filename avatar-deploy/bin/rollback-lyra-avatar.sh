@@ -60,7 +60,16 @@ sleep 8
 # every leg has already run and the health gate has already passed, so an abort
 # here would report a SUCCESSFUL rollback as a failure — the worst possible signal
 # mid-incident. Fall back to a wall-clock window rather than dying.
-BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar 2>/dev/null) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+#
+# Capture the inspect result on its OWN line and test it before handing it to
+# date. Interpolating it straight into the date expression does NOT fail closed:
+# `date -u -d " - 5 seconds"` is a VALID GNU date expression meaning now-5s, so an
+# empty inspect silently yields a FIVE-SECOND wall-clock window presented to the
+# operator as the boot anchor. Verified on the box — it exits 0 and prints a
+# timestamp. That is the same instrument-vs-claim defect this whole file is about.
+STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar 2>/dev/null || true)
+BOOT_SINCE=""
+[ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 if [ -n "$BOOT_SINCE" ]; then
   WINDOW_DESC="since container boot ($BOOT_SINCE)"
 else
@@ -70,6 +79,11 @@ fi
 REG=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -c '"msg":"registered worker"' || true)
 echo "leg 4 worker registrations $WINDOW_DESC: $REG (expect exactly 1)"
 [ "$REG" -le 1 ] || echo "!! GHOST WORKER after rollback — dispatch will load-balance across duplicates"
+# ZERO is absence, not health. Only the upper bound was warned on, so a rolled-back
+# container that never registered a worker printed a bare "0" next to an
+# "expect exactly 1" echo and said nothing — the soft lie that lets an operator
+# mid-rehearsal read a FAILED rollback as a finished one.
+[ "$REG" -ge 1 ] || echo "!! NO WORKER REGISTERED after rollback — the site is up but will not answer a spoken turn. Do NOT walk away from this."
 
 cat <<'EOF'
 === ROLLBACK COMPLETE. It is NOT verified until a human does a real spoken ===

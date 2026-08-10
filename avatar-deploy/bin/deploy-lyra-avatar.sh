@@ -51,7 +51,20 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "!! local modifications on the box — archiving to $FREEZE/local-mods-$STAMP.patch"
   git diff HEAD > "$FREEZE/local-mods-$STAMP.patch"
   git --no-pager diff --stat HEAD
-  git checkout -- .
+  # `git checkout -- .` restores the worktree from the INDEX, so it clears
+  # unstaged edits but leaves STAGED ones in place — and the `git checkout $SHA`
+  # below then refuses to run on a dirty index. The stated purpose of this block
+  # is "preserve the edits, then don't let checkout die on them"; it only ever
+  # delivered that for the unstaged half. `reset --hard HEAD` clears both, and the
+  # archive above is taken against HEAD so it already captured staged + unstaged.
+  # This fails CLOSED either way (the deploy aborts before any cutover), but a
+  # hand-edit silently blocking a deploy is precisely what froze dreamfinder for
+  # weeks — so it should abort with THIS script's loud message, not git's.
+  git reset --hard HEAD
+  # Untracked files are deliberately left alone: they are not in the archive
+  # (git diff HEAD does not see them) and destroying an operator's un-added file
+  # to make a deploy proceed is not this script's call. They only block a checkout
+  # if the incoming tree would overwrite them, in which case git says so plainly.
 fi
 PREV_SHA=$(git rev-parse HEAD)
 # Rollback anchor for the TREE. Only advance it when the tree actually MOVES.
@@ -112,7 +125,15 @@ sleep 10
 # live unauthenticated-read hole. A freshness check keyed to the wall clock rather
 # than to the thing whose freshness it asserts is a rollback waiting to happen.
 # StartedAt is correct whether or not the container was recreated.
-BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+# Failure of the anchor routes through rollback(), not through `set -e` — see the
+# matching note in deploy-dreamfinder-avatar.sh. The cutover is already live here,
+# so a silent abort would leave an unverified release running with no rollback
+# armed. Captured on its own line because `date -u -d " - 5 seconds"` is valid GNU
+# date (= now-5s, exit 0) and would otherwise fail OPEN into a 5-second window.
+STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar 2>/dev/null || true)
+BOOT_SINCE=""
+[ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+[ -n "$BOOT_SINCE" ] || rollback "cannot read lyra-avatar StartedAt — the boot anchor is unavailable, so gates 2-5 cannot be trusted"
 echo "log window anchored to container boot: $BOOT_SINCE"
 BANNER=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "$CONTRACT" | tail -1 || true)
 [ -n "$BANNER" ] || { echo "expect: [$CONTRACT]"; docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | head -12; rollback "boot-banner contract"; }

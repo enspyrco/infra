@@ -68,7 +68,18 @@ sleep 10
 # live unauthenticated-read hole. A freshness check keyed to the wall clock rather
 # than to the thing whose freshness it asserts is a rollback waiting to happen.
 # StartedAt is correct whether or not the container was recreated.
-BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+# Route a FAILURE of the anchor itself through rollback(), not through `set -e`.
+# The cutover has already happened by this point. An unguarded assignment here
+# aborts the whole script on a container rename or a missing container, leaving
+# the NEW release live with gates 2-4 never evaluated and no rollback fired —
+# gate LOGIC failures roll back, gate SCAFFOLDING failures walked away. And it
+# must be captured on its own line first: `date -u -d " - 5 seconds"` is a VALID
+# GNU date expression (= now-5s, exit 0), so interpolating a failed inspect fails
+# OPEN into a five-second window wearing the boot anchor's name.
+STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar 2>/dev/null || true)
+BOOT_SINCE=""
+[ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+[ -n "$BOOT_SINCE" ] || rollback "cannot read dreamfinder-avatar StartedAt — the boot anchor is unavailable, so gates 2-4 cannot be trusted"
 echo "log window anchored to container boot: $BOOT_SINCE"
 BANNER=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
 [ "$BANNER" = "$CONTRACT" ] || { echo "banner: [$BANNER]"; echo "expect: [$CONTRACT]"; rollback "boot-banner contract"; }
