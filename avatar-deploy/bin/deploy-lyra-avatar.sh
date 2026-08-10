@@ -87,7 +87,7 @@ rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-lyra-a
 
 # --- 4. gate 1: health ---
 ok=""
-for i in $(seq 1 30); do curl -sf "localhost:$PORT/api/health" >/dev/null && { ok=1; break; }; sleep 2; done
+for _ in $(seq 1 30); do curl -sf "localhost:$PORT/api/health" >/dev/null && { ok=1; break; }; sleep 2; done
 [ -n "$ok" ] || rollback "health"
 echo "gate 1/5 health OK"
 
@@ -165,9 +165,21 @@ echo "gate 5/5 allowlist assert OK"
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" lyra-avatar)
 docker tag lyra-avatar-app:latest lyra-avatar-app:post-traversal-fix
-{ echo "sha=$SHA"; echo "prev_sha=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo unknown)"   # the ANCHOR, not the variable: on a re-run at the same SHA these differ, and this file is what a human reads to find the rollback target; echo "image=$IMG"; \
-  echo "env_md5=$(md5sum .env | cut -d" " -f1)"; \
-  echo "container=$(docker ps -qf name=lyra-avatar)"; echo "date=$(date -u +%FT%TZ)"; } > "$FREEZE/deployed.txt"
+# prev_sha reads the ANCHOR FILE, not the $PREV_SHA variable: on a re-run at the
+# same SHA those differ, and this file is what a human reads to find the rollback
+# target. Keep each field on its own line — the previous version put that
+# explanation as a trailing `#` comment on the prev_sha line, which swallowed the
+# rest of the physical line (`echo "image=$IMG"; \`, backslash included, so not
+# even a continuation) and silently dropped image= from every lyra release record.
+ANCHOR=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo unknown)
+{
+  echo "sha=$SHA"
+  echo "prev_sha=$ANCHOR"
+  echo "image=$IMG"
+  echo "env_md5=$(md5sum .env | cut -d" " -f1)"
+  echo "container=$(docker ps -qf name=lyra-avatar)"
+  echo "date=$(date -u +%FT%TZ)"
+} > "$FREEZE/deployed.txt"
 cat "$FREEZE/deployed.txt"
 
 cat <<'EOF'

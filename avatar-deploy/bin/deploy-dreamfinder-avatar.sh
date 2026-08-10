@@ -52,7 +52,7 @@ rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-dreamf
 
 # --- 5. gate: health ---
 ok=""
-for i in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && { ok=1; break; }; sleep 2; done
+for _ in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && { ok=1; break; }; sleep 2; done
 [ -n "$ok" ] || rollback "health"
 echo "gate 1/4 health OK"
 

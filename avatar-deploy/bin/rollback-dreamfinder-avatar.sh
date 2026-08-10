@@ -15,10 +15,14 @@ docker tag dreamfinder-avatar-app:pre-engine dreamfinder-avatar-app:latest
 docker compose up -d --no-build
 
 echo "--- health gate ---"
-for i in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && break; sleep 2; done
+for _ in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && break; sleep 2; done
 curl -sf localhost:3015/api/health >/dev/null || { echo "ROLLBACK HEALTH GATE FAILED"; exit 1; }
 echo "health OK"
 sleep 8
 echo "--- worker registration (expect agentName dreamfinder, exactly one) ---"
-docker logs dreamfinder-avatar --since 2m 2>&1 | grep -i "registered worker" | tail -3 || echo "(no registration line yet — check again in 30s)"
+# Anchored to the container's own boot, not the wall clock — see the note in
+# rollback-lyra-avatar.sh. Informational here, but a spurious empty window during
+# a rollback rehearsal is exactly the wrong moment to mislead the operator.
+BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -i "registered worker" | tail -3 || echo "(no registration line yet — check again in 30s)"
 echo "=== rollback complete. VERIFY A SPOKEN TURN NOW (laptop, df.imagineering.cc) ==="

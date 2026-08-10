@@ -38,11 +38,18 @@ docker compose up -d --no-build
 
 # --- leg 4: gates (health, then exactly-one worker) ---
 echo "--- health gate ---"
-for i in $(seq 1 30); do curl -sf "localhost:$PORT/api/health" >/dev/null && break; sleep 2; done
+for _ in $(seq 1 30); do curl -sf "localhost:$PORT/api/health" >/dev/null && break; sleep 2; done
 curl -sf "localhost:$PORT/api/health" >/dev/null || { echo "ROLLBACK HEALTH GATE FAILED"; exit 1; }
 echo "health OK"
 sleep 8
-REG=$(docker logs lyra-avatar --since 2m 2>&1 | grep -c '"msg":"registered worker"' || true)
+# Same wall-clock-proxy defect the deploy scripts were fixed for on 2026-08-10,
+# missed in that sweep because it lives in the rollback half. `--since 2m` is a
+# proxy for "this boot" that goes false the moment the container is not recreated
+# — and a rollback via `up -d --no-build` is exactly that case. It cannot trigger
+# an auto-rollback here (the check below only warns), but it reports 0 to a human
+# mid-rehearsal, which reads as a failed rollback. Anchor to the container's boot.
+BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+REG=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -c '"msg":"registered worker"' || true)
 echo "leg 4 worker registrations in last 2m: $REG (expect exactly 1)"
 [ "$REG" -le 1 ] || echo "!! GHOST WORKER after rollback — dispatch will load-balance across duplicates"
 

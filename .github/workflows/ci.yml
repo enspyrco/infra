@@ -29,6 +29,20 @@ jobs:
           scandir: './cd-bus'
           severity: warning
 
+      # The avatar deploy/rollback substrate (avatar-deploy/bin/) lived only in
+      # ~/bin on the production box until 2026-08-10 and was never linted. The
+      # very first shellcheck run on it flagged SC2034 "IMG appears unused" —
+      # which was a real, live defect: a trailing comment had swallowed
+      # `echo "image=$IMG"`, silently dropping the image identity from every
+      # lyra release record. scandir above covers neither ./cd-bus nor this, so
+      # without its own step "Shell Linting" would be green while blind to the
+      # scripts that can roll production back onto a vulnerable image.
+      - name: Run ShellCheck (avatar-deploy)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './avatar-deploy'
+          severity: warning
+
   yaml-lint:
     name: YAML Linting
     runs-on: ubuntu-latest
