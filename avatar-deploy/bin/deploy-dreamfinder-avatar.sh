@@ -58,7 +58,19 @@ echo "gate 1/4 health OK"
 
 # --- 6. gate: boot-banner contract (exact line, from THIS boot) ---
 sleep 10
-BANNER=$(docker logs dreamfinder-avatar --since 3m 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
+
+# Anchor the log window to the dreamfinder-avatar'S OWN boot, not the wall clock.
+# A wall-clock window (`--since 3m`) is only a PROXY for "this boot", and it stops being one the moment
+# `docker compose up -d` is a no-op: an identical cached image means no recreate,
+# so the banner was printed at the PREVIOUS boot and the window returns empty.
+# On 2026-08-10 that false negative failed gate 2 on a perfectly good dreamfinder
+# deploy, and the auto-rollback then restored the pre-engine image — reopening a
+# live unauthenticated-read hole. A freshness check keyed to the wall clock rather
+# than to the thing whose freshness it asserts is a rollback waiting to happen.
+# StartedAt is correct whether or not the container was recreated.
+BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' dreamfinder-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+echo "log window anchored to container boot: $BOOT_SINCE"
+BANNER=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
 [ "$BANNER" = "$CONTRACT" ] || { echo "banner: [$BANNER]"; echo "expect: [$CONTRACT]"; rollback "boot-banner contract"; }
 echo "gate 2/4 contract OK: $BANNER"
 
@@ -70,7 +82,7 @@ done
 echo "gate 3/4 printenv OK"
 
 # --- 8. gate: exactly-one worker registered as dreamfinder ---
-REG=$(docker logs dreamfinder-avatar --since 3m 2>&1 | grep -ci "registered worker" || true)
+REG=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -ci "registered worker" || true)
 [ "$REG" -ge 1 ] || rollback "no worker registration in logs"
 echo "gate 4/4 worker registered (lines: $REG)"
 

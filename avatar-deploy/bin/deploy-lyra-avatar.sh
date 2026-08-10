@@ -54,7 +54,17 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   git checkout -- .
 fi
 PREV_SHA=$(git rev-parse HEAD)
-echo "$PREV_SHA" > "$FREEZE/PREV_SHA"     # rollback anchor for the TREE
+# Rollback anchor for the TREE. Only advance it when the tree actually MOVES.
+# Re-running a deploy at the same SHA (a no-op, and the normal shape of a retry)
+# would otherwise overwrite the anchor with the target itself, leaving a rollback
+# that restores the very release you are trying to escape. Same reason the image
+# anchor below is guarded — an anchor you can silently overwrite is not an anchor.
+if [ "$PREV_SHA" != "$SHA" ]; then
+  echo "$PREV_SHA" > "$FREEZE/PREV_SHA"
+  echo "rollback anchor -> $PREV_SHA"
+else
+  echo "rollback anchor unchanged ($(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo none)) — tree already at target"
+fi
 git fetch origin
 git checkout -q "$SHA"
 command -v git-lfs >/dev/null 2>&1 && git lfs pull || echo "(git-lfs not configured — skipping lfs pull)"
@@ -83,8 +93,20 @@ echo "gate 1/5 health OK"
 
 # --- 5. gate 2: boot-banner contract (exact line, from THIS boot) ---
 sleep 10
-BANNER=$(docker logs lyra-avatar --since 3m 2>&1 | grep -F "$CONTRACT" | tail -1 || true)
-[ -n "$BANNER" ] || { echo "expect: [$CONTRACT]"; docker logs lyra-avatar --since 3m 2>&1 | head -12; rollback "boot-banner contract"; }
+
+# Anchor the log window to the lyra-avatar'S OWN boot, not the wall clock.
+# A wall-clock window (`--since 3m`) is only a PROXY for "this boot", and it stops being one the moment
+# `docker compose up -d` is a no-op: an identical cached image means no recreate,
+# so the banner was printed at the PREVIOUS boot and the window returns empty.
+# On 2026-08-10 that false negative failed gate 2 on a perfectly good dreamfinder
+# deploy, and the auto-rollback then restored the pre-engine image — reopening a
+# live unauthenticated-read hole. A freshness check keyed to the wall clock rather
+# than to the thing whose freshness it asserts is a rollback waiting to happen.
+# StartedAt is correct whether or not the container was recreated.
+BOOT_SINCE=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' lyra-avatar) - 5 seconds" +%Y-%m-%dT%H:%M:%SZ)
+echo "log window anchored to container boot: $BOOT_SINCE"
+BANNER=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "$CONTRACT" | tail -1 || true)
+[ -n "$BANNER" ] || { echo "expect: [$CONTRACT]"; docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | head -12; rollback "boot-banner contract"; }
 echo "gate 2/5 contract OK: $BANNER"
 
 # --- 6. gate 3: container env (printenv, never the .env file) ---
@@ -96,7 +118,7 @@ docker exec lyra-avatar test -r /app/.ssh/lyra-deploy || rollback "brain-hop key
 echo "gate 3/5 printenv OK"
 
 # --- 7. gate 4: exactly-one worker registered ---
-REG=$(docker logs lyra-avatar --since 3m 2>&1 | grep -c '"msg":"registered worker"' || true)
+REG=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -c '"msg":"registered worker"' || true)
 [ "$REG" -ge 1 ] || rollback "no worker registration in logs"
 [ "$REG" -le 1 ] || rollback "GHOST WORKER: $REG registrations — dispatch will load-balance across duplicates"
 echo "gate 4/5 exactly one worker registered"
@@ -105,27 +127,45 @@ echo "gate 4/5 exactly one worker registered"
 #         Runs the pure predicate inside the container against the traversal
 #         vectors that were live in production. A loopback HTTP probe cannot do
 #         this (see header). Fails closed if the module is missing entirely.
-docker exec lyra-avatar node --input-type=module -e '
+# Fed via HEREDOC, not `-e '...'`. A single-quoted shell argument cannot contain
+# an apostrophe, and prose comments inside the assert naturally do — that broke
+# the block mid-string on the first run and bash tried to execute `//` as a
+# command. A quoted heredoc passes the payload through verbatim.
+docker exec -i lyra-avatar node --input-type=module <<'ASSERT' || rollback "deployed-artifact allowlist assert"
 import { isRendererAsset } from "/app/lib/renderer-assets.js";
+// Written out by hand and NOT derived from the module's own exported constants:
+// deriving them would only assert that the module agrees with itself, and a
+// verifier sharing a representation with the thing it verifies is blind to bugs
+// in that shared layer. The cost is that they must be updated DELIBERATELY when
+// the allowlist layout moves. That cost is real — the engine-subtree extraction
+// moved the renderer's own assets to /engine/..., and the pre-extraction version
+// of this list failed 3 of 5 allow-vectors, i.e. it would have rolled back a
+// good deploy. Verified against lib/renderer-assets.js at 4a04138 before install.
 const mustDeny = [
   "/avatars/../server.js", "/avatars/../lib/scope.js", "/avatars/../package.json",
   "/avatars/../data/last-night.json", "/avatars/%2e%2e/package.json",
-  "/avatars/..%2fpackage.json", "/headaudio/../../server.js", "/avatars/..\\server.js",
-  "/avatars//../server.js", "/avatars/./../server.js", "/avatars/%00/../server.js",
+  "/avatars/..%2fpackage.json", "/avatars/%252e%252e/server.js",
+  "/engine/headaudio/../../server.js", "/avatars/..\\server.js",
+  "/avatars//../server.js", "/avatars/./../server.js",
+  // moved-prefix regressions: these must NOT be public any more
+  "/headaudio/headaudio.min.mjs", "/engine/README.md", "/engine/character.js",
 ];
-const mustAllow = ["/avatar", "/avatar-renderer.js", "/sparks.js", "/avatars/lyra.glb", "/headaudio/a.wav"];
+const mustAllow = [
+  "/avatar", "/engine/avatar-renderer.html", "/engine/avatar-renderer.js",
+  "/engine/sparks.js", "/avatars/lyra.glb", "/engine/headaudio/headaudio.min.mjs",
+];
 const bad = mustDeny.filter(p => isRendererAsset(p));
 const broke = mustAllow.filter(p => !isRendererAsset(p));
 if (bad.length) { console.error("ALLOWLIST STILL MATCHES TRAVERSAL: " + bad.join(", ")); process.exit(1); }
 if (broke.length) { console.error("ALLOWLIST NOW DENIES LEGITIMATE ASSETS: " + broke.join(", ")); process.exit(1); }
-console.log("allowlist: " + mustDeny.length + " traversal vectors denied, " + mustAllow.length + " real assets allowed");
-' || rollback "deployed-artifact allowlist assert"
+console.log("allowlist: " + mustDeny.length + " denied, " + mustAllow.length + " allowed");
+ASSERT
 echo "gate 5/5 allowlist assert OK"
 
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" lyra-avatar)
 docker tag lyra-avatar-app:latest lyra-avatar-app:post-traversal-fix
-{ echo "sha=$SHA"; echo "prev_sha=$PREV_SHA"; echo "image=$IMG"; \
+{ echo "sha=$SHA"; echo "prev_sha=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo unknown)"   # the ANCHOR, not the variable: on a re-run at the same SHA these differ, and this file is what a human reads to find the rollback target; echo "image=$IMG"; \
   echo "env_md5=$(md5sum .env | cut -d" " -f1)"; \
   echo "container=$(docker ps -qf name=lyra-avatar)"; echo "date=$(date -u +%FT%TZ)"; } > "$FREEZE/deployed.txt"
 cat "$FREEZE/deployed.txt"
