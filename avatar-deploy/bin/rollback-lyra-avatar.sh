@@ -28,6 +28,19 @@ MISSING=""
 [ -n "$PREV" ] || MISSING="$MISSING PREV_SHA"
 [ -f "$FREEZE/env.file" ] || MISSING="$MISSING env.file"
 [ -f "$FREEZE/docker-compose.yml" ] || MISSING="$MISSING docker-compose.yml"
+# LFS AVAILABILITY is preflighted here, before the tree moves, so the one half of
+# the LFS risk that CAN be checked in advance is checked in advance. Whether a pull
+# will succeed cannot be — that depends on the network and the LFS endpoint at the
+# moment it runs — which is why leg 1 warns and continues rather than aborting
+# mid-rollback. Named tradeoff, not an oversight: two reviewers wanted opposite
+# behaviours here. A DEPLOY may refuse to proceed on a bad pull; a ROLLBACK is
+# already an incident response, and stopping it halfway leaves the old process
+# serving the release you are escaping. Landing incomplete beats not landing.
+if git -C "$SRC_DIR" ls-files 2>/dev/null | grep -q . && [ -f "$SRC_DIR/.gitattributes" ] \
+   && grep -q 'filter=lfs' "$SRC_DIR/.gitattributes" 2>/dev/null \
+   && ! command -v git-lfs >/dev/null 2>&1; then
+  MISSING="$MISSING git-lfs(repo tracks LFS files but no client installed)"
+fi
 [ -n "$PREV" ] && { git -C "$SRC_DIR" cat-file -e "${PREV}^{commit}" 2>/dev/null || MISSING="$MISSING PREV_SHA($PREV)-not-in-src-repo"; }
 if [ -n "$MISSING" ]; then
   echo "FATAL: rollback inputs missing -$MISSING"

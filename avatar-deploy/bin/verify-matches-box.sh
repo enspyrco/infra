@@ -46,14 +46,30 @@ for pair_a in "${PAIRS[@]}"; do
 done
 
 # One ssh round trip, not one per file — this runs against a production host.
-REMOTE_CMD=""
+#
+# The remote picks its own digest tool, the same way the local side does. Hardcoding
+# md5sum meant a box without it reported EVERY file as "absent on the box": still
+# fail-closed, but a false drift report with a confidently wrong diagnosis, which
+# sends the operator hunting a deletion that never happened. The tool choice is
+# resolved remotely and announced, so "no digest tool" is distinguishable from
+# "file missing" — a checker that cannot say WHY it disagrees is only half a
+# checker.
+REMOTE_CMD='if command -v md5sum >/dev/null 2>&1; then _d() { md5sum "$1"; };'
+REMOTE_CMD+=' elif command -v md5 >/dev/null 2>&1; then _d() { echo "$(md5 -q "$1")  $1"; };'
+REMOTE_CMD+=' else echo NODIGESTTOOL; exit 0; fi; '
 for pair in "${PAIRS[@]}"; do
-  REMOTE_CMD+="md5sum ${pair#*:} 2>/dev/null || echo 'ABSENT ${pair#*:}'; "
+  REMOTE_CMD+="_d ${pair#*:} 2>/dev/null || echo 'ABSENT ${pair#*:}'; "
 done
 
 if ! REMOTE_OUT=$(ssh -o BatchMode=yes "$HOST" "$REMOTE_CMD" 2>/dev/null); then
   echo "FAIL: cannot reach $HOST — cannot confirm the box matches the repo."
   echo "      Treat this as UNKNOWN, not as agreement."
+  exit 1
+fi
+
+if [ "$REMOTE_OUT" = "NODIGESTTOOL" ]; then
+  echo "FAIL: $HOST has neither md5sum nor md5 — cannot compute remote digests."
+  echo "      Treat this as UNKNOWN, not as drift and not as agreement."
   exit 1
 fi
 
