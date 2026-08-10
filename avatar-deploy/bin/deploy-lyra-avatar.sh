@@ -107,21 +107,25 @@ rollback() {
   exit 1
 }
 
-# ARM the rollback BEFORE the tree moves, not after the cutover.
-#
-# lyra's live code IS the bind-mounted tree, so `git checkout "$SHA"` below is
-# already a production mutation — not staging. Arming only after `up -d` left a
-# window where a failed checkout, a failed lfs pull or a failed build exited under
-# `set -e` with the tree advanced and the old process still serving it: disk and
-# memory out of phase, no recovery, and the next container restart for any reason
-# brings up an unbuilt release. The freeze is seeded immediately above so that
-# rollback() has its inputs before the trap can possibly fire.
-#
-# A pre-cutover failure now costs one container recreate on the way back to PREV.
-# That is a cheap price for never leaving the tree ahead of the process.
-trap 'rollback "unhandled failure at line $LINENO"' ERR
 
 git fetch origin
+# ARM the rollback at lyra's FIRST PRODUCTION MUTATION, which is the checkout —
+# not earlier, and not after the cutover.
+#
+# Both boundaries were wrong in earlier rounds and two reviewers caught opposite
+# halves. Armed after `up -d`, a failed checkout/lfs/build left the tree advanced
+# with the old process still serving it: disk and memory out of phase, no recovery,
+# and the next restart brings up an unbuilt release. Armed before `git fetch`, a
+# simple "cannot reach origin" — which mutates NOTHING — would fire a rollback and
+# DEMOTE a perfectly healthy production to PREV_SHA. Fail-closed on an unreachable
+# remote must mean "abort without touching production", not "roll production back".
+#
+# The invariant, stated once so it can be checked rather than re-derived: the trap
+# must cover exactly the window in which production is mutated but not yet verified.
+# For lyra that window opens at `git checkout` (the tree IS the running code) and
+# closes when gate 5 passes. The freeze is seeded above so rollback() has its inputs
+# before the trap can fire.
+trap 'rollback "unhandled failure at line $LINENO"' ERR
 git checkout -q "$SHA"
 # NOT `cmd && git lfs pull || echo "…"`. In that idiom an INSTALLED git-lfs whose
 # pull FAILS (auth, network, LFS quota) falls into the `||` arm, prints "not

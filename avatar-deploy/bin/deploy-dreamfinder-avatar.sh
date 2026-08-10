@@ -81,8 +81,18 @@ rollback() {
 # content IS the pre-cutover state we are standing in right now.
 [ -f "$FREEZE/env.file" ]                       || cp .env "$FREEZE/env.file"
 [ -f "$FREEZE/docker-compose.yml" ]             || cp docker-compose.yml "$FREEZE/docker-compose.yml"
-if [ ! -f "$FREEZE/docker-compose.override.yml" ] && [ -f docker-compose.override.yml ]; then
-  cp docker-compose.override.yml "$FREEZE/docker-compose.override.yml"
+# The override is the awkward one: every green deploy RENAMES it to
+# docker-compose.lyra.yml.was-override (step 4 below), so after the first cutover
+# the file this seeds from no longer exists under that name. Wipe ~/demo-freeze
+# once and the deploy would refuse forever while its only seed source sat under
+# the other name — a refusal with no path out, written by the same script that
+# renamed it. Accept either name.
+if [ ! -f "$FREEZE/docker-compose.override.yml" ]; then
+  if [ -f docker-compose.override.yml ]; then
+    cp docker-compose.override.yml "$FREEZE/docker-compose.override.yml"
+  elif [ -f docker-compose.lyra.yml.was-override ]; then
+    cp docker-compose.lyra.yml.was-override "$FREEZE/docker-compose.override.yml"
+  fi
 fi
 FREEZE_MISSING=""
 for f in env.file docker-compose.yml docker-compose.override.yml; do
@@ -102,6 +112,18 @@ fi
 [ -f .env.next ] && [ -f docker-compose.next.yml ] || { echo "staged .env.next / docker-compose.next.yml missing"; exit 1; }
 grep -q "^BRAIN=" .env.next && grep -q "^STT=" .env.next && grep -q "^TTS=" .env.next && grep -q "^BRAIN_MODEL=" .env.next \
   || { echo ".env.next missing selector lines"; exit 1; }
+# ARM the rollback at dreamfinder's FIRST PRODUCTION MUTATION — the env/compose
+# flip below, not after `up -d`. Same invariant as lyra, different first mutation:
+# the trap must cover exactly the window in which production is mutated but not yet
+# verified. dreamfinder bakes source into the image, so its tree checkout above is
+# genuinely staging and must NOT be covered; the flip of .env and docker-compose.yml
+# is where production starts changing.
+#
+# Armed only after `up -d`, a partial or failed compose cutover — the command most
+# likely to stop and recreate the live container — exited under `set -e` with no
+# rollback, which is precisely the window the comments claimed to close.
+trap 'rollback "unhandled failure at line $LINENO"' ERR
+
 cp .env.next .env
 cp docker-compose.next.yml docker-compose.yml
 # override becomes opt-in again (its true name); BRAIN=oauth must not carry the lyra key
@@ -115,19 +137,6 @@ cp docker-compose.next.yml docker-compose.yml
 # makes "a new process started" a fact rather than an inference.
 docker compose up -d --force-recreate
 
-# ARM the rollback for everything after the cutover. Until now, gate LOGIC failures
-# called rollback() explicitly while gate SCAFFOLDING failures — a container rename,
-# a compose service rename, an unexpected `docker inspect` shape — exited under
-# `set -e` with the new release ALREADY LIVE and no rollback fired. The script's
-# stated contract is "ANY gate failure auto-runs the QUAD rollback"; this is what
-# makes that sentence true rather than aspirational.
-#
-# Deferred through six review rounds on the grounds that arming an unrehearsed
-# rollback is risky. That reasoning was backwards: the status quo is that a
-# scaffolding failure leaves production unverified with NO recovery at all, which is
-# strictly worse than a possibly-spurious rollback to a known-good freeze. Raised by
-# all three reviewers in every round; they were right.
-trap 'rollback "unhandled failure at line $LINENO"' ERR
 
 # --- 5. gate: health ---
 ok=""
