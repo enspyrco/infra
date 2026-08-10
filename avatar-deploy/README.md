@@ -160,6 +160,30 @@ deferred on purpose, with the reason — not overlooked. They are tracked as tas
   up. A latent armed state rather than an outage. The real fix is to stage the
   checkout in a git worktree and swap only at cutover, which is a redesign of the
   deploy shape, not a patch — it belongs with inverting the authority.
+- **dreamfinder has no gate 5, and dreamfinder is where the hole actually bled.**
+  lyra's deploy closes with an in-container `isRendererAsset` assert against the
+  traversal vectors; dreamfinder stops at four gates. The 2026-08-10 bleed was
+  `df.imagineering.cc/avatars/../server.js`. This PR fixed the false-RED that
+  *reopened* the hole (StartedAt, `--force-recreate`) and never added the
+  instrument that would refuse a false-GREEN *while the hole is open*. Health and
+  banner can both sing while the allowlist is broken. Adding it is new gate
+  functionality against a differently-shaped image (dreamfinder bakes source in
+  rather than bind-mounting), not a fix to anything this PR changed — but it is
+  the most valuable single thing left on this list.
+- **lyra's freeze is a first-run snapshot while `PREV_SHA` advances every deploy.**
+  `env.file`, `docker-compose.yml` and the `pre-traversal-fix` image tag are all
+  written only if absent, so they are frozen at whatever the first run saw, while
+  the tree anchor moves. A rollback therefore restores the *immediately previous
+  tree* alongside *first-run* image/env/compose. The script itself notes the image
+  carries node_modules, ENV and CMD, so a future deploy with a dependency or config
+  change rolls back into a combination that never existed. Four legs, not one
+  state. The fix is a coherent per-release freeze tuple, which is a redesign of the
+  freeze model.
+- **The retry path and the escape path are the same wire.** When `PREV_SHA == $SHA`
+  the tree anchor is correctly left alone, but the deploy still recreates and still
+  auto-rolls-back on a flaky gate — to `PREV_SHA`, which is now an *older* release
+  than the one being re-verified. "Run the deploy again at the current SHA" is not
+  a closed loop.
 - **A deploy always execs `$HOME/bin/rollback-*.sh`, by absolute path.** Correct
   while the box is the source of truth, but it means a PARTIAL install — new deploy
   script, stale rollback script — silently couples a new gate narrative to an old
