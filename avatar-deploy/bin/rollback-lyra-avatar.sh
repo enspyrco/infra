@@ -43,8 +43,17 @@ git -C "$SRC_DIR" checkout -q "$PREV"
 # one layer down. The deploy swept this class; the rollback half was missed.
 # Not currently load-bearing (neither repo has .gitattributes yet) — which is
 # exactly why it must go in now rather than the day LFS is switched on.
+# NOTE the deliberate asymmetry with the DEPLOY path, which fails closed here.
+# This point is AFTER the first live mutation (the tree has already moved) and
+# BEFORE the cutover. Exiting here — which is what the first version of this fix
+# did — leaves the disk at PREV while the old process keeps serving the release
+# you are trying to escape, under a banner reading "FATAL". A rollback that stops
+# halfway is not a safe failure; the whole value of the QUAD is that it completes.
+# So: warn as loudly as possible and press on to the cutover. A deploy may refuse
+# to proceed; a rollback must land.
 if command -v git-lfs >/dev/null 2>&1; then
-  git -C "$SRC_DIR" lfs pull || { echo "FATAL: git lfs pull failed during rollback — the tree may be pointer files only"; exit 1; }
+  git -C "$SRC_DIR" lfs pull \
+    || echo "!! git lfs pull FAILED during rollback — the tree may hold POINTER FILES. Continuing to the cutover anyway (a half-rollback is worse). Health may go green with assets missing; check a real spoken turn."
 else
   echo "(git-lfs not installed — skipping lfs pull)"
 fi

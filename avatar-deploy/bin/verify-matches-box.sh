@@ -72,6 +72,22 @@ drift=0
 # /bin/bash and `declare -A` is a bash 4 feature, so an assoc array would abort
 # this script on the very laptop it is meant to be run from.
 SEEN=" "
+# Probe for the digest tool ONCE, explicitly, instead of chaining a fallback off a
+# pipeline's exit status. `md5sum f | cut -f1 || md5 -q f` never falls back: the
+# pipeline's status is CUT's, and cut exits 0 on empty input, so on a host without
+# md5sum the `||` arm is skipped and every file reports "missing in the repo".
+# macOS has no md5sum by default and this script is written to run from a macOS
+# laptop, so that is the primary path, not an edge case.
+if command -v md5sum >/dev/null 2>&1; then
+  local_digest() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+elif command -v md5 >/dev/null 2>&1; then
+  local_digest() { md5 -q "$1" 2>/dev/null; }
+else
+  echo "FAIL: neither md5sum nor md5 is available locally — cannot compute digests."
+  echo "      Treat this as UNKNOWN, not as agreement."
+  exit 1
+fi
+
 resolve_repo_path() {  # $1 = a path as reported by the box; echoes the repo path, or empty
   local reported="$1" pair repo tail
   for pair in "${PAIRS[@]}"; do
@@ -106,8 +122,7 @@ while IFS= read -r line; do
   fi
   SEEN="$SEEN$repo_path "
 
-  local_md5=$(md5sum "$HERE/$repo_path" 2>/dev/null | cut -d' ' -f1 \
-    || md5 -q "$HERE/$repo_path" 2>/dev/null || true)
+  local_md5=$(local_digest "$HERE/$repo_path")
 
   if [ -z "$local_md5" ]; then
     echo "DRIFT  $repo_path — missing in the repo"

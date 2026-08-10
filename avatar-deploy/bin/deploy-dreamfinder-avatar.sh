@@ -27,7 +27,15 @@ fi
 cd "$SRC_DIR"
 git fetch origin
 git checkout -q "$SHA"
-git lfs pull
+# Guarded to match deploy-lyra-avatar.sh: an ABSENT client is skippable, an
+# INSTALLED one that fails must fail closed. A bare `git lfs pull` under `set -e`
+# turns a missing binary into a hard deploy stop, which is the opposite of the
+# sibling's behaviour on the same substrate.
+if command -v git-lfs >/dev/null 2>&1; then
+  git lfs pull
+else
+  echo "(git-lfs not installed — skipping lfs pull)"
+fi
 echo "src at: $(git log -1 --oneline)"
 cd "$APP_DIR"
 
@@ -114,6 +122,6 @@ echo "gate 4/4 worker registered (lines: $REG)"
 # --- 9. record release identity + preserve the forward image ---
 IMG=$(docker inspect --format "{{.Image}}" dreamfinder-avatar)
 docker tag dreamfinder-avatar-app:latest dreamfinder-avatar-app:post-engine
-{ echo "sha=$SHA"; echo "image=$IMG"; echo "env_md5=$(md5sum .env | cut -d" " -f1)"; echo "container=$(docker ps -qf name=dreamfinder-avatar)"; echo "date=$(date -u +%FT%TZ)"; } > "$FREEZE/deployed.txt"
+{ echo "sha=$SHA"; echo "image=$IMG"; echo "env_md5=$(md5sum .env | cut -d" " -f1)"; echo "container=$(docker ps -qf "name=^dreamfinder-avatar$")"; echo "date=$(date -u +%FT%TZ)"; } > "$FREEZE/deployed.txt"
 cat "$FREEZE/deployed.txt"
 echo "=== DEPLOY GREEN. NOW: voice canary (laptop spoken turn at df.imagineering.cc), then phone/cellular, then rollback rehearsal. ==="

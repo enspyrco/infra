@@ -216,7 +216,7 @@ ANCHOR=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo unknown)
   echo "prev_sha=$ANCHOR"
   echo "image=$IMG"
   echo "env_md5=$(md5sum .env | cut -d" " -f1)"
-  echo "container=$(docker ps -qf name=lyra-avatar)"
+  echo "container=$(docker ps -qf "name=^lyra-avatar$")"
   echo "date=$(date -u +%FT%TZ)"
 } > "$FREEZE/deployed.txt"
 cat "$FREEZE/deployed.txt"

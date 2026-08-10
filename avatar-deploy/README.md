@@ -160,6 +160,19 @@ deferred on purpose, with the reason — not overlooked. They are tracked as tas
   up. A latent armed state rather than an outage. The real fix is to stage the
   checkout in a git worktree and swap only at cutover, which is a redesign of the
   deploy shape, not a patch — it belongs with inverting the authority.
+- **A deploy always execs `$HOME/bin/rollback-*.sh`, by absolute path.** Correct
+  while the box is the source of truth, but it means a PARTIAL install — new deploy
+  script, stale rollback script — silently couples a new gate narrative to an old
+  recovery path. `verify-matches-box.sh` will report the drift if someone runs it;
+  nothing enforces that they do. The seam closes when the deploy comes from CI as
+  an atomic set. Named here so the inversion work knows to look at it.
+- **lyra's banner gate tests PRESENCE (`grep -F`), dreamfinder's tests EQUALITY.**
+  Presence is the weaker instrument — a substring collision would be a false GREEN
+  on the gate that once reopened the hole. Verified on the box that lyra's contract
+  (`Auth enabled — password required`) does appear as a bare line, so tightening to
+  a whole-line match is feasible. Deliberately not done here: a false RED on this
+  gate fires the auto-rollback, which is the failure mode we are most afraid of, and
+  it cannot be tested without a live deploy. Sequence it with the rehearsal.
 - **The shellcheck action is pinned to `@master`.** `ludeeus/action-shellcheck@master`
   now lints the scripts that can roll production onto a vulnerable image, on a
   floating ref. Real supply-chain exposure, but it is the existing convention for
