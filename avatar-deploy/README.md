@@ -137,29 +137,19 @@ State and secrets, never source:
 These came in with the verbatim import and are still live on the box. Each is
 deferred on purpose, with the reason — not overlooked. They are tracked as tasks.
 
-- **Neither deploy script has a rollback trap.** `rollback()` is defined after the
-  cutover, and the scripts run under `set -euo pipefail`. A failure in the *gate
-  scaffolding* itself (a `docker inspect` name mismatch, an unexpected `StartedAt`
-  shape, a compose service rename) exits the script without ever calling
-  `rollback()` — after `docker compose up -d` has already gone live. Gate *logic*
-  failures roll back; gate *scaffolding* failures leave the new release running
-  unverified. Fixing this means arming an `ERR` trap that fires a rollback path
-  that has never been rehearsed, which is the same shape as the incident that
-  started all this. It waits for the rehearsal.
+Three items that used to sit on this list were fixed instead, once they had been
+raised in every review round and the deferral reasoning stopped holding up: the
+missing `ERR` trap (a scaffolding failure after cutover left production unverified
+with *no* recovery, which is strictly worse than a possibly-spurious rollback), the
+floating `@master` on the shellcheck action, and lyra's deploy mutating the tree
+before `rollback()` was in scope.
+
 - **dreamfinder's worker-registration gate is lower-bound only** (`-ge 1`), while
   lyra enforces both bounds and rolls back on a ghost worker. Two registrations
-  pass green on dreamfinder and dispatch load-balances across duplicates. Same
-  reasoning as above: aligning it arms a new auto-rollback trigger pre-rehearsal.
-  The misleading "exactly-one" comment is corrected in this PR; the gate is not.
-- **lyra's deploy mutates the live tree before any rollback is armed.**
-  `deploy-lyra-avatar.sh` checks out `$SHA` into `src/` — which *is* the running
-  code, via the bind mount — before `rollback()` is even defined, and then builds.
-  A build failure aborts under `set -e` with the tree already advanced. The live
-  container keeps serving the old code from memory, so the site stays up; but the
-  disk now holds an unbuilt release, and the next restart for any reason brings it
-  up. A latent armed state rather than an outage. The real fix is to stage the
-  checkout in a git worktree and swap only at cutover, which is a redesign of the
-  deploy shape, not a patch — it belongs with inverting the authority.
+  pass green on dreamfinder and dispatch load-balances across duplicates. Aligning
+  it arms a new auto-rollback trigger on a path that has never been rehearsed, so it
+  waits for task #12. The misleading "exactly-one" comment is corrected here; the
+  gate is not.
 - **lyra's freeze is a first-run snapshot while `PREV_SHA` advances every deploy.**
   `env.file`, `docker-compose.yml` and the `pre-traversal-fix` image tag are all
   written only if absent, so they are frozen at whatever the first run saw, while
@@ -187,12 +177,6 @@ deferred on purpose, with the reason — not overlooked. They are tracked as tas
   a whole-line match is feasible. Deliberately not done here: a false RED on this
   gate fires the auto-rollback, which is the failure mode we are most afraid of, and
   it cannot be tested without a live deploy. Sequence it with the rehearsal.
-- **The shellcheck action is pinned to `@master`.** `ludeeus/action-shellcheck@master`
-  now lints the scripts that can roll production onto a vulnerable image, on a
-  floating ref. Real supply-chain exposure, but it is the existing convention for
-  every shellcheck step in this repo (`./scripts`, `./cd-bus`), so pinning only the
-  new one would be worse than either consistent state. Repo-wide decision, not this
-  PR's — tracked separately.
 - **`Host github-lyra` points at `IdentityFile ~/.ssh/embodied-lyra-deploy`.** Fossil
   naming from before the repo rename, on a load-bearing key path. Renaming the key
   is a box mutation, not a repo change, and at 3am a mismatched name reads as a

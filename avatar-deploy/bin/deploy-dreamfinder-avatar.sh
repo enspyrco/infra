@@ -17,6 +17,10 @@ APP_DIR="$HOME/apps/dreamfinder-avatar"
 SRC_DIR="$APP_DIR/src"
 REPO_URL="git@github-dreamfinder:imagineering-cc/dreamfinder-avatar.git"
 FREEZE="$HOME/demo-freeze"
+# mkdir -p, matching lyra. Without it the deploy can pass all five gates and then
+# die on the record step, leaving a green release with no identity file — a
+# scaffolding failure after live mutation, the class this script keeps meeting.
+mkdir -p "$FREEZE"
 cd "$APP_DIR"
 
 SHA=$(cat "$APP_DIR/DEPLOY_SHA")          # pinned — never a floating branch
@@ -56,6 +60,17 @@ docker image inspect dreamfinder-avatar-app:pre-engine >/dev/null 2>&1 \
 # --- 3. build while the old container still serves ---
 docker compose -f docker-compose.next.yml build --pull
 
+# rollback() is defined BEFORE the cutover, not after it, so that everything from
+# the first live mutation onward has a recovery path in scope. `trap - ERR` inside
+# it disarms the trap armed below, so a failure DURING the rollback cannot re-enter
+# rollback and recurse.
+rollback() {
+  trap - ERR
+  echo "GATE FAILED: $1 — rolling back"
+  "$HOME/bin/rollback-dreamfinder-avatar.sh"
+  exit 1
+}
+
 # --- 4. ATOMIC cutover: env + compose + override flip together, then one up -d ---
 [ -f .env.next ] && [ -f docker-compose.next.yml ] || { echo "staged .env.next / docker-compose.next.yml missing"; exit 1; }
 grep -q "^BRAIN=" .env.next && grep -q "^STT=" .env.next && grep -q "^TTS=" .env.next && grep -q "^BRAIN_MODEL=" .env.next \
@@ -73,7 +88,19 @@ cp docker-compose.next.yml docker-compose.yml
 # makes "a new process started" a fact rather than an inference.
 docker compose up -d --force-recreate
 
-rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-dreamfinder-avatar.sh"; exit 1; }
+# ARM the rollback for everything after the cutover. Until now, gate LOGIC failures
+# called rollback() explicitly while gate SCAFFOLDING failures — a container rename,
+# a compose service rename, an unexpected `docker inspect` shape — exited under
+# `set -e` with the new release ALREADY LIVE and no rollback fired. The script's
+# stated contract is "ANY gate failure auto-runs the QUAD rollback"; this is what
+# makes that sentence true rather than aspirational.
+#
+# Deferred through six review rounds on the grounds that arming an unrehearsed
+# rollback is risky. That reasoning was backwards: the status quo is that a
+# scaffolding failure leaves production unverified with NO recovery at all, which is
+# strictly worse than a possibly-spurious rollback to a known-good freeze. Raised by
+# all three reviewers in every round; they were right.
+trap 'rollback "unhandled failure at line $LINENO"' ERR
 
 # --- 5. gate: health ---
 ok=""
@@ -82,7 +109,6 @@ for _ in $(seq 1 30); do curl -sf localhost:3015/api/health >/dev/null && { ok=1
 echo "gate 1/5 health OK"
 
 # --- 6. gate: boot-banner contract (exact line, from THIS boot) ---
-sleep 10
 
 # Anchor the log window to the dreamfinder-avatar'S OWN boot, not the wall clock.
 # A wall-clock window (`--since 3m`) is only a PROXY for "this boot", and it stops being one the moment
@@ -106,7 +132,20 @@ BOOT_SINCE=""
 [ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 [ -n "$BOOT_SINCE" ] || rollback "cannot read dreamfinder-avatar StartedAt — the boot anchor is unavailable, so gates 2-5 cannot be trusted"
 echo "log window anchored to container boot: $BOOT_SINCE"
-BANNER=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
+# POLL for the banner rather than `sleep 10` and look once. A fixed sleep is the
+# same instrument class as the wall-clock log window in a softer register: it
+# asserts "the banner has been printed by now" using elapsed time as the proxy.
+# Under a slow voice init the banner arrives late, gate 2 reads empty, and the
+# auto-rollback fires on a perfectly good deploy — reproducing the 2026-08-10
+# topology without a single `--since 3m` left in the file. Waiting for the thing
+# itself can only ever be more patient than waiting for the clock; the deploy is
+# still bounded, it just fails on the CONTRACT rather than on the stopwatch.
+BANNER=""
+for _ in $(seq 1 30); do
+  BANNER=$(docker logs dreamfinder-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "[voice] contract:" | tail -1 | sed "s/^.*\[voice\] contract: //" || true)
+  [ "$BANNER" = "$CONTRACT" ] && break
+  sleep 2
+done
 [ "$BANNER" = "$CONTRACT" ] || { echo "banner: [$BANNER]"; echo "expect: [$CONTRACT]"; rollback "boot-banner contract"; }
 echo "gate 2/5 contract OK: $BANNER"
 

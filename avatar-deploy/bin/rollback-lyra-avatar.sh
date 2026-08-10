@@ -11,6 +11,7 @@ set -euo pipefail
 APP_DIR="$HOME/apps/lyra-avatar"
 SRC_DIR="$APP_DIR/src"
 FREEZE="$HOME/lyra-freeze"
+LEGS_SKIPPED=""   # legs that could not run; reported in the closing banner
 PORT=3017
 cd "$APP_DIR"
 
@@ -28,14 +29,11 @@ MISSING=""
 [ -n "$PREV" ] || MISSING="$MISSING PREV_SHA"
 [ -f "$FREEZE/env.file" ] || MISSING="$MISSING env.file"
 [ -f "$FREEZE/docker-compose.yml" ] || MISSING="$MISSING docker-compose.yml"
-# LFS AVAILABILITY is preflighted here, before the tree moves, so the one half of
-# the LFS risk that CAN be checked in advance is checked in advance. Whether a pull
-# will succeed cannot be — that depends on the network and the LFS endpoint at the
-# moment it runs — which is why leg 1 warns and continues rather than aborting
-# mid-rollback. Named tradeoff, not an oversight: two reviewers wanted opposite
-# behaviours here. A DEPLOY may refuse to proceed on a bad pull; a ROLLBACK is
-# already an incident response, and stopping it halfway leaves the old process
-# serving the release you are escaping. Landing incomplete beats not landing.
+# LFS AVAILABILITY is preflighted here, before the tree moves, so the half of the
+# LFS risk that CAN be known in advance is refused for free — with nothing yet
+# mutated. Whether a pull will actually succeed cannot be preflighted; that depends
+# on the network and the LFS endpoint at the instant it runs, and leg 1 handles it
+# by stopping with an explicit state report (see the note there).
 if git -C "$SRC_DIR" ls-files 2>/dev/null | grep -q . && [ -f "$SRC_DIR/.gitattributes" ] \
    && grep -q 'filter=lfs' "$SRC_DIR/.gitattributes" 2>/dev/null \
    && ! command -v git-lfs >/dev/null 2>&1; then
@@ -56,28 +54,54 @@ git -C "$SRC_DIR" checkout -q "$PREV"
 # one layer down. The deploy swept this class; the rollback half was missed.
 # Not currently load-bearing (neither repo has .gitattributes yet) — which is
 # exactly why it must go in now rather than the day LFS is switched on.
-# NOTE the deliberate asymmetry with the DEPLOY path, which fails closed here.
-# This point is AFTER the first live mutation (the tree has already moved) and
-# BEFORE the cutover. Exiting here — which is what the first version of this fix
-# did — leaves the disk at PREV while the old process keeps serving the release
-# you are trying to escape, under a banner reading "FATAL". A rollback that stops
-# halfway is not a safe failure; the whole value of the QUAD is that it completes.
-# So: warn as loudly as possible and press on to the cutover. A deploy may refuse
-# to proceed; a rollback must land.
+#
+# This point sits AFTER the first live mutation (the tree has moved) and BEFORE the
+# cutover, so failing here is genuinely awkward either way. It went both directions
+# across review rounds. It stops, and prints exactly what state the box is in —
+# because the alternative recreates the container against pointer files, which
+# passes /api/health while serving nothing, and reads to the operator as a finished
+# rollback. Degraded-and-known beats broken-and-believed; an operator who is told
+# the truth can finish the job in one command, and one is printed below.
 if command -v git-lfs >/dev/null 2>&1; then
-  git -C "$SRC_DIR" lfs pull \
-    || echo "!! git lfs pull FAILED during rollback — the tree may hold POINTER FILES. Continuing to the cutover anyway (a half-rollback is worse). Health may go green with assets missing; check a real spoken turn."
+  git -C "$SRC_DIR" lfs pull || {
+    # REVERSED from the first version of this fix, on 2-of-3 reviewer argument.
+    # Continuing produced a container recreated against POINTER FILES: /api/health
+    # green, assets missing, the whole thing reading as a completed rollback. A
+    # restore that lies is worse than one that stops, because the operator walks
+    # away. Stopping BEFORE the recreate leaves the old process still serving —
+    # degraded and known, rather than broken and believed.
+    echo "FATAL: git lfs pull failed — the restored tree may hold POINTER FILES, not assets."
+    echo
+    echo "  STATE RIGHT NOW: the src tree HAS been moved to $PREV."
+    echo "                   the container has NOT been recreated, so the OLD process"
+    echo "                   is still serving the release you were trying to escape."
+    echo
+    echo "  TO FINISH the rollback once LFS is reachable:"
+    echo "    git -C $SRC_DIR lfs pull && $0"
+    echo "  TO ABANDON it and return the tree to where it was:"
+    echo "    git -C $SRC_DIR checkout -q <the sha you came from>"
+    exit 1
+  }
 else
   echo "(git-lfs not installed — skipping lfs pull)"
 fi
 echo "leg 1 src -> $(git -C "$SRC_DIR" log -1 --oneline)"
 
 # --- leg 2: image ---
+# The image leg is genuinely OPTIONAL for lyra — the tree is what runs — but the
+# banner said "QUAD" regardless, so an operator heard "four legs restored" when
+# three had been. Legs 0/1/3 hard-require their inputs; this one does not, and the
+# difference must be audible. Say the arity out loud rather than implying it.
 if docker image inspect lyra-avatar-app:pre-traversal-fix >/dev/null 2>&1; then
   docker tag lyra-avatar-app:pre-traversal-fix lyra-avatar-app:latest
   echo "leg 2 image -> pre-traversal-fix"
 else
-  echo "leg 2 image: no pre-traversal-fix anchor — leaving image as-is"
+  LEGS_SKIPPED="image"
+  echo "!! leg 2 SKIPPED: no lyra-avatar-app:pre-traversal-fix anchor exists."
+  echo "   The image is being LEFT AS-IS. This is a THREE-leg rollback, not a QUAD."
+  echo "   The tree, env and compose will be restored; deps/ENV/CMD come from the"
+  echo "   image and will still be whatever the failed release built. If the release"
+  echo "   you are escaping changed dependencies, this rollback is INCOMPLETE."
 fi
 
 # --- leg 3: env + compose (existence already asserted in leg 0) ---
@@ -135,6 +159,9 @@ echo "leg 4 worker registrations $WINDOW_DESC: $REG (expect exactly 1)"
 # mid-rehearsal read a FAILED rollback as a finished one.
 [ "$REG" -ge 1 ] || echo "!! NO WORKER REGISTERED after rollback — the site is up but will not answer a spoken turn. Do NOT walk away from this."
 
+if [ -n "$LEGS_SKIPPED" ]; then
+  echo "=== ROLLBACK LANDED, BUT INCOMPLETE — skipped leg(s): $LEGS_SKIPPED ==="
+fi
 cat <<'EOF'
 === ROLLBACK COMPLETE. It is NOT verified until a human does a real spoken ===
 === turn at lyra.imagineering.cc.                                          ===

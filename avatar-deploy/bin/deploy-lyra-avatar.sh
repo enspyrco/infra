@@ -76,7 +76,20 @@ if [ "$PREV_SHA" != "$SHA" ]; then
   echo "$PREV_SHA" > "$FREEZE/PREV_SHA"
   echo "rollback anchor -> $PREV_SHA"
 else
-  echo "rollback anchor unchanged ($(cat "$FREEZE/PREV_SHA" 2>/dev/null || echo none)) — tree already at target"
+  # ...but "don't advance it" is not the same as "there is one". On a first deploy,
+  # or after a wiped freeze, PREV_SHA can be ABSENT while the tree is already at the
+  # target. The old message cheerfully printed "(none)" and carried on — so the
+  # deploy armed an auto-rollback whose preflight requires PREV_SHA and exits
+  # without changing anything. That advertises rollback protection while having no
+  # reversible path at all. Refuse here, BEFORE the cutover, where refusing is free.
+  ANCHOR=$(cat "$FREEZE/PREV_SHA" 2>/dev/null || true)
+  [ -n "$ANCHOR" ] || {
+    echo "FATAL: tree is already at $SHA and there is no $FREEZE/PREV_SHA anchor."
+    echo "       Deploying now would arm an auto-rollback with nothing to roll back to."
+    echo "       Write a known-good SHA to $FREEZE/PREV_SHA first, or deploy a SHA that moves the tree."
+    exit 1
+  }
+  echo "rollback anchor unchanged ($ANCHOR) — tree already at target"
 fi
 git fetch origin
 git checkout -q "$SHA"
@@ -92,6 +105,16 @@ else
 fi
 echo "src: $PREV_SHA -> $(git log -1 --oneline)"
 cd "$APP_DIR"
+
+# rollback() is defined BEFORE the cutover so everything from the first live
+# mutation onward has a recovery path in scope. `trap - ERR` inside it disarms the
+# trap armed below, so a failure DURING the rollback cannot recurse.
+rollback() {
+  trap - ERR
+  echo "GATE FAILED: $1 — rolling back"
+  "$HOME/bin/rollback-lyra-avatar.sh"
+  exit 1
+}
 
 # --- 2. idempotent rollback anchors (never clobber an existing anchor) ---
 docker image inspect lyra-avatar-app:pre-traversal-fix >/dev/null 2>&1 \
@@ -114,7 +137,11 @@ docker compose build --pull
 # preserved across a recreate; only --renew-anon-volumes would discard them.
 docker compose up -d --force-recreate
 
-rollback() { echo "GATE FAILED: $1 — rolling back"; "$HOME/bin/rollback-lyra-avatar.sh"; exit 1; }
+# ARM the rollback for everything after the cutover — see the matching note in
+# deploy-dreamfinder-avatar.sh. Gate LOGIC failures called rollback(); gate
+# SCAFFOLDING failures exited under `set -e` with the new release already live and
+# no recovery fired.
+trap 'rollback "unhandled failure at line $LINENO"' ERR
 
 # --- 4. gate 1: health ---
 ok=""
@@ -123,7 +150,6 @@ for _ in $(seq 1 30); do curl -sf "localhost:$PORT/api/health" >/dev/null && { o
 echo "gate 1/5 health OK"
 
 # --- 5. gate 2: boot-banner contract (exact line, from THIS boot) ---
-sleep 10
 
 # Anchor the log window to the lyra-avatar'S OWN boot, not the wall clock.
 # A wall-clock window (`--since 3m`) is only a PROXY for "this boot", and it stops being one the moment
@@ -144,7 +170,16 @@ BOOT_SINCE=""
 [ -n "$STARTED_AT" ] && BOOT_SINCE=$(date -u -d "$STARTED_AT - 5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 [ -n "$BOOT_SINCE" ] || rollback "cannot read lyra-avatar StartedAt — the boot anchor is unavailable, so gates 2-5 cannot be trusted"
 echo "log window anchored to container boot: $BOOT_SINCE"
-BANNER=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "$CONTRACT" | tail -1 || true)
+# POLL for the banner rather than `sleep 10` and look once — see the matching note
+# in deploy-dreamfinder-avatar.sh. A fixed sleep uses elapsed time as a proxy for
+# "the banner has been printed", which goes false under a slow init and fires the
+# auto-rollback on a good deploy.
+BANNER=""
+for _ in $(seq 1 30); do
+  BANNER=$(docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | grep -F "$CONTRACT" | tail -1 || true)
+  [ -n "$BANNER" ] && break
+  sleep 2
+done
 [ -n "$BANNER" ] || { echo "expect: [$CONTRACT]"; docker logs lyra-avatar --since "$BOOT_SINCE" 2>&1 | head -12; rollback "boot-banner contract"; }
 echo "gate 2/5 contract OK: $BANNER"
 
