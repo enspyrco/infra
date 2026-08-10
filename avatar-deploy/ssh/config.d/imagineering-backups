@@ -1,0 +1,5 @@
+Host github-imagineering-backups
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/imagineering-backups-deploy
+    IdentitiesOnly yes

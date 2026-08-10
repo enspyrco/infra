@@ -1,0 +1,11 @@
+Include config.d/*
+
+# Deploy alias for imagineering-cc/dreamfinder-avatar. The deploy script clones
+# via git@github-dreamfinder: so the repo gets its own scoped key rather than the
+# box identity. Restored 2026-08-10 — the alias was referenced by the app src
+# remote but never defined, so every deploy failed at the first git fetch.
+Host github-dreamfinder
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/dreamfinder-deploy
+  IdentitiesOnly yes
