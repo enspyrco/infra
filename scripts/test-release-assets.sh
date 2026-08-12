@@ -182,6 +182,41 @@ assert_eq "1" "$rc" "empty file returns non-zero"
 assert_not_contains "$(calls)" "release upload" "empty file uploads NOTHING"
 rm -f "$tmp" "$empty"
 
+echo "== logging delegates to a host log/error WITHOUT recursing =="
+# Regression guard for a production-only SIGSEGV. _ra_log's delegating branch
+# fires only when a real `log` function exists — i.e. only when sourced from
+# backup.sh. Every test above takes the printf fallback, so an `_ra_log` that
+# called ITSELF instead of `log` stayed invisible: 25/25 green while the
+# deployed script overflowed its stack and died with a core dump.
+#
+# So define host log/error here, exactly as backup.sh does, and assert the
+# delegation both reaches them and terminates. `timeout` bounds the runaway
+# case: unbounded recursion would otherwise hang or crash the suite itself
+# rather than reporting a clean failure.
+delegation_probe() {
+  # shellcheck disable=SC2317  # invoked indirectly via _ra_log
+  log() { echo "HOSTLOG:$1"; }
+  # shellcheck disable=SC2317  # invoked indirectly via _ra_err
+  error() { echo "HOSTERR:$1" >&2; }
+  . "$SCRIPT_DIR/lib/release-assets.sh"
+  _ra_log "hello"
+  _ra_err "boom"
+}
+probe_out=$(timeout 10 bash -c "SCRIPT_DIR='$SCRIPT_DIR'; $(declare -f delegation_probe); delegation_probe" 2>&1)
+probe_rc=$?
+
+assert_eq "0" "$probe_rc" "delegation terminates (no stack overflow / SIGSEGV)"
+assert_contains "$probe_out" "HOSTLOG:hello" "_ra_log reaches the host log()"
+assert_contains "$probe_out" "HOSTERR:boom" "_ra_err reaches the host error()"
+assert_not_contains "$probe_out" "[release-assets] hello" "_ra_log does not fall back when a host log exists"
+
+echo "== and still falls back cleanly with NO host log/error =="
+fallback_out=$(timeout 10 bash -c "SCRIPT_DIR='$SCRIPT_DIR'; . \"\$SCRIPT_DIR/lib/release-assets.sh\"; _ra_log hi; _ra_err oops" 2>&1)
+fallback_rc=$?
+assert_eq "0" "$fallback_rc" "fallback path terminates"
+assert_contains "$fallback_out" "[release-assets] hi" "falls back to its own log format"
+assert_contains "$fallback_out" "[release-assets] ERROR: oops" "falls back to its own error format"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]
