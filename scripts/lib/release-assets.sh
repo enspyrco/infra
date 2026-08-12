@@ -67,16 +67,21 @@ release_auth_available() {
 # So: delegate only when we are demonstrably in bash AND the name is genuinely a
 # shell function; otherwise print our own. Internal names are prefixed so they
 # cannot collide with a builtin in any shell.
+# NOTE: the delegating calls below MUST invoke `log` / `error`, never `_ra_log`
+# / `_ra_err`. Getting that wrong is not a cosmetic slip — it is unbounded
+# recursion that overflows the stack and kills the process with SIGSEGV, and it
+# only fires when a real `log` exists, i.e. only when sourced from backup.sh.
+# The standalone test suite takes the printf branch and stays green throughout.
 _ra_log() {
   if [ -n "${BASH_VERSION:-}" ] && declare -f log >/dev/null 2>&1; then
-    _ra_log "$*"
+    log "$*"
   else
     printf '[release-assets] %s\n' "$*"
   fi
 }
 _ra_err() {
   if [ -n "${BASH_VERSION:-}" ] && declare -f error >/dev/null 2>&1; then
-    _ra_err "$*"
+    error "$*"
   else
     printf '[release-assets] ERROR: %s\n' "$*" >&2
   fi
