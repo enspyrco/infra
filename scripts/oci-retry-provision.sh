@@ -16,8 +16,8 @@ SSH_KEY_PATH="$HOME/.ssh/id_ed25519.pub"
 # What we're aiming for
 SMALL_OCPUS=1
 SMALL_MEM=6
-FULL_OCPUS=4
-FULL_MEM=24
+FULL_OCPUS=2
+FULL_MEM=12
 
 log() { echo "$(date): $*" >> "$LOG"; }
 
