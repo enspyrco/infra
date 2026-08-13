@@ -1,0 +1,45 @@
+# docker-compose.lyra.yml — OVERRIDE applied ONLY in lyra-live mode.
+#
+# Why this file exists (cage-match #81, finding 1): the lyra-live brain reaches
+# the real Lyra container on robins-oci over ssh, using a deploy key. Mounting
+# that key into the base compose meant it was present in the container on EVERY
+# deploy, including the default DF_BRAIN=api path where the ssh hop never runs.
+# `:ro` stops mutation, not exfiltration — under a container compromise the key
+# was readable even though the lyra path was dark. Pulling the mount into this
+# override keeps the key out of the container unless lyra-live is actually on.
+#
+# Applied automatically by scripts/deploy-to.sh when the generated DF_BRAIN is
+# `lyra-live`. Manual equivalent:
+#   docker compose -f docker-compose.yml -f docker-compose.lyra.yml up -d
+#
+# Host-key pinning (cage-match #81, finding 2 — the cross-repo other half):
+# the lyra-live ssh hop in dreamfinder-avatar used StrictHostKeyChecking=no +
+# UserKnownHostsFile=/dev/null, accepting ANY server identity (MITM). The JS
+# fix is prepared in dreamfinder-avatar PR #65 (still OPEN, based on
+# feat/lyra-speak — the lyra-live brain isn't in that repo's main yet): the hop
+# switches to StrictHostKeyChecking=yes and reads its known_hosts from
+# LYRA_KNOWN_HOSTS (default /app/.ssh/known_hosts). This mount provides the file
+# the JS verifies the server against — the infra half of that fix.
+#
+# ACTIVATION GATE — all three must be true before flipping DF_BRAIN=lyra-live in
+# production, or the hop fails closed:
+#   1. dreamfinder-avatar PR #65 merged into the deployed app branch (so the
+#      StrictHostKeyChecking=yes consuming code is actually built).
+#   2. The pinned host key generated ONCE on the deploy host:
+#          ssh-keyscan 207.211.145.30 > /home/nick/.ssh/lyra-known_hosts
+#   3. DF_BRAIN=lyra-live set (which applies THIS override; see deploy-to.sh).
+# If the host file is missing/empty, the mount surfaces an empty/absent
+# known_hosts and StrictHostKeyChecking=yes makes ssh REFUSE the hop (fail
+# closed, by design — a missing pin must never silently trust any server).
+# In the default DF_BRAIN=api path this override is not applied, the mount is
+# absent, and the ssh hop never runs.
+services:
+  app:
+    volumes:
+      # Deploy key for the lyra-live ssh hop (read-only). Present ONLY when this
+      # override is applied — i.e. only in lyra-live mode.
+      - /home/nick/.ssh/lyra-deploy:/app/.ssh/lyra-deploy:ro
+      # Pinned host key (known_hosts) the JS verifies robins-oci against — the
+      # server-identity half of the auth. Generate on the host with the
+      # ssh-keyscan above before enabling lyra-live (fail-closed if absent).
+      - /home/nick/.ssh/lyra-known_hosts:/app/.ssh/known_hosts:ro

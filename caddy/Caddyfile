@@ -10,6 +10,10 @@ kan.imagineering.cc {
     reverse_proxy localhost:3013
 }
 
+chat.imagineering.cc {
+    reverse_proxy localhost:8095
+}
+
 dav.imagineering.cc {
     reverse_proxy localhost:5232
 }
@@ -83,7 +87,7 @@ df.imagineering.cc {
     reverse_proxy localhost:3015
 }
 
-# Lyra's live Q&A — same embodied-dreamfinder app; the app detects the "lyra."
+# Lyra's live Q&A — same dreamfinder-avatar app; the app detects the "lyra."
 # host and serves her persona, voice, and own face (no ?lyra param needed).
 lyra.imagineering.cc {
     reverse_proxy localhost:3015
@@ -169,7 +173,7 @@ api.downstream-storage.cc {
 # --- Tech World (Flutter web + avatar via DF) ---
 
 world.imagineering.cc {
-    # Avatar renderer and its assets — proxy to embodied-dreamfinder (port 3015).
+    # Avatar renderer and its assets — proxy to dreamfinder-avatar (port 3015).
     # These paths match RENDERER_PATHS and RENDERER_PREFIXES in server.js.
     @df_renderer {
         path /avatar /avatar-renderer.js /sparks.js /avatars/* /headaudio/*
@@ -208,4 +212,13 @@ world.imagineering.cc {
         file_server
         try_files {path} /index.html
     }
+}
+
+# --- live-game (quiz buzzer) ---
+# Phones are buzzers, the big screen is the board, Claude is the Game Master.
+# Server runs on the box as a systemd/long-running process bound to localhost:7373.
+# Previously this route lived only in Caddy's running config (added via the admin
+# API), so a container restart dropped it — now it's durable in the Caddyfile.
+quiz-game.imagineering.cc {
+    reverse_proxy localhost:7373
 }

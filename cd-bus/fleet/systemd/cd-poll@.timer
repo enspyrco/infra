@@ -3,7 +3,7 @@
 # Install at /etc/systemd/system/cd-poll@.timer
 [Unit]
 Description=Trigger deploy-bus CD pull for %i every 5 min
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 
 [Timer]
 # First tick 2 min after boot (let Docker settle), then every 5 min.

@@ -12,7 +12,7 @@
 # Install at /etc/systemd/system/cd-bus-recover@.timer
 [Unit]
 Description=Periodic auto-recovery check for cd-bus-subscriber@%i
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 
 [Timer]
 # First check 5 min after boot (let the subscriber come up and, if the relay is

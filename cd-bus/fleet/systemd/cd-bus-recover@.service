@@ -22,7 +22,7 @@
 # Install at /etc/systemd/system/cd-bus-recover@.service
 [Unit]
 Description=Auto-recover a failed cd-bus-subscriber@%i (bounded re-alert, no permanent death)
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 
 [Service]
 Type=oneshot

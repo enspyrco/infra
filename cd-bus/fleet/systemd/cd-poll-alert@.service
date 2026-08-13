@@ -6,7 +6,7 @@
 # Install at /etc/systemd/system/cd-poll-alert@.service
 [Unit]
 Description=Telegram alert for cd-poll@%i failure
-Documentation=https://github.com/imagineering-cc/imagineering-infra/blob/main/cd-bus/fleet/README.md
+Documentation=https://github.com/enspyrco/infra/blob/main/cd-bus/fleet/README.md
 
 [Service]
 Type=oneshot

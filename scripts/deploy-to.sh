@@ -126,11 +126,19 @@ deploy_scripts() {
 
     # Set up health check cron. Tokens are NOT inlined here any more — the
     # script reads /etc/imagineering-secrets/telegram.env via lib/telegram.sh.
+    #
+    # MAILTO must be QUOTED. On Ubuntu 24.04 (cron 3.0pl1-184ubuntu2) a bare
+    # `MAILTO=` makes cron reject the whole file with "Error: bad username"
+    # whenever the hour and day-of-month fields are both `*` — which is exactly
+    # the hourly entry below. Cron logs that once, at the scan after the file is
+    # written, and never again, because it only re-parses a cron.d file when the
+    # mtime changes. The result is a health check that installs cleanly, looks
+    # correct in `cat`, runs fine by hand, and never executes.
     echo "Installing /etc/cron.d/health-check..."
     ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
         'SHELL=/bin/bash' \
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        'MAILTO=' \
+        'MAILTO=\"\"' \
         '0 * * * * nick /opt/scripts/health-check.sh >> /home/nick/logs/health-check.log 2>&1' \
         | sudo tee /etc/cron.d/health-check > /dev/null && \
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
@@ -195,7 +203,7 @@ deploy_galaxy() {
     #
     # Source now lives in its OWN repo (imagineering-cc/galaxy), cloned at
     # ~/git/orgs/imagineering/galaxy — same EDF_SRC-style convention as
-    # embodied-dreamfinder. Split out of this repo 2026-06-21.
+    # dreamfinder-avatar. Split out of this repo 2026-06-21.
     #
     # Destination is ~/apps/galaxy — the Caddy container bind-mounts
     # /home/nick/apps/galaxy -> /srv/galaxy:ro (see caddy/docker-compose.yml).
@@ -323,6 +331,43 @@ deploy_notify() {
     echo "  Health:   curl https://notify.imagineering.cc/health"
 }
 
+deploy_claude_shim() {
+    echo "Deploying claude-shim (Max-plan inference endpoint)..."
+
+    local SHIM_SECRETS="$REPO_ROOT/claude-shim/secrets.yaml"
+    if [ ! -f "$SHIM_SECRETS" ]; then
+        echo "ERROR: claude-shim/secrets.yaml not found"
+        echo "Create from claude-shim/secrets.yaml.example and encrypt with: sops -e -i claude-shim/secrets.yaml"
+        return 1
+    fi
+
+    # Decrypt once, then route every value through dotenv_quote so a secret with
+    # dotenv-significant bytes survives docker compose's dotenv parser intact
+    # (see deploy_outline for rationale).
+    echo "Generating .env from encrypted secrets..."
+    local SHIM_PLAINTEXT
+    SHIM_PLAINTEXT=$(sops -d "$SHIM_SECRETS")
+    shim_field() { echo "$SHIM_PLAINTEXT" | yq -r "$1 // \"\""; }
+    {
+        printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$(dotenv_quote "$(shim_field '.claude_code_oauth_token')")"
+    } > "$REPO_ROOT/claude-shim/.env"
+
+    ssh "$REMOTE" "mkdir -p ~/apps/claude-shim"
+    rsync -avz --delete --exclude 'secrets.yaml' "$REPO_ROOT/claude-shim/" "$REMOTE":~/apps/claude-shim/
+
+    rm -f "$REPO_ROOT/claude-shim/.env"
+
+    # Ensure shared network exists (consumers reach it as http://claude-shim:8088).
+    ssh "$REMOTE" "docker network inspect imagineering >/dev/null 2>&1 || docker network create imagineering"
+
+    # Builds from its Dockerfile (not a published image), so build+up, not pull.
+    ssh "$REMOTE" "cd ~/apps/claude-shim && docker compose build && docker compose up -d"
+
+    echo "claude-shim deployed!"
+    echo "  Network URL (consumers): http://claude-shim:8088/chat"
+    echo "  Health (host-local):     curl 127.0.0.1:8088/health"
+}
+
 deploy_familiars_server() {
     echo "Deploying familiars-server..."
 
@@ -383,14 +428,55 @@ deploy_familiars_server() {
 deploy_backups() {
     echo "Deploying backup configuration..."
 
-    # Deploy backup scripts
-    echo "Deploying backup scripts..."
-    ssh "$REMOTE" "sudo mkdir -p /opt/scripts"
-    scp "$REPO_ROOT/scripts/backup.sh" "$REMOTE":/tmp/backup.sh
-    scp "$REPO_ROOT/scripts/restore.sh" "$REMOTE":/tmp/restore.sh
-    ssh "$REMOTE" "sudo mv /tmp/backup.sh /tmp/restore.sh /opt/scripts/"
-    ssh "$REMOTE" "sudo chmod +x /opt/scripts/backup.sh /opt/scripts/restore.sh"
-    ssh "$REMOTE" "sudo chown nick:nick /opt/scripts/*.sh"
+    # Deploy backup scripts + the lib/ helpers they source, DEPENDENCY-FIRST.
+    # backup.sh/restore.sh `. "$SCRIPT_DIR/lib/aiko-volume.sh"` (+ telegram.sh)
+    # at runtime, so a consumer script installed BEFORE its lib — or beside a
+    # FAILED lib copy — reopens the exact silent-04:00-cron-death #1759 fixed.
+    # So the order and atomicity matter as much as copying the files:
+    #   1. stage the whole payload under one fresh remote temp dir,
+    #   2. FAIL CLOSED before touching /opt/scripts if a required lib is absent,
+    #   3. install lib FIRST (rsync --delete → /opt/scripts/lib is an authoritative
+    #      mirror, so a helper removed from the repo can't linger as a sourceable
+    #      tombstone), then flip the consumer scripts LAST, in one ssh transaction,
+    #   4. assert every sourced file is present + parseable on-box before success.
+    echo "Deploying backup scripts + lib helpers (lib first)..."
+    local rstage
+    rstage=$(ssh "$REMOTE" 'mktemp -d /tmp/scripts-deploy.XXXXXX') \
+        || { echo "ERROR: remote mktemp failed"; return 1; }
+    scp -q "$REPO_ROOT/scripts/backup.sh" "$REPO_ROOT/scripts/restore.sh" "$REMOTE":"$rstage/"
+    rsync -az "$REPO_ROOT/scripts/lib/" "$REMOTE":"$rstage/lib/"
+    # Fail closed BEFORE any /opt/scripts mutation if the libs the scripts source
+    # didn't stage — better no deploy than a half-deploy over a live cron path.
+    # (Remote rsync is implicitly proven present: the staging rsync above would
+    # have failed here, before any mutation, if it were missing.)
+    ssh "$REMOTE" "test -s '$rstage/lib/aiko-volume.sh' && test -s '$rstage/lib/telegram.sh'" \
+        || { echo "ERROR: required libs missing from staging — aborting before install"; ssh "$REMOTE" "rm -rf '$rstage'"; return 1; }
+    # Parse the STAGED payload BEFORE mutating /opt/scripts: a syntactically broken
+    # script/lib must be caught while the live tree is still untouched (fail closed
+    # BEFORE, not merely detect AFTER — the live 04:00 cron can't be left broken by
+    # a bad push). Iterate the scripts AND every staged lib/*.sh (not a hardcoded
+    # pair) so this matches what the authoritative rsync --delete installs — a new
+    # helper can't ship unparsed. Re-checked post-install below as belt-and-braces.
+    ssh "$REMOTE" "for f in '$rstage'/backup.sh '$rstage'/restore.sh '$rstage'/lib/*.sh; do bash -n \"\$f\" || { echo \"bash -n failed: \$f\"; exit 1; }; done" \
+        || { echo "ERROR: staged payload failed bash -n — aborting before any /opt/scripts change"; ssh "$REMOTE" "rm -rf '$rstage'"; return 1; }
+    # Install lib first, consumers last, one transaction. `install` sets mode+owner
+    # deterministically (no separate chmod/chown races).
+    ssh "$REMOTE" "sudo mkdir -p /opt/scripts/lib \
+        && sudo rsync -a --delete '$rstage/lib/' /opt/scripts/lib/ \
+        && sudo chown -R nick:nick /opt/scripts/lib \
+        && sudo install -o nick -g nick -m 0755 '$rstage/backup.sh'  /opt/scripts/backup.sh \
+        && sudo install -o nick -g nick -m 0755 '$rstage/restore.sh' /opt/scripts/restore.sh \
+        && rm -rf '$rstage'" \
+        || { echo "ERROR: remote install failed"; ssh "$REMOTE" "rm -rf '$rstage'" 2>/dev/null; return 1; }
+    # Post-install falsifier: deploy exit 0 must mean "the cron won't abort on a
+    # missing/broken source", not just "bytes moved". Two checks: (1) the REQUIRED
+    # runtime contract — aiko-volume.sh + telegram.sh must be present + readable
+    # (a glob can't catch a MISSING required file); (2) every installed script and
+    # lib/*.sh must parse (bash -n — no execution, so no telegram side effects).
+    ssh "$REMOTE" "test -r /opt/scripts/lib/aiko-volume.sh && test -r /opt/scripts/lib/telegram.sh \
+        && for f in /opt/scripts/backup.sh /opt/scripts/restore.sh /opt/scripts/lib/*.sh; do bash -n \"\$f\" || { echo \"bash -n failed: \$f\"; exit 1; }; done" \
+        || { echo "ERROR: post-install source check FAILED — backup cron would break; investigate the box"; return 1; }
+    echo "  backup scripts + lib installed and source-verified"
 
     # Ensure cron is installed and running
     if ! ssh "$REMOTE" "systemctl is-active cron > /dev/null 2>&1"; then
@@ -443,9 +529,8 @@ SSHEOF'
     echo "============================================"
     echo ""
 
-    # --- Continuwuity backup prerequisites ---
-    # `backup_continuwuity` needs the `age` binary to encrypt the tarball
-    # before pushing. apt is idempotent; reinstall is a no-op if present.
+    # --- age binary (used by encrypted backups / restores) ---
+    # apt is idempotent; reinstall is a no-op if present.
     echo "Ensuring age is installed on $REMOTE..."
     ssh "$REMOTE" "command -v age >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq age"
 
@@ -502,16 +587,50 @@ SSHEOF'
         echo "  Add matrix_admin_token + backup_age_recipient to matrix/secrets.yaml to enable"
     fi
 
+    # Install the GitHub release token (root:nick 0640). Deploy keys cannot
+    # create releases — they authenticate git-over-SSH only — so the
+    # object-store tier needs an API token the tree-committed path doesn't.
+    # Same build-locally / scp / install-with-perms shape as the matrix block
+    # above, for the same reason: never put the token on a remote command line.
+    local RELEASE_SECRETS="$REPO_ROOT/backups/secrets.yaml"
+    if [ -f "$RELEASE_SECRETS" ] && sops -d "$RELEASE_SECRETS" | yq -e '.github_release_token' > /dev/null 2>&1; then
+        echo "Installing /etc/imagineering-secrets/github-release.env..."
+        local RELEASE_TOKEN RELEASE_TMP RELEASE_PREV_TRAP
+        RELEASE_TOKEN=$(sops -d "$RELEASE_SECRETS" | yq -r '.github_release_token')
+        RELEASE_TMP=$(mktemp)
+        RELEASE_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand RELEASE_TMP now, intentional
+        trap "rm -f '$RELEASE_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/github-release.env' 2>/dev/null || true" EXIT
+        shell_env_line GH_TOKEN "$RELEASE_TOKEN" > "$RELEASE_TMP"
+        chmod 0600 "$RELEASE_TMP"
+        scp -q "$RELEASE_TMP" "$REMOTE":/tmp/github-release.env
+        ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
+            sudo install -m 0640 -o root -g nick /tmp/github-release.env /etc/imagineering-secrets/github-release.env && \
+            rm -f /tmp/github-release.env"
+        rm -f "$RELEASE_TMP"
+        eval "${RELEASE_PREV_TRAP:-trap - EXIT}"
+        echo "  GitHub release envfile installed (mode 0640 root:nick)"
+    else
+        echo "NOTE: No github_release_token in backups/secrets.yaml — object-store backups will FAIL loudly"
+        echo "  This is deliberate: a missing credential must not look like a successful smaller run"
+    fi
+
+    # `gh` drives the release-asset tier. backup_objects_to_releases fails
+    # loudly without it rather than skipping, so install it here rather than
+    # discovering the gap at 04:00.
+    echo "Ensuring gh (GitHub CLI) is installed on $REMOTE..."
+    ssh "$REMOTE" "command -v gh >/dev/null 2>&1 || (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh)"
+
     echo "Backup configuration complete!"
     echo "  - GitHub backup: imagineering-cc/imagineering-backups (private repo)"
     echo "  - Deploy key: ~/.ssh/imagineering-backups-deploy"
     echo "  - Scripts: /opt/scripts/backup.sh, /opt/scripts/restore.sh"
     echo "  - Matrix secrets: /etc/imagineering-secrets/matrix.env"
+    echo "  - Release token: /etc/imagineering-secrets/github-release.env"
     echo "  - Cron: Daily at 4 AM"
     echo ""
     echo "Test with: ssh $REMOTE '/opt/scripts/backup.sh all'"
     echo "Test individual: ssh $REMOTE '/opt/scripts/backup.sh matrix'"
-    echo "Test continuwuity: ssh $REMOTE '/opt/scripts/backup.sh continuwuity'"
 }
 
 deploy_outline() {
@@ -709,19 +828,19 @@ deploy_pm_bot() {
 deploy_embodied_dreamfinder() {
     echo "Deploying Embodied Dreamfinder (voice avatar)..."
 
-    local EDF_SECRETS="$REPO_ROOT/embodied-dreamfinder/secrets.yaml"
-    local EDF_SRC="$HOME/git/orgs/imagineering/embodied-dreamfinder"
+    local EDF_SECRETS="$REPO_ROOT/dreamfinder-avatar/secrets.yaml"
+    local EDF_SRC="$HOME/git/orgs/imagineering/dreamfinder-avatar"
 
     # Check for secrets file
     if [ ! -f "$EDF_SECRETS" ]; then
-        echo "ERROR: embodied-dreamfinder/secrets.yaml not found"
-        echo "Create it from secrets.yaml.example and encrypt with: sops -e -i embodied-dreamfinder/secrets.yaml"
+        echo "ERROR: dreamfinder-avatar/secrets.yaml not found"
+        echo "Create it from secrets.yaml.example and encrypt with: sops -e -i dreamfinder-avatar/secrets.yaml"
         return 1
     fi
 
     # Check for source code
     if [ ! -d "$EDF_SRC" ]; then
-        echo "ERROR: embodied-dreamfinder source not found at $EDF_SRC"
+        echo "ERROR: dreamfinder-avatar source not found at $EDF_SRC"
         return 1
     fi
 
@@ -751,49 +870,64 @@ deploy_embodied_dreamfinder() {
         printf 'LIVEKIT_URL=%s\n'           "$(dotenv_quote "$(edf_field '.livekit_url')")"
         printf 'LIVEKIT_API_KEY=%s\n'       "$(dotenv_quote "$(edf_field '.livekit_api_key')")"
         printf 'LIVEKIT_API_SECRET=%s\n'    "$(dotenv_quote "$(edf_field '.livekit_api_secret')")"
-        # lyra-live fields (merged from feat/lyra-live-voice; routed through the
-        # same dotenv_quote hardening as every other secret above).
-        printf 'DF_BRAIN=%s\n'              "$(dotenv_quote "$(edf_field '.df_brain' 'api')")"
-        printf 'TTS_ENGINE=%s\n'            "$(dotenv_quote "$(edf_field '.tts_engine' 'kokoro')")"
-        printf 'LYRA_SSH_KEY=%s\n'          "$(dotenv_quote "$(edf_field '.lyra_ssh_key')")"
-        printf 'LYRA_SSH_HOST=%s\n'         "$(dotenv_quote "$(edf_field '.lyra_ssh_host' 'ubuntu@207.211.145.30')")"
-        printf 'OPENAI_TTS_VOICE=%s\n'      "$(dotenv_quote "$(edf_field '.openai_tts_voice' 'sage')")"
-    } > "$REPO_ROOT/embodied-dreamfinder/.env"
+        # Stage selectors — engine concepts (STT -> BRAIN -> TTS), renamed from
+        # DF_BRAIN/STT_ENGINE/TTS_ENGINE at the 2026-07-15 demo cutover. The
+        # pipeline is FAIL-CLOSED on these (unset/unknown -> boot crash), so the
+        # defaults here ARE the deployed contract. lyra-live mode (and its
+        # LYRA_SSH_* fields) was removed with the rename; it returns behind the
+        # engine's brain selector in Stage C of the engine-extraction plan.
+        printf 'BRAIN=%s\n'                "$(dotenv_quote "$(edf_field '.brain' 'http')")"
+        printf 'BRAIN_URL=%s\n'            "$(dotenv_quote "$(edf_field '.brain_url' 'http://host.docker.internal:3020')")"
+        printf 'BRAIN_SERVICE_KEY=%s\n'    "$(dotenv_quote "$(edf_field '.brain_service_key')")"
+        printf 'BRAIN_MODEL=%s\n'          "$(dotenv_quote "$(edf_field '.brain_model' 'claude-opus-4-8')")"
+        printf 'STT=%s\n'                  "$(dotenv_quote "$(edf_field '.stt' 'deepgram')")"
+        # DEEPGRAM: STT + Aura TTS (2026-07-16 demo stack). deepgram_api_key and
+        # brain_service_key MUST be added to secrets.yaml before the next infra
+        # deploy of dreamfinder-avatar — empty values crash the container at
+        # boot (fail-closed selectors), loudly not silently.
+        printf 'DEEPGRAM_API_KEY=%s\n'     "$(dotenv_quote "$(edf_field '.deepgram_api_key')")"
+        printf 'TTS_VOICE=%s\n'            "$(dotenv_quote "$(edf_field '.tts_voice' 'aura-2-orpheus-en')")"
+        printf 'TTS=%s\n'                  "$(dotenv_quote "$(edf_field '.tts' 'deepgram')")"
+        # ascend night-loop ingest bearer (POST /api/ascend/night). Same secret as ascend's ASCEND_DF_KEY.
+        printf 'ASCEND_INGEST_KEY=%s\n'     "$(dotenv_quote "$(edf_field '.ascend_ingest_key')")"
+        # Second password scoping a session to "ascend" (unlocks the DF that knows last night).
+        printf 'ASCEND_PASSWORD=%s\n'       "$(dotenv_quote "$(edf_field '.ascend_password')")"
+        # Shared secret proving a localhost caller is the trusted in-container voice agent
+        # (not the public-embeddable renderer): lets it request ascend-scoped context over
+        # 127.0.0.1 so the local LiveKit pipeline gets the night. Server + agent run in the
+        # same container, so this one value reaches both. <16 chars → server disables the
+        # override (fail-closed). See dreamfinder-avatar server.js localhost branch.
+        printf 'INTERNAL_SCOPE_KEY=%s\n'    "$(dotenv_quote "$(edf_field '.internal_scope_key')")"
+    } > "$REPO_ROOT/dreamfinder-avatar/.env"
 
-    # Compose-file selection: only apply the lyra-live override (which mounts the
-    # ssh deploy key into the container) when the brain is actually lyra-live, so
-    # the default api path never carries the key (cage-match #81 finding 1).
-    local DF_BRAIN_VAL EDF_COMPOSE_ARGS
-    DF_BRAIN_VAL=$(edf_field '.df_brain' 'api')
-    if [ "$DF_BRAIN_VAL" = "lyra-live" ]; then
-        EDF_COMPOSE_ARGS="-f docker-compose.yml -f docker-compose.lyra.yml"
-        echo "DF_BRAIN=lyra-live -> applying docker-compose.lyra.yml (mounts ssh deploy key)"
-    else
-        EDF_COMPOSE_ARGS="-f docker-compose.yml"
-        echo "DF_BRAIN=$DF_BRAIN_VAL -> base compose only (no ssh key mounted)"
-    fi
+    # Base compose only. lyra-live (and its docker-compose.lyra.yml key mount)
+    # is not selectable since the BRAIN rename — the current pipeline accepts
+    # oauth|api only. The override file stays in the repo for Stage C, when the
+    # engine's brain selector brings lyra-live back as a first-class mode.
+    local EDF_COMPOSE_ARGS
+    EDF_COMPOSE_ARGS="-f docker-compose.yml"
 
     # Deploy files
-    ssh "$REMOTE" "mkdir -p ~/apps/embodied-dreamfinder/src"
+    ssh "$REMOTE" "mkdir -p ~/apps/dreamfinder-avatar/src"
 
     # Copy docker compose and .env
-    rsync -avz --exclude 'secrets.yaml' "$REPO_ROOT/embodied-dreamfinder/" "$REMOTE":~/apps/embodied-dreamfinder/
+    rsync -avz --exclude 'secrets.yaml' "$REPO_ROOT/dreamfinder-avatar/" "$REMOTE":~/apps/dreamfinder-avatar/
 
     # Copy source code (Node.js project + avatar GLB)
-    rsync -avz --delete --exclude 'node_modules' --exclude '.env' --exclude '.git' "$EDF_SRC/" "$REMOTE":~/apps/embodied-dreamfinder/src/
+    rsync -avz --delete --exclude 'node_modules' --exclude '.env' --exclude '.git' "$EDF_SRC/" "$REMOTE":~/apps/dreamfinder-avatar/src/
 
     # Clean up local .env
-    rm -f "$REPO_ROOT/embodied-dreamfinder/.env"
+    rm -f "$REPO_ROOT/dreamfinder-avatar/.env"
 
     # Ensure shared network exists (allows voice brain to reach text brain)
     ssh "$REMOTE" "docker network inspect imagineering >/dev/null 2>&1 || docker network create imagineering"
 
     # Build and start (override applied only in lyra-live mode — see above)
-    ssh "$REMOTE" "cd ~/apps/embodied-dreamfinder && DOCKER_BUILDKIT=1 docker compose $EDF_COMPOSE_ARGS build --pull && docker compose $EDF_COMPOSE_ARGS up -d"
+    ssh "$REMOTE" "cd ~/apps/dreamfinder-avatar && DOCKER_BUILDKIT=1 docker compose $EDF_COMPOSE_ARGS build --pull && docker compose $EDF_COMPOSE_ARGS up -d"
 
     echo "Embodied Dreamfinder deployed!"
     echo "  URL: https://df.imagineering.cc"
-    echo "  Check logs: ssh $REMOTE 'docker logs -f embodied-dreamfinder'"
+    echo "  Check logs: ssh $REMOTE 'docker logs -f dreamfinder-avatar'"
 }
 
 deploy_livekit() {
@@ -1358,7 +1492,7 @@ case $SERVICE in
     youtube-rag|rag)
         deploy_youtube_rag
         ;;
-    embodied-dreamfinder|edf|avatar)
+    dreamfinder-avatar|edf|avatar)
         deploy_embodied_dreamfinder
         ;;
     livekit)
@@ -1370,12 +1504,15 @@ case $SERVICE in
     notify)
         deploy_notify
         ;;
+    claude-shim|shim)
+        deploy_claude_shim
+        ;;
     familiars-server|familiars)
         deploy_familiars_server
         ;;
     *)
         echo "Unknown service: $SERVICE"
-        echo "Usage: $0 <ip> [all|caddy|outline|kanbn|radicale|dreamfinder|embodied-dreamfinder|livekit|matrix|claudius|lugh|youtube-rag|imagineering-contact-us|backups|scripts|site|invite|galaxy]"
+        echo "Usage: $0 <ip> [all|caddy|outline|kanbn|radicale|dreamfinder|dreamfinder-avatar|livekit|matrix|claudius|lugh|youtube-rag|imagineering-contact-us|backups|scripts|site|invite|galaxy]"
         exit 1
         ;;
 esac
