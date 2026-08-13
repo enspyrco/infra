@@ -862,6 +862,12 @@ deploy_embodied_dreamfinder() {
         printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n'     "$(dotenv_quote "$(edf_field '.claude_code_oauth_token')")"
         printf 'VOICE_MODE=%s\n'            "$(dotenv_quote "$(edf_field '.voice_mode' 'realtime')")"
         printf 'OUTLINE_API_KEY=%s\n'       "$(dotenv_quote "$(edf_field '.outline_api_key')")"
+        # KAN_BASE_URL also has a compose default, but KAN_API_KEY/KAN_BOARD_ID
+        # do not — without these the container gets empty strings and the voice
+        # Kan-board tool (/api/kan/board-summary) fails silently.
+        printf 'KAN_BASE_URL=%s\n'          "$(dotenv_quote "$(edf_field '.kan_base_url')")"
+        printf 'KAN_API_KEY=%s\n'           "$(dotenv_quote "$(edf_field '.kan_api_key')")"
+        printf 'KAN_BOARD_ID=%s\n'          "$(dotenv_quote "$(edf_field '.kan_board_id')")"
         printf 'RADICALE_CALENDAR_URL=%s\n' "$(dotenv_quote "$(edf_field '.radicale_calendar_url')")"
         printf 'RADICALE_USERNAME=%s\n'     "$(dotenv_quote "$(edf_field '.radicale_username')")"
         printf 'RADICALE_PASSWORD=%s\n'     "$(dotenv_quote "$(edf_field '.radicale_password')")"
