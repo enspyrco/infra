@@ -1,0 +1,5 @@
+Host github-backups
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/xdeca-backups-deploy
+    IdentitiesOnly yes

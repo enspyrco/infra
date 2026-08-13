@@ -126,11 +126,19 @@ deploy_scripts() {
 
     # Set up health check cron. Tokens are NOT inlined here any more — the
     # script reads /etc/imagineering-secrets/telegram.env via lib/telegram.sh.
+    #
+    # MAILTO must be QUOTED. On Ubuntu 24.04 (cron 3.0pl1-184ubuntu2) a bare
+    # `MAILTO=` makes cron reject the whole file with "Error: bad username"
+    # whenever the hour and day-of-month fields are both `*` — which is exactly
+    # the hourly entry below. Cron logs that once, at the scan after the file is
+    # written, and never again, because it only re-parses a cron.d file when the
+    # mtime changes. The result is a health check that installs cleanly, looks
+    # correct in `cat`, runs fine by hand, and never executes.
     echo "Installing /etc/cron.d/health-check..."
     ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
         'SHELL=/bin/bash' \
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        'MAILTO=' \
+        'MAILTO=\"\"' \
         '0 * * * * nick /opt/scripts/health-check.sh >> /home/nick/logs/health-check.log 2>&1' \
         | sudo tee /etc/cron.d/health-check > /dev/null && \
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
@@ -579,11 +587,46 @@ SSHEOF'
         echo "  Add matrix_admin_token + backup_age_recipient to matrix/secrets.yaml to enable"
     fi
 
+    # Install the GitHub release token (root:nick 0640). Deploy keys cannot
+    # create releases — they authenticate git-over-SSH only — so the
+    # object-store tier needs an API token the tree-committed path doesn't.
+    # Same build-locally / scp / install-with-perms shape as the matrix block
+    # above, for the same reason: never put the token on a remote command line.
+    local RELEASE_SECRETS="$REPO_ROOT/backups/secrets.yaml"
+    if [ -f "$RELEASE_SECRETS" ] && sops -d "$RELEASE_SECRETS" | yq -e '.github_release_token' > /dev/null 2>&1; then
+        echo "Installing /etc/imagineering-secrets/github-release.env..."
+        local RELEASE_TOKEN RELEASE_TMP RELEASE_PREV_TRAP
+        RELEASE_TOKEN=$(sops -d "$RELEASE_SECRETS" | yq -r '.github_release_token')
+        RELEASE_TMP=$(mktemp)
+        RELEASE_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand RELEASE_TMP now, intentional
+        trap "rm -f '$RELEASE_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/github-release.env' 2>/dev/null || true" EXIT
+        shell_env_line GH_TOKEN "$RELEASE_TOKEN" > "$RELEASE_TMP"
+        chmod 0600 "$RELEASE_TMP"
+        scp -q "$RELEASE_TMP" "$REMOTE":/tmp/github-release.env
+        ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
+            sudo install -m 0640 -o root -g nick /tmp/github-release.env /etc/imagineering-secrets/github-release.env && \
+            rm -f /tmp/github-release.env"
+        rm -f "$RELEASE_TMP"
+        eval "${RELEASE_PREV_TRAP:-trap - EXIT}"
+        echo "  GitHub release envfile installed (mode 0640 root:nick)"
+    else
+        echo "NOTE: No github_release_token in backups/secrets.yaml — object-store backups will FAIL loudly"
+        echo "  This is deliberate: a missing credential must not look like a successful smaller run"
+    fi
+
+    # `gh` drives the release-asset tier. backup_objects_to_releases fails
+    # loudly without it rather than skipping, so install it here rather than
+    # discovering the gap at 04:00.
+    echo "Ensuring gh (GitHub CLI) is installed on $REMOTE..."
+    ssh "$REMOTE" "command -v gh >/dev/null 2>&1 || (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh)"
+
     echo "Backup configuration complete!"
     echo "  - GitHub backup: imagineering-cc/imagineering-backups (private repo)"
     echo "  - Deploy key: ~/.ssh/imagineering-backups-deploy"
     echo "  - Scripts: /opt/scripts/backup.sh, /opt/scripts/restore.sh"
     echo "  - Matrix secrets: /etc/imagineering-secrets/matrix.env"
+    echo "  - Release token: /etc/imagineering-secrets/github-release.env"
     echo "  - Cron: Daily at 4 AM"
     echo ""
     echo "Test with: ssh $REMOTE '/opt/scripts/backup.sh all'"
