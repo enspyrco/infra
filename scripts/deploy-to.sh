@@ -126,11 +126,19 @@ deploy_scripts() {
 
     # Set up health check cron. Tokens are NOT inlined here any more — the
     # script reads /etc/imagineering-secrets/telegram.env via lib/telegram.sh.
+    #
+    # MAILTO must be QUOTED. On Ubuntu 24.04 (cron 3.0pl1-184ubuntu2) a bare
+    # `MAILTO=` makes cron reject the whole file with "Error: bad username"
+    # whenever the hour and day-of-month fields are both `*` — which is exactly
+    # the hourly entry below. Cron logs that once, at the scan after the file is
+    # written, and never again, because it only re-parses a cron.d file when the
+    # mtime changes. The result is a health check that installs cleanly, looks
+    # correct in `cat`, runs fine by hand, and never executes.
     echo "Installing /etc/cron.d/health-check..."
     ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
         'SHELL=/bin/bash' \
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        'MAILTO=' \
+        'MAILTO=\"\"' \
         '0 * * * * nick /opt/scripts/health-check.sh >> /home/nick/logs/health-check.log 2>&1' \
         | sudo tee /etc/cron.d/health-check > /dev/null && \
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
