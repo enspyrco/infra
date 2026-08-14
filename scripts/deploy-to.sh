@@ -143,6 +143,17 @@ deploy_scripts() {
         # shell-significant bytes.
         local NOTIFY_TMP
         NOTIFY_TMP=$(mktemp)
+        # Clean up the 0600 plaintext temp file on ANY exit (incl. set -e
+        # aborts mid-scp/ssh) — locally and best-effort on the remote /tmp —
+        # mirroring the telegram.env block above. Without this trap a failed
+        # scp/ssh leaves the plaintext NOTIFY_API_KEY on both disks. Save any
+        # pre-existing EXIT trap and restore it on success rather than clearing
+        # unconditionally. ConnectTimeout bounds the remote scavenger so the
+        # trap can't hang ~120s on an unreachable host.
+        local NOTIFY_PREV_TRAP
+        NOTIFY_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand NOTIFY_TMP now, intentional
+        trap "rm -f '$NOTIFY_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/notify.env' 2>/dev/null || true" EXIT
         printf 'NOTIFY_API_KEY=%q\n' "$NOTIFY_KEY" > "$NOTIFY_TMP"
         chmod 0600 "$NOTIFY_TMP"
         scp -q "$NOTIFY_TMP" "$REMOTE":/tmp/notify.env
@@ -150,6 +161,8 @@ deploy_scripts() {
             sudo install -m 0640 -o root -g nick /tmp/notify.env /etc/imagineering-secrets/notify.env && \
             rm -f /tmp/notify.env"
         rm -f "$NOTIFY_TMP"
+        # Restore the prior EXIT trap (empty string clears, if none existed).
+        eval "${NOTIFY_PREV_TRAP:-trap - EXIT}"
         echo "  Notify envfile installed (mode 0640 root:nick)"
     else
         echo "NOTE: No notify_api_key in notify/secrets.yaml — cron alerts disabled"
