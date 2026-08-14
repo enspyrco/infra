@@ -1,6 +1,8 @@
-# Imagineering Infrastructure
+# enspyrco/infra
 
-Monorepo for Imagineering infrastructure and self-hosted services.
+Monorepo for self-hosted infrastructure — imagineering.cc services, co-located xdeca, and enspyr.
+(Formerly `imagineering-cc/imagineering-infra`; renamed 2026-07-28. The `imagineering.cc` domain
+and its live services are unchanged — only the GitHub repo moved.)
 
 ## IMPORTANT: Production Server Safety
 
@@ -56,7 +58,7 @@ Sydney (149.118.69.221) hosts both **imagineering** services (img-* containers, 
 | matrix-continuwuity | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork) |
 | (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot + relay-bot-hf |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
-| embodied-dreamfinder | 3015 | df.imagineering.cc | 3D avatar voice frontend |
+| dreamfinder-avatar | 3015 | df.imagineering.cc | 3D avatar voice frontend |
 | symposium | 3016 | symposium.imagineering.cc | Discussion/event space |
 | livekit | - | livekit.imagineering.cc | WebRTC SFU (TURN/TLS at :5349 currently disabled — see memory) |
 | youtube-rag | 3010/8010 | rag.imagineering.cc, rag-api.imagineering.cc | YouTube transcript RAG (frontend + backend + chroma) |
@@ -209,7 +211,7 @@ Everything runs on Oracle Cloud's Always Free tier — no billing, no trial expi
 
 | Shape | OCPUs | RAM | Instances | Notes |
 |-------|-------|-----|-----------|-------|
-| VM.Standard.A1.Flex (Arm) | 4 total | 24 GB total | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently |
+| VM.Standard.A1.Flex (Arm) | 4 total¹ | 24 GB total¹ | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently. ¹Grandfathered accounts (our Sydney tenancy) get 4/24; **newer tenancies are now capped at 2 OCPU / 12 GB** (Oracle shrank the A1 grant). `scripts/oci-retry-provision.sh` auto-detects the real per-tenancy limit and adapts. |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 each (burstable) | 1 GB each | Up to 2 | **Separate CPU budget** — does not eat into A1 allocation. Can burst above baseline |
 
 Total baseline: **4.25 OCPUs + 26 GB RAM** across up to 6 instances.
@@ -267,6 +269,27 @@ Boot volume can be resized online — grow partition with `growpart` + `resize2f
 
 - Instance: `ocid1.instance.oc1.ap-sydney-1.anzxsljr5jyppsicpdt4ecunqcvoxmvhauzsq5co53joaumapptj3ktxoqhq`
 - Boot volume: `ocid1.bootvolume.oc1.ap-sydney-1.abzxsljrvp4mpltca5qqqt3qldbs252qlqp35hr6ydsdvew2ch444zmcqakq`
+
+## DNS
+
+**Cloudflare is the source of truth for `imagineering.cc` DNS.** The domain's
+nameservers are `hattie`/`karl.ns.cloudflare.com`, so all live records are
+served from the Cloudflare zone:
+
+- Zone ID: `1444f67680d10386df2a55e5f016e2b2`
+- Account ID: `fc0bb404a04968a041ca7d8475e2ffad`
+
+**Namecheap is the registrar only** (renewals + NS delegation) — it does **not**
+serve DNS. The old `dns/` Terraform (Namecheap provider, `mode = "OVERWRITE"`)
+was non-authoritative dead config and was **removed** (see git history before
+this commit / the "retire dead dns/" PR). It defined: bare `@` A → server IP,
+wildcard `*` A → server IP, SPF (`v=spf1 include:sendinblue.com ~all`, for Brevo
+email), and DMARC (`v=DMARC1; p=none;`). Those equivalents live in Cloudflare
+now — if you ever need to recreate DNS-as-code, use the Cloudflare provider and
+import the live zone, don't resurrect the Namecheap config.
+
+> Edit DNS via the Cloudflare dashboard or API (zone above). The Namecheap API
+> creds that `dns/secrets.yaml` held are unused after this removal.
 
 ## Secrets Management
 

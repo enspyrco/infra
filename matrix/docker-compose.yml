@@ -20,6 +20,10 @@ services:
       CONTINUWUITY_ALLOW_FEDERATION: "true"
       CONTINUWUITY_MAX_REQUEST_SIZE: "20971520"
       CONTINUWUITY_NEW_USER_DISPLAYNAME_SUFFIX: ""
+      # Media is treated as disposable cache (NOT backed up — it's re-fetchable
+      # federated/bridged content). Prune dangling media refs on startup so a
+      # media-less DB restore boots clean instead of crashing the integrity check.
+      CONTINUWUITY_PRUNE_MISSING_MEDIA: "true"
       CONTINUWUITY_LOG: "info"
     volumes:
       - continuwuity_data:/var/lib/continuwuity
@@ -100,18 +104,18 @@ services:
       - continuwuity
 
   # --- aiko-bridge: Matrix <-> aiko_chat (Aiko Services / MQTT) -------------
-  # Source is the matrix/aiko-bridge submodule (github.com/nickmeinhold/aiko-bridge).
+  # Source is the matrix/aiko-chat-bridge submodule (github.com/nickmeinhold/aiko-chat-bridge).
   # Config + registration + db live server-side in ./aiko-bridge-data (gitignored),
   # generated/registered once per the bridge README (like the other mautrix bridges).
   aiko-mosquitto:
     image: eclipse-mosquitto:2
     restart: always
     volumes:
-      - ./aiko-bridge/deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./aiko-chat-bridge/deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - aiko_mosquitto_data:/mosquitto/data
 
   aiko-registrar:
-    build: ./aiko-bridge
+    build: ./aiko-chat-bridge
     image: aiko-bridge:latest
     restart: always
     environment:

@@ -10,6 +10,10 @@ kan.imagineering.cc {
     reverse_proxy localhost:3013
 }
 
+chat.imagineering.cc {
+    reverse_proxy localhost:8095
+}
+
 dav.imagineering.cc {
     reverse_proxy localhost:5232
 }
@@ -80,6 +84,12 @@ dreamfinder.imagineering.cc {
 # --- Embodied Dreamfinder (voice avatar) ---
 
 df.imagineering.cc {
+    reverse_proxy localhost:3015
+}
+
+# Lyra's live Q&A — same dreamfinder-avatar app; the app detects the "lyra."
+# host and serves her persona, voice, and own face (no ?lyra param needed).
+lyra.imagineering.cc {
     reverse_proxy localhost:3015
 }
 
@@ -163,7 +173,7 @@ api.downstream-storage.cc {
 # --- Tech World (Flutter web + avatar via DF) ---
 
 world.imagineering.cc {
-    # Avatar renderer and its assets — proxy to embodied-dreamfinder (port 3015).
+    # Avatar renderer and its assets — proxy to dreamfinder-avatar (port 3015).
     # These paths match RENDERER_PATHS and RENDERER_PREFIXES in server.js.
     @df_renderer {
         path /avatar /avatar-renderer.js /sparks.js /avatars/* /headaudio/*
@@ -176,20 +186,23 @@ world.imagineering.cc {
         reverse_proxy localhost:3015
     }
 
-    # --- Cache-busting layer 2 (per tech_world PR #476) ---
-    # The Flutter bundle (`main.dart.js`) is wrapped by `flutter_bootstrap.js`,
-    # which we stamp with a per-build `?v=<sha>` query string at deploy time.
-    # The query string forces browsers to re-fetch on every redeploy IF they
-    # actually request the new HTML. These headers ensure they do:
-    #   - `/` and `/index.html`: always revalidate, never serve a cached HTML
-    #     that points at a stale bootstrap.
-    #   - `/flutter_bootstrap.js`: never cached so the latest `?v=<sha>` query
-    #     in the HTML always lands on a fresh fetch.
-    # Hashed/static assets (`main.dart.js`, fonts, images) keep Caddy's
-    # default ETag-based behavior — they're large and rarely change between
-    # deploys for the same SHA.
+    # --- Cache-busting (per tech_world PR #476, extended in #15) ---
+    # pwa-strategy=none → NO service worker, so HTTP caching is the only layer.
+    # Flutter's entrypoint artifacts (main.dart.js/.mjs/.wasm, flutter.js) and
+    # the asset manifests have STABLE filenames whose CONTENT changes every
+    # deploy — they are NOT content-hashed. So they must always revalidate
+    # (ETag → 304 when unchanged → cached bytes reused; 200 only on real change).
+    #   - #476 originally no-cached only `/`, `/index.html`, `/flutter_bootstrap.js`
+    #     and wrongly assumed `main.dart.js` was "hashed/static". This is a --wasm
+    #     build: the actual app code is `main.dart.wasm`, which fell through to
+    #     heuristic caching → a Refresh re-fetched fresh HTML+bootstrap but a STALE
+    #     wasm, so "Refresh does nothing". #15 adds the entrypoints + manifests.
+    # NOTE: `no-cache` ≠ `no-store` — the 5.5MB wasm stays cached; only a cheap
+    # conditional revalidation is added. Genuinely versioned/immutable assets
+    # (/canvaskit/*, fonts, images) intentionally keep default caching below.
+    # When adding a new stable-named per-build artifact, add it here too.
     @html_or_loader {
-        path / /index.html /flutter_bootstrap.js
+        path / /index.html /flutter_bootstrap.js /flutter.js /main.dart.js /main.dart.mjs /main.dart.wasm /assets/AssetManifest.bin /assets/AssetManifest.bin.json /assets/FontManifest.json /version.json
     }
     header @html_or_loader Cache-Control "no-cache, must-revalidate"
 
@@ -199,4 +212,13 @@ world.imagineering.cc {
         file_server
         try_files {path} /index.html
     }
+}
+
+# --- live-game (quiz buzzer) ---
+# Phones are buzzers, the big screen is the board, Claude is the Game Master.
+# Server runs on the box as a systemd/long-running process bound to localhost:7373.
+# Previously this route lived only in Caddy's running config (added via the admin
+# API), so a container restart dropped it — now it's durable in the Caddyfile.
+quiz-game.imagineering.cc {
+    reverse_proxy localhost:7373
 }

@@ -71,7 +71,8 @@ scripts/watchers/
 │   └── watcher-base.sh    # shared helpers + state machine (sourced by all watchers)
 ├── template.sh            # skeleton for new watchers
 ├── README.md              # this file
-├── disk-usage-watch.sh    # built example
+├── disk-usage-watch.sh    # built example (recurring threshold-alert)
+├── email-health-watch.sh  # built example (recurring; Brevo sender-auth + volume + errors)
 └── …                       # other watchers
 ```
 
@@ -251,6 +252,170 @@ listed here so the template has demand-side context):
 Each of these has the right shape (external state, transitions, want-to-be-notified,
 genuinely-stops-mattering-after-resolution). Each is also <50 lines of
 phase logic on top of the template. If you build one, link it back here.
+
+## Built: email-health-watch
+
+`email-health-watch.sh` catches the class of silent transactional-email
+failure that hit imagineering.cc on 2026-06-20: the Brevo sending domain was
+unauthenticated, so Brevo accepted every send (250 OK at SMTP) then dropped it
+at processing — every app thought email worked, no alert fired, password
+resets / magic links / contact-form leads silently vanished for days.
+
+It is a **recurring threshold-alert** (modelled on `disk-usage-watch.sh`,
+*not* the self-disabling two-phase template): `phase_a_check` runs three checks
+every cycle and always returns 1, so the state machine never advances and the
+watcher never removes its own cron entry. Each check debounces to **at most one
+alert per UTC day** via a per-check sentinel under `~/.config/imagineering/`,
+and clears that sentinel on recovery.
+
+Three checks against the Brevo REST API (`https://api.brevo.com/v3`):
+
+1. **Domain auth** — `GET /senders/domains`: each required domain
+   (`imagineering.cc`, `xdeca.com`) must be present with `authenticated:true`
+   **and** `verified:true`. This is the check that would have caught the
+   incident. Tunable: `REQUIRED_DOMAINS`.
+2. **Daily volume** — `GET /smtp/statistics/aggregatedReport?days=1` `.requests`
+   vs the shared free-plan cap. Alerts at `>= WARN_PCT%` of `CAP` (default 70%
+   of 300 = 210) — early warning before a flood exhausts the cap and starves
+   auth email. Tunable: `CAP`, `WARN_PCT`.
+3. **Error spike** — same report `.error` field. Alerts when `> ERROR_THRESHOLD`
+   (default 25/day). Tunable: `ERROR_THRESHOLD`.
+
+JSON is parsed with `python3` (robust against missing keys) rather than
+grep/jq chains. If `BREVO_API_KEY` is absent or the API is unreachable, the
+watcher logs and skips that cycle — it never crashes cron.
+
+### Install on Sydney
+
+This watcher depends ONLY on `watcher-base.sh` (it inlines its one needed
+helper, `html_escape`, rather than sourcing `lib/diagnose.sh`), so the install
+footprint is just the lib + the script.
+
+```bash
+# 1. Lib + script (lib likely already present from other watchers).
+scp scripts/watchers/lib/watcher-base.sh 149.118.69.221:/tmp/   # if not already there
+ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/watcher-base.sh /home/ubuntu/lib/'
+scp scripts/watchers/email-health-watch.sh 149.118.69.221:/tmp/
+ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/email-health-watch.sh /home/ubuntu/'
+
+# 2. Install the Brevo credential file (mode 0600, mirrors notify-credentials).
+#    The key lives in notify/secrets.yaml under brevo_api_key. Build the
+#    envfile locally and scp it — do NOT echo the key over an interactive ssh
+#    (it lands in shell history / logs). Abort if the key is empty/null so we
+#    never install a credential file that silently makes the watcher skip.
+export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt
+umask 077
+BREVO_KEY=$(sops -d notify/secrets.yaml | yq -r '.brevo_api_key')
+[ -n "$BREVO_KEY" ] && [ "$BREVO_KEY" != "null" ] || { echo "ERROR: brevo_api_key empty/null — aborting"; exit 1; }
+printf 'BREVO_API_KEY=%s\n' "$BREVO_KEY" > /tmp/brevo-credentials
+scp /tmp/brevo-credentials 149.118.69.221:/tmp/
+# mkdir the config dir first — watcher-base.sh creates it at runtime, but the
+# credfile is installed BEFORE the first run, so it must exist now.
+ssh 149.118.69.221 'mkdir -p ~/.config/imagineering && install -m 0600 /tmp/brevo-credentials ~/.config/imagineering/brevo-credentials && rm -f /tmp/brevo-credentials'
+rm -f /tmp/brevo-credentials; unset BREVO_KEY
+
+# 3. Install the cron entry (every 4 hours, off the hour). Tag MUST match
+#    CRON_TAG. Idempotent: strips any existing email-health-watch line first so
+#    re-running this step never creates duplicate entries / duplicate alerts.
+ssh 149.118.69.221 'crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /home/ubuntu/email-health-watch.sh  # email-health-watch"; } | crontab -'
+
+# 4. Confirm first cycle (force a run, watch the log).
+ssh 149.118.69.221 '/home/ubuntu/email-health-watch.sh; tail ~/email-health-watch.log'
+```
+
+## Built: notify-canary-melbourne
+
+`notify-canary-melbourne.sh` is the **external witness for the alerting path
+itself**. Every cron + watcher on Sydney funnels alerts through ONE chain:
+notify container (127.0.0.1:8090) → Telegram → Nick. That chain cannot announce
+its own death — if Docker, the notify container, or Sydney's egress to
+api.telegram.org is down, the alert is POSTed to the corpse and lost silently.
+This canary runs on **Melbourne** (nick-mel) — a sibling of
+`oci-instance-watch-melbourne.sh` — and watches Sydney's notify chain from
+outside.
+
+**The independence rule (the whole point):** the canary must NOT route its own
+alert through the Sydney notify service it is checking. So, unlike every other
+watcher, it does **not** use the lib's `tg()` helper (which POSTs to
+notify.imagineering.cc). It sources `scripts/lib/telegram.sh` and calls
+`send_telegram_alert()`, which hits `api.telegram.org` **directly** with a bot
+token held on Melbourne. Spreading the bot token is normally an anti-pattern
+(that's why notify exists) — but the one client that may not depend on notify
+is the client that watches notify. Documented exception.
+
+**Three-layer probe over one SSH hop** (Mel→Syd), because a bare TCP/`/health`
+check is a false positive — `/health` returns static `{"ok":true}` without ever
+touching Telegram, so a revoked token or blocked egress passes it:
+
+1. **L1** — `docker inspect` notify: container `running` AND Docker-health
+   `healthy` (tolerates `none` if no healthcheck defined).
+2. **L2** — `GET http://127.0.0.1:8090/health` returns `200`.
+3. **L3** — Telegram `getMe` succeeds **from Sydney's network**, using the
+   container's own bot token (read from its env, never shipped over the wire).
+   This is the layer that makes it a *delivery* check, not a liveness check —
+   it proves egress + token validity WITHOUT sending Nick a message (a test
+   `/send` would spam Telegram every cycle).
+
+**Shape:** recurring threshold-alert (like `email-health-watch.sh`, *not* the
+self-disabling template) — a canary that disabled itself after one recovery
+would stop guarding. `phase_a_check` always returns 1; the state machine never
+advances to DONE. Alerts debounce to **one 🚨 per failure-episode** via a
+sentinel file, fire a single ✅ on recovery, then re-arm. A single transient
+`UNKNOWN` (SSH blip, no token in container env) does **not** fire — only a
+second consecutive `UNKNOWN` escalates (a `FAIL` fires immediately). `DRY_RUN=1`
+logs the alert instead of sending.
+
+**Residual gap (known tradeoff):** if Melbourne AND Sydney die simultaneously,
+no alert fires — but that's covered by the existing mutual peer monitoring
+(Sydney's `oci-instance-watch.sh` watches Melbourne; Melbourne's
+`oci-instance-watch-melbourne.sh` watches Sydney), so a dead Melbourne is
+itself alarmed from Sydney. The canary also can't distinguish "notify token
+revoked" from "Telegram API outage" — both surface as `FAIL:telegram-*`; that's
+acceptable since both mean Sydney can't deliver.
+
+### Install on Melbourne (nick-mel, 130.162.192.233)
+
+```bash
+# 1. Lib + the direct-Telegram helper + the canary. Melbourne already runs
+#    oci-instance-watch-melbourne.sh, so lib/watcher-base.sh + ~/bin tooling
+#    are present; the canary additionally needs lib/telegram.sh.
+scp scripts/watchers/lib/watcher-base.sh nick-mel:/tmp/   # if not already there
+scp scripts/lib/telegram.sh              nick-mel:/tmp/
+scp scripts/watchers/notify-canary-melbourne.sh nick-mel:/tmp/
+ssh nick-mel 'mkdir -p ~/lib \
+  && install -m 0755 /tmp/watcher-base.sh ~/lib/ \
+  && install -m 0755 /tmp/telegram.sh     ~/lib/ \
+  && install -m 0755 /tmp/notify-canary-melbourne.sh ~/ \
+  && rm -f /tmp/watcher-base.sh /tmp/telegram.sh /tmp/notify-canary-melbourne.sh'
+
+# 2. The INDEPENDENT alert path needs a Telegram bot token on Melbourne, at
+#    /etc/imagineering-secrets/telegram.env (root:ubuntu 0640 — ubuntu is the
+#    cron user that sources it) — the same file scripts/lib/telegram.sh
+#    auto-sources. Build it from notify's secrets and STREAM it over ssh stdin
+#    under umask 077: scp would land the token world-readable (0644) in the
+#    remote /tmp; piping under umask 077 keeps the temp file 0600, and the
+#    remote `trap ... EXIT` removes it even if a later step fails.
+export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt
+umask 077
+BOT=$(sops -d notify/secrets.yaml | yq -r '.telegram_bot_token')
+CHAT=$(sops -d notify/secrets.yaml | yq -r '.telegram_chat_id')
+[ -n "$BOT" ]  && [ "$BOT" != "null" ]  || { echo "ERROR: telegram_bot_token empty/null — aborting"; exit 1; }
+[ -n "$CHAT" ] && [ "$CHAT" != "null" ] || { echo "ERROR: telegram_chat_id empty/null — aborting"; exit 1; }
+printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\n' "$BOT" "$CHAT" \
+  | ssh nick-mel 'umask 077; trap "rm -f /tmp/telegram.env" EXIT; cat > /tmp/telegram.env \
+      && sudo install -d -m 0755 /etc/imagineering-secrets \
+      && sudo install -m 0640 -o root -g ubuntu /tmp/telegram.env /etc/imagineering-secrets/telegram.env'
+unset BOT CHAT
+
+# 3. Confirm Melbourne can SSH to Sydney as ubuntu (BatchMode, key-based):
+ssh nick-mel 'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@149.118.69.221 "echo reachable"'
+
+# 4. DRY_RUN smoke on the box, then install the cron entry (Melbourne crontab,
+#    user ubuntu — offset to :47, clear of the oci-watcher's :17). Tag MUST
+#    match CRON_TAG. Idempotent: strips any existing line first.
+ssh nick-mel 'DRY_RUN=1 ~/notify-canary-melbourne.sh; tail ~/notify-canary-melbourne.log'
+ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * /home/ubuntu/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
+```
 
 ## See also
 

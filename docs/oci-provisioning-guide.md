@@ -1,8 +1,19 @@
 # Free Cloud Servers with OCI Always Free Tier
 
-This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately powerful machines (4 CPU cores, 24GB RAM) and they're **free forever** on Oracle's Always Free tier.
+This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately powerful machines (up to 4 CPU cores, 24GB RAM) and they're **free forever** on Oracle's Always Free tier.
 
 The catch? Everyone wants one, so they're almost always "out of capacity." Hence the retry script — it tries every 5 minutes until one slips through.
+
+> **⚠️ Heads up — Oracle has been shrinking the free A1 grant.** Older tenancies
+> (e.g. our Sydney box) got the full **4 OCPU / 24 GB**. Some **newer** tenancies
+> are now capped at **2 OCPU / 12 GB**. You can't tell from the marketing page —
+> you have to ask the API. The retry script now **auto-detects the tenancy's real
+> A1 allotment** (`limits resource-availability get` on `standard-a1-core-count`)
+> and caps its resize target to whatever the account actually allows, logging a
+> warning when it's below 4. So you always get the biggest box the tenancy permits,
+> and the loop still self-completes instead of grinding forever trying to reach a 4
+> it can't have. Once at target it resizes online — so if Oracle later raises your
+> limit, bump `full_ocpus` and it grows with no rebuild.
 
 ## What You're Getting
 
@@ -10,7 +21,8 @@ The catch? Everyone wants one, so they're almost always "out of capacity." Hence
 ┌─────────────────────────────────────────┐
 │  Oracle Cloud Always Free ARM Instance  │
 │                                         │
-│  • 4 OCPU (ARM cores) / 24GB RAM       │
+│  • Up to 4 OCPU / 24GB RAM (2/12 on    │
+│    some newer tenancies — auto-detected)│
 │  • Up to 200GB disk                     │
 │  • Ubuntu 24.04                         │
 │  • Public IP address                    │
@@ -26,7 +38,7 @@ But the ARM instance is just the headliner. The Always Free tier comes with a lo
 
 | Shape | CPUs | RAM | Max Instances | Notes |
 |-------|------|-----|---------------|-------|
-| VM.Standard.A1.Flex (Arm) | 4 OCPUs | 24 GB | 4 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances |
+| VM.Standard.A1.Flex (Arm) | 4 OCPUs* | 24 GB* | 4 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances. *Newer tenancies may be capped at 2 OCPU / 12 GB — the retry script auto-detects and adapts |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 OCPU each | 1 GB each | 2 | **Independent CPU budget** — doesn't touch the Arm allocation. Burstable above baseline |
 
 The Micro instances are the sleeper pick. They run on completely different x86 hardware, so you're getting extra compute on top of the 4 Arm cores. Each gets its own public IP and 50 Mbps internet bandwidth. Good for monitoring, cron runners, small proxies, or a Tailscale exit node.
@@ -129,6 +141,8 @@ Then verify it works:
 oci --version
 ```
 
+> **Official install docs:** [Installing the CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm) — covers the quickstart installer above plus alternatives (MacOS Homebrew: `brew install oci-cli`, Windows) and prerequisites.
+
 ---
 
 ## Step 3: Set Up OCI Authentication
@@ -225,7 +239,7 @@ This creates a key pair. The script will pass the public key to Oracle when crea
 
 ## Step 6: Install Dependencies
 
-On your always-on machine:
+On your local machine:
 
 ```bash
 # jq for parsing JSON responses from OCI

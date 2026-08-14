@@ -30,7 +30,7 @@
 #
 # Configuration: NOTIFY_API_KEY (required), NOTIFY_URL (optional, defaults
 # to the local listener). If not already in the environment, this lib tries
-# to source /etc/downstream-secrets/notify.env (root:nick 0640) so the key
+# to source /etc/imagineering-secrets/notify.env (root:nick 0640) so the key
 # never has to be inlined into world-readable cron entries.
 #
 # Silent no-op if creds are missing — a missing-secret deploy shouldn't turn
@@ -45,9 +45,9 @@
 # Source the secrets file if present and the key isn't already set.
 # Done at source-time, not at function-call-time, so each script only pays
 # the cost once (and behavior is predictable in `set -u` consumers).
-if [ -z "${NOTIFY_API_KEY:-}" ] && [ -r /etc/downstream-secrets/notify.env ]; then
+if [ -z "${NOTIFY_API_KEY:-}" ] && [ -r /etc/imagineering-secrets/notify.env ]; then
   # shellcheck disable=SC1091
-  . /etc/downstream-secrets/notify.env
+  . /etc/imagineering-secrets/notify.env
 fi
 
 # Default exports so consumers can use `${VAR:-}` or `set -u` safely.

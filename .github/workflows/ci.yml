@@ -14,10 +14,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
         with:
           scandir: './scripts'
           additional_files: '.githooks/pre-commit'
+          severity: warning
+
+      # The deploy-bus fleet template (cd-bus/fleet/) ships its own shell
+      # scripts; scandir above only covers ./scripts, so lint cd-bus/ too —
+      # otherwise "Shell Linting" would be green while not covering them.
+      - name: Run ShellCheck (cd-bus)
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
+        with:
+          scandir: './cd-bus'
+          severity: warning
+
+      # The avatar deploy/rollback substrate (avatar-deploy/bin/) lived only in
+      # ~/bin on the production box until 2026-08-10 and was never linted. The
+      # very first shellcheck run on it flagged SC2034 "IMG appears unused" —
+      # which was a real, live defect: a trailing comment had swallowed
+      # `echo "image=$IMG"`, silently dropping the image identity from every
+      # lyra release record. scandir above covers neither ./cd-bus nor this, so
+      # without its own step "Shell Linting" would be green while blind to the
+      # scripts that can roll production back onto a vulnerable image.
+      - name: Run ShellCheck (avatar-deploy)
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
+        with:
+          scandir: './avatar-deploy'
           severity: warning
 
   yaml-lint:
@@ -34,3 +57,81 @@ jobs:
           yamllint -d "{extends: relaxed, rules: {line-length: {max: 150}}}" \
             .github/workflows/*.yml \
             */docker-compose.yml
+
+  secret-quoting:
+    name: Secret Quoting Round-trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install mikefarah yq explicitly rather than relying on it being
+      # preinstalled on the runner. REQUIRE_ALL=1 (below) already makes a
+      # missing yq a HARD failure, so this prevents *spurious* CI failures if a
+      # future ubuntu-latest image drops yq — it does not affect what the test
+      # asserts (a missing yq could never pass silently). Pinned to a release
+      # so the binary is deterministic. docker is still taken from the runner;
+      # ubuntu-latest ships it, and REQUIRE_ALL=1 fails loudly if it ever stops.
+      - name: Install yq (mikefarah)
+        run: |
+          YQ_VERSION=v4.44.3
+          sudo curl -fsSL \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      # REQUIRE_ALL=1 turns a missing tool into a hard failure rather than a
+      # vacuous skip, so a future runner-image change that drops yq/docker
+      # fails loudly instead of passing green with the checks silently skipped.
+      - name: Run secret-quoting round-trip tests
+        env:
+          REQUIRE_ALL: "1"
+        run: ./scripts/test-secret-quoting.sh
+
+  restore-aiko-island:
+    name: Aiko Island Restore Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Real restore test: drives restore.sh's _restore_island_core + the
+      # aiko_island_* discovery lib against throwaway docker volumes, asserting
+      # the restored passkey rows land in the LIVE volume (content, not
+      # presence) and that discovery never picks the orphaned ghost volume
+      # (#1759). ubuntu-latest ships docker; REQUIRE_ALL=1 makes a missing
+      # docker a HARD failure so this can't silently skip and go green.
+      - name: Run aiko-island restore test
+        env:
+          REQUIRE_ALL: "1"
+        run: ./scripts/test-restore-aiko-island.sh
+
+  backup-libs:
+    name: Backup Library Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hermetic unit tests for the backup helper libs — `docker` and `gh` are
+      # stubbed, so no daemon, no token, no network, and nothing real is
+      # mutated. These cover the fail-closed guards on container resolution,
+      # where a wrong answer silently backs up the WRONG tenant's data (see
+      # lib/resolve-container.sh) rather than failing visibly.
+      - name: Run resolve-container tests
+        run: ./scripts/test-resolve-container.sh
+
+  caddy-validate:
+    name: Caddyfile Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Validate caddy/Caddyfile with the SAME image the box runs (caddy:2-alpine),
+      # so a syntax error or bad directive is caught HERE — before a deploy reloads
+      # it into the live proxy and takes every domain (*.imagineering.cc, xdeca.com,
+      # callonclare.com.au) down. `caddy validate` only parses + adapts the config;
+      # it does NOT dial upstreams, so the localhost:PORT backends that don't exist
+      # in CI are fine. Fails the build (non-zero) on an invalid Caddyfile.
+      - name: Validate caddy/Caddyfile
+        run: |
+          docker run --rm -v "$PWD/caddy:/etc/caddy:ro" caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
