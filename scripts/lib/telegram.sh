@@ -94,8 +94,11 @@ send_telegram_alert() {
     echo "Telegram alert skipped (NOTIFY_API_KEY not set)"
     return 0
   fi
+  # bot=infra so alerts arrive as the Enspyr Infra identity, not the dreams
+  # bot notify defaults to. notify falls back to dreams if infra creds aren't
+  # deployed, so this is safe even before the infra bot is wired everywhere.
   local payload
-  payload=$(printf '{"message": "%s", "parse_mode": "HTML"}' \
+  payload=$(printf '{"message": "%s", "parse_mode": "HTML", "bot": "infra"}' \
     "$(notify_json_escape "$message")")
   # Capture curl output. On non-zero exit, emit a one-line stderr message
   # so the cron job's log carries a breadcrumb for the post-mortem.
