@@ -6,6 +6,8 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - INFRA_BOT_TOKEN=${INFRA_BOT_TOKEN:-}
+      - INFRA_CHAT_ID=${INFRA_CHAT_ID:-}
       - NOTIFY_API_KEY=${NOTIFY_API_KEY}
       - PORT=8090
     ports:

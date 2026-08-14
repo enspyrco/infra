@@ -361,6 +361,8 @@ deploy_notify() {
     {
         printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(dotenv_quote "$(notify_field '.telegram_bot_token')")"
         printf 'TELEGRAM_CHAT_ID=%s\n'   "$(dotenv_quote "$(notify_field '.telegram_chat_id')")"
+        printf 'INFRA_BOT_TOKEN=%s\n'    "$(dotenv_quote "$(notify_field '.infra_telegram_bot_token')")"
+        printf 'INFRA_CHAT_ID=%s\n'      "$(dotenv_quote "$(notify_field '.infra_telegram_chat_id')")"
         printf 'NOTIFY_API_KEY=%s\n'     "$(dotenv_quote "$(notify_field '.notify_api_key')")"
     } > "$REPO_ROOT/notify/.env"
 
