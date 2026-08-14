@@ -211,7 +211,7 @@ Everything runs on Oracle Cloud's Always Free tier — no billing, no trial expi
 
 | Shape | OCPUs | RAM | Instances | Notes |
 |-------|-------|-----|-----------|-------|
-| VM.Standard.A1.Flex (Arm) | 4 total | 24 GB total | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently |
+| VM.Standard.A1.Flex (Arm) | 4 total¹ | 24 GB total¹ | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently. ¹Grandfathered accounts (our Sydney tenancy) get 4/24; **newer tenancies are now capped at 2 OCPU / 12 GB** (Oracle shrank the A1 grant). `scripts/oci-retry-provision.sh` auto-detects the real per-tenancy limit and adapts. |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 each (burstable) | 1 GB each | Up to 2 | **Separate CPU budget** — does not eat into A1 allocation. Can burst above baseline |
 
 Total baseline: **4.25 OCPUs + 26 GB RAM** across up to 6 instances.
