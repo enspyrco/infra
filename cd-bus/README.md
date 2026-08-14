@@ -4,7 +4,7 @@ Fans out `image.published` events from CI to OCI-host subscribers over **SSE**,
 so a merge-to-main reaches the running container in ~seconds without the host
 opening an inbound port. This is the keystone (component 2) of the deploy-bus.
 
-> Full design + rationale: [The Imagineering Deploy Bus](https://outline.imagineering.cc/doc/the-imagineering-deploy-bus-qz9QscpP6Q)
+> Full design + rationale: [DESIGN.md](DESIGN.md)
 
 **Deployed:** https://cd-bus.imagineering.cc (Cloudflare Worker + Durable Object).
 The legacy `https://cd-bus.nick-meinhold.workers.dev` host stays live in parallel

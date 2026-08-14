@@ -2,13 +2,7 @@
 # Restore script for all services
 # Restores from GitHub backup repo (imagineering-cc/imagineering-backups)
 # Usage: ./restore.sh <service>
-#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity
-#
-# Note: continuwuity requires the age private key path in $AGE_IDENTITY_FILE
-# (default: ~/.config/sops/age/keys.txt — same file SOPS uses; age will try
-# each key in the file until one matches). Restoring continuwuity replaces
-# the live homeserver state — only do it on a fresh instance or after
-# confirming the existing state is unrecoverable.
+#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix
 
 set -e
 
@@ -50,6 +44,217 @@ cleanup_backups() {
   rm -rf "$BACKUP_CLONE_DIR"
 }
 
+# Validate a plain-text pg_dump BEFORE any destructive restore step: non-empty,
+# complete (end-anchored '-- PostgreSQL database dump complete'), and not a
+# schemaless/empty DB (has CREATE TABLE). Returns non-zero so the caller can abort
+# with the LIVE database still intact. The old restore_kanbn/outline dropped the
+# live DB FIRST, then blind-loaded — a corrupt/truncated repo dump wiped live data.
+# (The full atomic restore-into-temp-DB-then-rename is Phase 2 of #29 — needs a
+# postgres test container; this guard already stops a bad dump reaching dropdb.)
+_validate_pg_dump() {
+  local svc="$1" f="$2"
+  if [ ! -s "$f" ]; then
+    error "$svc: dump $(basename "$f") is empty — refusing (live DB untouched)"; return 1
+  fi
+  if ! tail -n5 "$f" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "$svc: dump incomplete (no completion marker — truncated) — refusing (live DB untouched)"; return 1
+  fi
+  if ! grep -q 'CREATE TABLE' "$f"; then
+    error "$svc: dump has no CREATE TABLE (empty/wrong DB) — refusing (live DB untouched)"; return 1
+  fi
+  # Refuse dumps that can escape the temp DB mid-replay: a `\connect`/`\c` reconnects
+  # to another DB (incl. the LIVE one), and cluster-level `CREATE DATABASE` /
+  # `DROP DATABASE` act on OTHER databases regardless of the current connection — any
+  # of these replays against live BEFORE the atomic swap, breaking the "temp DB only,
+  # live untouched" invariant (cage-match #140, Carnot r1 + Wu r2). Case-insensitive
+  # so lowercase SQL keywords don't slip past. Our backups are plain `pg_dump <db>`,
+  # so a real backup never trips this.
+  if grep -qiE '^[[:space:]]*(\\c|\\connect|create database|drop database)\b' "$f"; then
+    error "$svc: dump contains \\connect / CREATE DATABASE / DROP DATABASE (could act on the LIVE db mid-replay) — refusing. Expected a plain 'pg_dump <db>' dump."; return 1
+  fi
+  return 0
+}
+
+# Build the tiny alpine+sqlite helper image if absent (idempotent — mirrors
+# backup-aiko-island-standalone.sh) so a box where the backup path never ran can
+# still validate a SQLite candidate. Shared single door for _restore_island_core
+# and _validate_sqlite_db so both paths validate identically. Returns non-zero on
+# build failure so the caller can abort with live state intact.
+_ensure_sqlite_dumper() {
+  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
+    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
+    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
+      | docker build -q -t sqlite-dumper:latest - >/dev/null \
+      || { error "failed to build sqlite-dumper:latest"; return 1; }
+  fi
+  return 0
+}
+
+# Validate a raw SQLite .db file BEFORE it overwrites live state. The 16-byte magic
+# header alone is NOT enough: a truncated/garbage file that keeps the header still
+# passes a magic check and then clobbers the live DB (cage-match #138: Carnot+Tesla).
+# So this runs the same PRAGMA integrity_check the island path uses (reads the whole
+# b-tree — truncation fails) PLUS a non-empty .tables check (rejects a schemaless/
+# wrong DB). Exact-byte header match first as a cheap pre-filter. Returns non-zero
+# so the caller aborts with the live DB untouched.
+_validate_sqlite_db() {
+  local svc="$1" f="$2"
+  if [ ! -s "$f" ]; then
+    error "$svc: $(basename "$f") is empty — refusing (live DB untouched)"; return 1
+  fi
+  # Exact 15-byte header ("SQLite format 3", the magic minus its trailing NUL) —
+  # an exact prefix match, not a substring grep that any 16 bytes containing the
+  # string would satisfy (cage-match #138: Carnot+Tesla).
+  if [ "$(head -c 15 "$f")" != "SQLite format 3" ]; then
+    error "$svc: $(basename "$f") is not a SQLite database (bad header) — refusing (live DB untouched)"; return 1
+  fi
+  _ensure_sqlite_dumper || { error "$svc: cannot validate SQLite candidate (no sqlite-dumper image) — refusing (live DB untouched)"; return 1; }
+  # integrity_check reads the entire file, so a truncated-but-header-valid DB fails
+  # here; the non-empty .tables check rejects a schemaless/wrong DB. Mount read-only.
+  if ! docker run --rm -v "$f:/candidate.db:ro" sqlite-dumper:latest sh -c '
+        integ=$(sqlite3 /candidate.db "PRAGMA integrity_check;" 2>&1) || { echo "sqlite3 failed: $integ" >&2; exit 1; }
+        [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
+        [ -n "$(sqlite3 /candidate.db ".tables" 2>/dev/null)" ] || { echo "no tables (schemaless/wrong DB)" >&2; exit 1; }
+      '; then
+    error "$svc: $(basename "$f") failed SQLite integrity_check (truncated/corrupt/schemaless) — refusing (live DB untouched)"; return 1
+  fi
+  return 0
+}
+
+# Atomically restore a postgres DB from a plain dump WITHOUT ever leaving the live
+# DB empty (#29 Phase 2). The postgres analog of _restore_island_core's temp-file +
+# atomic-mv: load the dump into a TEMP database, integrity-gate it, then swap it into
+# place with two ALTER DATABASE renames — keeping the prior live DB as a timestamped
+# rescue. The old restore_kanbn/outline dropped the live DB FIRST then loaded, so a
+# dump that passed validation but errored mid-replay left the DB EMPTY. Here the live
+# DB is untouched until a fully-replayed, non-empty candidate exists.
+#
+# Validated end-to-end against postgres:alpine (cage-match #138 → #29 Phase 2):
+# good dump swaps in with the old DB preserved as rescue; a truncated dump fails the
+# temp load and the live DB is never touched.
+#
+# Args: <svc> <container> <pguser> <db> <composedir> <dumpfile>
+# Requires the dump to have already passed _validate_pg_dump.
+_restore_pg_atomic() {
+  local svc="$1" container="$2" user="$3" db="$4" composedir="$5" dumpfile="$6"
+  local ts temp rescue
+  ts=$(date +%Y%m%d_%H%M%S)
+  temp="${db}_restore_${ts}"
+  rescue="${db}_rescue_${ts}"
+
+  cd "$composedir" || { error "$svc: cannot cd $composedir"; return 1; }
+  docker compose up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+  docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 || { error "$svc: postgres not ready after 30s"; return 1; }
+
+  # 1. Load into a fresh temp DB — live $db untouched. --single-transaction +
+  #    ON_ERROR_STOP so a mid-replay error aborts with the temp DB discarded.
+  log "$svc: loading dump into temp DB $temp (live $db untouched)..."
+  docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+  docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "CREATE DATABASE \"$temp\";" >/dev/null 2>&1 \
+    || { error "$svc: could not create temp DB $temp — live $db untouched"; return 1; }
+  if ! docker exec -i "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U "$user" -d "$temp" < "$dumpfile" >/dev/null 2>&1; then
+    error "$svc: dump failed to replay into temp DB — live $db UNTOUCHED. Dropping temp; investigate the dump before retrying."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # 2. Integrity gate: the candidate must have loaded at least one public table.
+  local ntables
+  # `|| true` so a hard docker/psql failure doesn't trip set -e on the assignment
+  # (leaving temp undropped) — the numeric guard below treats empty as a failed gate.
+  ntables=$(docker exec "$container" psql -U "$user" -d "$temp" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || true)
+  # Validate ntables is actually a number before the -ge (a failed docker exec /
+  # psql can emit a non-numeric error line, which would make `[ -ge ]` itself
+  # error — treat any non-digit result as a failed gate, live untouched).
+  if ! [[ "$ntables" =~ ^[0-9]+$ ]] || [ "$ntables" -lt 1 ]; then
+    error "$svc: temp DB integrity gate failed (no public tables, or count query errored: '$ntables') — live $db UNTOUCHED. Dropping temp."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # Small helpers for the swap phase — every step is explicitly checked rather than
+  # leaning on `set -e` (cage-match #140 round 2: Carnot/Tesla/Wu all flagged bare
+  # set -e commands with no recovery). _pgx runs a psql statement with ON_ERROR_STOP
+  # and returns its status; _unfence best-effort re-enables connections on a DB.
+  # _pgx runs a CHECKED psql statement (ON_ERROR_STOP) — always used in `if !` so
+  # set -e never aborts on it. _unfence + _apprestart are BEST-EFFORT recovery: they
+  # end in `|| true` so a failure can never trip set -e and skip the recovery step
+  # that follows (cage-match #140 r3, Carnot+Tesla: "best-effort under set -e is a
+  # lie"). The critical path is the explicit `if !` checks, not set -e.
+  _pgx() { docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "$1" >/dev/null 2>&1; }
+  _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1 || true; }
+  _apprestart() { docker compose up -d >/dev/null 2>&1 || true; }
+
+  # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
+  #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
+  #    ASSERT readiness — a not-ready postgres must not proceed to fence/rename.
+  log "$svc: stopping app for the atomic swap..."
+  docker compose stop >/dev/null 2>&1 || true
+  if ! docker compose up -d postgres >/dev/null 2>&1; then
+    error "$svc: postgres failed to restart for the swap — live $db UNTOUCHED, temp $temp left. Bringing app back up."
+    _apprestart; return 1
+  fi
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+  if ! docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1; then
+    error "$svc: postgres not ready after restart — live $db UNTOUCHED, temp $temp left. Bringing app back up."
+    _apprestart; return 1
+  fi
+
+  # 4. Atomic swap. FENCE connections first (ALLOW_CONNECTIONS false) so an external
+  #    client outside this compose project can't reconnect between terminate and
+  #    rename — and the fence + terminate are CHECKED (a silent fence failure would
+  #    reopen that race: cage-match #140 r2, Carnot+Tesla+Wu). On any failure before
+  #    the live rename, live is still $db and UNTOUCHED — un-fence it and restart.
+  if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS false; ALTER DATABASE \"$temp\" WITH ALLOW_CONNECTIONS false;"; then
+    error "$svc: could not fence connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  if ! _pgx "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('$db','$temp') AND pid <> pg_backend_pid();"; then
+    error "$svc: could not terminate live connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  # Rename live->rescue, then temp->live. If the second rename fails, roll rescue
+  # back so live is never lost.
+  if ! _pgx "ALTER DATABASE \"$db\" RENAME TO \"$rescue\";"; then
+    error "$svc: could not rename live $db -> rescue (connections still open?) — live UNTOUCHED, temp $temp left."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  if ! _pgx "ALTER DATABASE \"$temp\" RENAME TO \"$db\";"; then
+    error "$svc: rename temp -> live FAILED after live moved to rescue — rolling back rescue -> live."
+    if _pgx "ALTER DATABASE \"$rescue\" RENAME TO \"$db\";"; then
+      _unfence "$db"
+      error "$svc: rolled back — live $db is the original; temp $temp left for inspection."
+    else
+      error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue' (run: ALTER DATABASE \"$rescue\" RENAME TO \"$db\"; ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;), candidate under '$temp'. Manual recovery needed; app NOT restarted."
+      return 1
+    fi
+    _apprestart; return 1
+  fi
+
+  # 5. Un-fence the new live DB — CHECKED. It inherited ALLOW_CONNECTIONS false from
+  #    the temp; if this fails, the app would come up against a DB that refuses
+  #    connections (a silent RC=0 false-success — Tesla). Keep the app STOPPED and
+  #    error loudly (starting it against a fenced DB just crash-loops — Carnot r3).
+  if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;"; then
+    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose up -d'. Previous live kept as '$rescue'."
+    return 1
+  fi
+  # Re-enable the rescue DB too so operators can inspect it without a manual ALTER
+  # (it inherited the fence when it was still the live $db — Carnot :207). Best-effort.
+  _unfence "$rescue"
+
+  # Success — previous live kept as $rescue (drop it manually once satisfied). Check
+  # the app restart: the data swap already succeeded, so a restart failure is a warn
+  # (not a data-loss error), but don't print "complete" as if the service is up.
+  if docker compose up -d >/dev/null 2>&1; then
+    log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). App restarted."
+    return 0
+  fi
+  warn "$svc: atomic swap complete and data is live, but 'docker compose up -d' failed to restart the app — run it manually. Previous live kept as '$rescue'."
+  return 0
+}
+
 restore_kanbn() {
   log "Restoring Kan.bn..."
 
@@ -62,23 +267,12 @@ restore_kanbn() {
     cleanup_backups
     exit 1
   fi
-
-  # Ensure Kan.bn postgres is running
-  cd ~/apps/kanbn
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i kanbn_postgres bash -c "psql -U kanbn -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kanbn' AND pid <> pg_backend_pid();\" postgres && dropdb -U kanbn kanbn && createdb -U kanbn kanbn"
-
-  # Restore database
-  log "Restoring database..."
-  docker exec -i kanbn_postgres psql -U kanbn kanbn < "$BACKUP_FILE"
-
-  log "Restarting Kan.bn..."
-  docker compose restart
+  # Validate the dump, then atomically swap it in via a temp DB (never drops the
+  # live DB before a fully-replayed candidate exists — #29 Phase 2). The old code
+  # dropped+recreated FIRST then loaded, so a dump that errored mid-replay left the
+  # DB empty.
+  _validate_pg_dump kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
+  _restore_pg_atomic kanbn kanbn_postgres kanbn kanbn ~/apps/kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Kan.bn restore complete!"
@@ -95,23 +289,9 @@ restore_outline() {
     cleanup_backups
     exit 1
   fi
-
-  # Ensure Outline postgres is running
-  cd ~/apps/outline
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i outline_postgres bash -c "psql -U outline -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'outline' AND pid <> pg_backend_pid();\" postgres && dropdb -U outline outline && createdb -U outline outline"
-
-  # Restore database
-  log "Restoring database..."
-  docker exec -i outline_postgres psql -U outline outline < "$BACKUP_FILE"
-
-  log "Restarting Outline..."
-  docker compose restart
+  # Validate + atomic temp-DB swap (see restore_kanbn / _restore_pg_atomic).
+  _validate_pg_dump outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
+  _restore_pg_atomic outline outline_postgres outline outline ~/apps/outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Outline restore complete!"
@@ -131,7 +311,16 @@ restore_pm_bot() {
 
   # Copy SQLite database into container volume
   log "Restoring database..."
-  docker cp "$BACKUP_FILE" dreamfinder:/app/data/kan-bot.db
+  # Validate before overwriting the live DB: non-empty, exact SQLite header, AND
+  # a full PRAGMA integrity_check + non-empty schema (see _validate_sqlite_db). A
+  # header-only check would let a truncated-but-header-valid backup clobber the live
+  # bot.db — the same content-sentinel the island/matrix paths already enforce.
+  _validate_sqlite_db "Dreamfinder restore" "$BACKUP_FILE" || { cleanup_backups; exit 1; }
+
+  # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
+  # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
+  # silently wrote a file the app ignores (a no-op restore).
+  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
   cd ~/apps/dreamfinder
@@ -153,12 +342,38 @@ restore_radicale() {
     exit 1
   fi
 
+  # Validate the archive BEFORE the destructive rm — a truncated/corrupt tar must
+  # not reach `rm -rf /data/collections` (which would leave collections gone with
+  # nothing to extract). Two gates, because `tar tf` checks the CARRIER not the
+  # PAYLOAD (cage-match #138, Tesla): a well-formed EMPTY tar, or a valid tar of the
+  # WRONG tree, lists fine and would still let the rm wipe collections with nothing
+  # useful to restore.
+  #   1. Readable/complete archive (truncation fails a full listing).
+  local radicale_members
+  if ! radicale_members=$(tar tf "$BACKUP_FILE" 2>/dev/null); then
+    error "Radicale restore: $BACKUP_FILE is not a valid/complete tar — refusing (collections untouched)"
+    cleanup_backups; exit 1
+  fi
+  #   2. Content sentinel: at least one member under data/collections (backup.sh
+  #      tars `docker exec radicale tar czf - /data/collections`, so a real archive
+  #      lists data/collections[/...]). An empty or wrong-tree tar fails here.
+  # Exact directory boundary (`(/|$)`) — a bare prefix would also match a wrong
+  # tree like data/collections-old / data/collections.bak, pass, then let the
+  # rm wipe the real collections (cage-match #138 round 2, Carnot).
+  if ! printf '%s\n' "$radicale_members" | grep -qE '^data/collections(/|$)'; then
+    error "Radicale restore: $BACKUP_FILE has no data/collections members (empty/wrong-tree tar) — refusing (collections untouched)"
+    cleanup_backups; exit 1
+  fi
+
   # Stop Radicale
   log "Stopping Radicale..."
   cd ~/apps/radicale
   docker compose stop radicale
 
-  # Restore collections into the volume
+  # Restore collections into the volume. Content-validated above (readable tar with
+  # real collections members), so the rm won't wipe live data with nothing to
+  # restore. NOTE: the in-container extract itself is not yet atomic (a mid-extract
+  # failure after the rm leaves a partial tree) — stage-to-temp-then-swap is Phase 2.
   log "Restoring collections..."
   docker compose run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
     -c "rm -rf /data/collections && tar xf /restore.tar -C /"
@@ -181,6 +396,24 @@ restore_claudius() {
     error "No claudius.tar found in backup repo"
     cleanup_backups
     exit 1
+  fi
+
+  # Validate the archive before extracting over live state. Extract is additive
+  # (no rm), so the blast is lower than radicale — but an empty/wrong-tree tar
+  # would still "restore" nothing silently, exactly the no-op class this PR fights.
+  # So carrier + payload here too, symmetric with radicale (cage-match #138, Tesla):
+  #   1. Readable/complete archive.
+  local claudius_members
+  if ! claudius_members=$(tar tf "$BACKUP_FILE" 2>/dev/null); then
+    error "Claudius restore: $BACKUP_FILE is not a valid/complete tar — refusing"
+    cleanup_backups; exit 1
+  fi
+  #   2. Content sentinel: at least one workspace/ member (backup.sh tars
+  #      /workspace/... paths). An empty/wrong-tree tar fails here rather than
+  #      extracting nothing and reporting success.
+  if ! printf '%s\n' "$claudius_members" | grep -q '^workspace/'; then
+    error "Claudius restore: $BACKUP_FILE has no workspace/ members (empty/wrong-tree tar) — refusing"
+    cleanup_backups; exit 1
   fi
 
   # Restore state files into container
@@ -227,14 +460,9 @@ _restore_island_core() {
   fi
 
   # The island image ships no sqlite3; build the tiny alpine+sqlite helper if
-  # absent (idempotent — mirrors backup-aiko-island-standalone.sh) so restore
-  # works on a box where the backup path has never run.
-  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
-    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-      | docker build -q -t sqlite-dumper:latest - >/dev/null \
-      || { error "failed to build sqlite-dumper:latest"; return 1; }
-  fi
+  # absent (shared _ensure_sqlite_dumper, also used by _validate_sqlite_db) so
+  # restore works on a box where the backup path has never run.
+  _ensure_sqlite_dumper || return 1
 
   log "Stopping island container $cid..."
   docker stop "$cid" >/dev/null || { error "failed to stop container $cid"; return 1; }
@@ -248,7 +476,7 @@ _restore_island_core() {
   if ! docker run --rm -i -v "${vol}:/data" sqlite-dumper:latest sh -c '
         set -e
         rm -f /data/aiko.db.restore /data/aiko.db.restore-wal /data/aiko.db.restore-shm
-        sqlite3 /data/aiko.db.restore        # replay dump from stdin
+        sqlite3 -bail /data/aiko.db.restore  # replay dump; -bail: exit non-zero on first SQL error
         integ=$(sqlite3 /data/aiko.db.restore "PRAGMA integrity_check;")
         [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
         sqlite3 /data/aiko.db.restore ".tables" | grep -qw users || { echo "no users table in restored DB" >&2; exit 1; }
@@ -323,8 +551,8 @@ restore_aiko_island() {
 # Restore matrix bridges + relay-bot SQLite DBs from latest SQL dumps in the
 # backup repo. Each .sql file is replayed against a fresh SQLite DB inside
 # the bridge's volume. Bridges must be stopped before the replay (writing
-# to a live DB while replaying would corrupt it). Continuwuity itself is
-# NOT touched here — see restore_continuwuity for the homeserver.
+# to a live DB while replaying would corrupt it). The continuwuity homeserver
+# is NOT backed up or restored (its signing key is saved separately — 2026-08-02).
 restore_matrix() {
   log "Restoring matrix bridges + relay-bots..."
 
@@ -339,121 +567,101 @@ restore_matrix() {
     "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
+  # Build the sqlite helper if absent — restore may run on a box where the backup
+  # path (which builds it) has never executed. Shared _ensure_sqlite_dumper, same
+  # as island/pm_bot (cage-match #138 round 2, Kelvin: was an inline copy).
+  _ensure_sqlite_dumper || { cleanup_backups; return 1; }
+
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
-  cd ~/apps/matrix
+  cd ~/apps/matrix || { error "cannot cd ~/apps/matrix"; cleanup_backups; return 1; }
   docker compose stop
 
+  local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
     local sql_file="$BACKUP_CLONE_DIR/${name}.sql"
     if [ ! -f "$sql_file" ]; then
+      # Missing dump: skip, but track it — a silent skip under a "complete!"
+      # banner is a cousin of the old |continue bug (some bridges never touched
+      # while the run reports success). Surface it loudly at the end.
       warn "No ${name}.sql found in backup repo, skipping"
+      skipped=$((skipped+1)); skipped_names="$skipped_names $name"
       continue
     fi
 
-    log "  Restoring $name from ${name}.sql..."
-    # Replace the existing DB with a fresh one populated from the dump.
-    # Pipe SQL through stdin into sqlite3 in the sqlite-dumper container
-    # (rw mount). Removing the old WAL/SHM files first prevents stale
-    # write-ahead state corrupting the restore.
-    docker run --rm -i -v "${volume}:/data" sqlite-dumper:latest sh -c \
-      "rm -f /data/${dbfile} /data/${dbfile}-wal /data/${dbfile}-shm && \
-       sqlite3 /data/${dbfile}" < "$sql_file" || \
-      error "Restore failed for $name (continuing)"
+    # Validate the dump BEFORE the destructive path. The OLD code rm'd the live
+    # DB then replayed with a non-fatal `|| error`, so a truncated/empty dump
+    # wiped a bridge DB while the run still logged success. Now a bad dump is
+    # refused and the live DB is left intact. End-anchored COMMIT; check (not
+    # `grep '^COMMIT;'`): app data can embed a COMMIT;-prefixed line.
+    if [ ! -s "$sql_file" ]; then
+      error "$name: dump $(basename "$sql_file") is empty — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+    if [ "$(grep -ve '^[[:space:]]*$' "$sql_file" | tail -n1)" != "COMMIT;" ]; then
+      error "$name: dump looks truncated/invalid (last line not COMMIT;) — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+    # Reject a schemaless dump (valid COMMIT; but no tables — an empty/wrong DB):
+    # PRAGMA integrity_check returns ok on an empty DB, so without this the empty
+    # candidate would atomically replace a live bridge (Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$sql_file"; then
+      error "$name: dump has no CREATE TABLE (empty/wrong DB) — skipping (live DB untouched)"
+      any_failed=1; continue
+    fi
+
+    log "  Restoring $name (build candidate -> integrity_check -> atomic install)..."
+    # Build + validate the replacement in a TEMP file inside the volume; only
+    # swap it in on success. Rescue the old DB (+WAL/SHM) by full copy first, so
+    # the live $dbfile is never destroyed unless a valid replacement exists.
+    # Mirrors _restore_island_core (minus the island-only users-table check —
+    # bridge schemas differ, so PRAGMA integrity_check is the generic gate).
+    local rescue; rescue="${dbfile}.rescue-$(date +%Y%m%d-%H%M%S)"
+    if ! docker run --rm -i -v "${volume}:/data" sqlite-dumper:latest sh -c '
+          set -e
+          dbfile="'"$dbfile"'"; rescue="'"$rescue"'"
+          rm -f "/data/$dbfile.restore" "/data/$dbfile.restore-wal" "/data/$dbfile.restore-shm"
+          sqlite3 -bail "/data/$dbfile.restore"      # replay dump; -bail: exit non-zero on first SQL error
+          integ=$(sqlite3 "/data/$dbfile.restore" "PRAGMA integrity_check;")
+          [ "$integ" = "ok" ] || { echo "integrity_check failed: $integ" >&2; exit 1; }
+          # Rescue the COMPLETE old state (db + WAL/SHM) by full copy before
+          # touching it; cp failure is fatal under set -e, absence is not.
+          if [ -f "/data/$dbfile" ]; then
+            cp -p "/data/$dbfile" "/data/$rescue"
+            if [ -f "/data/$dbfile-wal" ]; then cp -p "/data/$dbfile-wal" "/data/$rescue-wal"; fi
+            if [ -f "/data/$dbfile-shm" ]; then cp -p "/data/$dbfile-shm" "/data/$rescue-shm"; fi
+          fi
+          # Remove stale sidecars BEFORE install so a fresh-from-.dump DB never
+          # sits beside a salt-mismatched WAL (SQLite corruption).
+          rm -f "/data/$dbfile-wal" "/data/$dbfile-shm"
+          # Atomic install LAST: single rename, always old-or-new, never neither.
+          mv -f "/data/$dbfile.restore" "/data/$dbfile"
+        ' < "$sql_file"; then
+      error "Restore FAILED for $name — the candidate was rejected or the install aborted. In the common case (bad dump / integrity_check fail) the failure is BEFORE any destructive step and live $dbfile is untouched; if it aborted mid-swap, the prior DB (+WAL/SHM) is preserved as $dbfile.rescue-* in the volume. Inspect the volume before retrying. Continuing with other bridges."
+      any_failed=1; continue
+    fi
+    log "  $name restored OK (previous DB kept as $dbfile.rescue-* in the volume)"
   done
 
   log "Restarting matrix stack..."
   docker compose up -d
 
   cleanup_backups
+  if [ "$any_failed" -eq 1 ]; then
+    error "Matrix restore finished with errors (see above); failed/empty bridges were skipped with their live DBs intact"
+    return 1
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    warn "Matrix restore complete for the bridges that had dumps, but ${skipped} had NO dump in the repo and were left untouched:${skipped_names}. This is an INCOMPLETE restore — confirm that's intended (fresh bridges) and not a partial/wrong backup clone."
+    return 0
+  fi
   log "Matrix restore complete!"
 }
 
-# Restore Continuwuity from the most recent encrypted tarball in the
-# backup repo. The tarball is a RocksDB BackupEngine directory (not a
-# direct database snapshot) — it has meta/, private/, shared_checksum/
-# subdirs and requires a BackupEngine restore step, NOT a simple replace
-# of the data dir.
-#
-# Since Continuwuity has no `restore-database` admin command (only
-# `backup-database` and `list-backups`), full restore needs RocksDB's
-# `ldb restore` tool. This script extracts the encrypted backup into the
-# continuwuity_backups volume and prints next-step guidance — full
-# automation pending Continuwuity adding a restore command OR us shipping
-# an ldb-based helper.
-#
-# CRITICAL: full restore REPLACES the live homeserver state — signing
-# keys, room state, all messages, user accounts. Only do this on a fresh
-# deployment or when the live state is confirmed unrecoverable.
-#
-# Requires the age private key at $AGE_IDENTITY_FILE (default:
-# ~/.config/sops/age/keys.txt — same file SOPS uses). age will iterate
-# all private keys in the file until one matches the encrypted recipient.
-restore_continuwuity() {
-  log "Restoring Continuwuity (partial — see notes at end)..."
-
-  if [ ! -f "$AGE_IDENTITY_FILE" ]; then
-    error "Age identity file not found at $AGE_IDENTITY_FILE"
-    error "Set AGE_IDENTITY_FILE to the path of your private key."
-    exit 1
-  fi
-  if ! command -v age &>/dev/null; then
-    error "age not installed (apt-get install -y age)"
-    exit 1
-  fi
-
-  fetch_backups
-
-  local enc_file="$BACKUP_CLONE_DIR/continuwuity.tar.gz.age"
-  if [ ! -f "$enc_file" ]; then
-    error "No continuwuity.tar.gz.age found in backup repo"
-    cleanup_backups
-    exit 1
-  fi
-
-  warn "Backup file: $enc_file (committed $(stat -c %y "$enc_file" 2>/dev/null || echo unknown))"
-  warn "This will extract the RocksDB BackupEngine backup into the"
-  warn "matrix_continuwuity_backups volume. To actually restore INTO the"
-  warn "live database, you'll need to run a BackupEngine restore step"
-  warn "manually (see notes printed at the end)."
-  read -r -p "Type 'extract-backup' to confirm: " confirm
-  if [ "$confirm" != "extract-backup" ]; then
-    log "Aborted"
-    cleanup_backups
-    exit 0
-  fi
-
-  # Decrypt + extract into the matrix_continuwuity_backups volume. This
-  # does NOT touch the live continuwuity_data volume; the operator must
-  # then run a BackupEngine restore as a separate manual step.
-  log "Decrypting and extracting backup into matrix_continuwuity_backups..."
-  if ! age -d -i "$AGE_IDENTITY_FILE" "$enc_file" \
-       | docker run --rm -i -v matrix_continuwuity_backups:/data alpine \
-         sh -c "rm -rf /data/* && tar xzf - -C /data"; then
-    error "Decrypt/extract failed"
-    cleanup_backups
-    exit 1
-  fi
-
-  cleanup_backups
-  log "Backup extracted to matrix_continuwuity_backups volume."
-  echo ""
-  warn "NEXT STEPS (manual): To restore the database from this backup, you"
-  warn "need RocksDB's ldb tool to do a BackupEngine restore. Outline:"
-  echo "  1. apt-get install -y rocksdb-tools  # provides 'ldb'"
-  echo "  2. cd ~/apps/matrix && docker compose stop continuwuity"
-  echo "  3. # Identify backup dir on host:"
-  echo "     ls /var/lib/docker/volumes/matrix_continuwuity_backups/_data"
-  echo "  4. # Restore into a temp dir then swap with continuwuity_data:"
-  echo "     ldb --db=/tmp/restored restore \\"
-  echo "         --backup_dir=/var/lib/docker/volumes/matrix_continuwuity_backups/_data"
-  echo "  5. # Replace the live data volume contents with /tmp/restored"
-  echo "  6. docker compose up -d continuwuity"
-  echo ""
-  echo "TODO: ship an ldb-based helper or wait for Continuwuity to add a"
-  echo "      'restore-database' admin command (file an issue upstream)."
-}
+# Continuwuity restore constants. The image is the exact prod version so the
+# validate-boot exercises the real RocksDB (no ldb version-skew).
+MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the
 # functions (_restore_island_core + the aiko_island_* lib) without running the
@@ -470,13 +678,12 @@ fi
 # Deferred from the top of the file so the harness can source cleanly.
 if [ -z "$SERVICE" ]; then
   echo "Usage: $0 <service>"
-  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
   echo ""
   echo "Examples:"
   echo "  $0 kanbn         # Restore latest from GitHub backup"
   echo "  $0 outline       # Restore latest from GitHub backup"
   echo "  $0 matrix        # Restore all matrix bridges + relay-bots"
-  echo "  $0 continuwuity  # Restore homeserver (requires AGE_IDENTITY_FILE)"
   exit 1
 fi
 
@@ -505,12 +712,9 @@ case $SERVICE in
   matrix)
     restore_matrix
     ;;
-  continuwuity)
-    restore_continuwuity
-    ;;
   *)
     error "Unknown service: $SERVICE"
-    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
     exit 1
     ;;
 esac

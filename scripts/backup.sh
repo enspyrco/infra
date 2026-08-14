@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unified backup script for all services
 # Dumps databases/data, pushes to GitHub (imagineering-cc/imagineering-backups)
-# Usage: ./backup.sh [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|continuwuity]
+# Usage: ./backup.sh [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix]
 #
 # NOTE: downstream-server's DB backup moved to the downstream repo
 # (nickmeinhold/downstream deploy/oci/scripts/backup-downstream.sh, cron
@@ -17,17 +17,29 @@ FAILED_SERVICES=()
 GITHUB_BACKUP_REPO="git@github-imagineering-backups:imagineering-cc/imagineering-backups.git"
 GITHUB_BACKUP_DIR="/tmp/imagineering-backups"
 GITHUB_REPO_SIZE_ALERT_MB=500
+# owner/repo form, for the REST API (releases). The SSH URL above is for git.
+GITHUB_BACKUP_SLUG="imagineering-cc/imagineering-backups"
 
-# Continuwuity backup config. AGE_RECIPIENT and MATRIX_ADMIN_TOKEN are
-# sourced at runtime from MATRIX_ADMIN_SECRETS_FILE (see backup_continuwuity).
-# Decryption: `age -d -i <key> continuwuity.tar.gz.age | tar xzf -`.
-MATRIX_ADMIN_SECRETS_FILE="/etc/imagineering-secrets/matrix.env"
-CONTINUWUITY_ADMIN_ROOM='!L8ZmuakjgpeL1P3Jl8:imagineering.cc'
-CONTINUWUITY_HOMESERVER='https://matrix.imagineering.cc'
-# Continuwuity tarballs are large + opaque to git deltas. When the repo
-# exceeds this size, prune_repo_history_if_needed collapses history to a
-# fresh root commit (loses non-essential git history; keeps current files).
+# Object-store archives are published as RELEASE ASSETS, never committed to the
+# tree. Two reasons, and the second is a hard stop rather than mere bloat:
+# a committed blob is in history forever (deleting the file reclaims nothing —
+# the whole reason prune_repo_history_if_needed exists), and GitHub blocks any
+# file over 100 MiB outright, which no history rewrite can help. Release assets
+# sit outside history, have no total-size limit, and a delete actually
+# reclaims — so retention here is an ordinary API call.
+OBJECT_RELEASE_RETENTION=${OBJECT_RELEASE_RETENTION:-7}
+
+# Backup-repo history guard. When the repo exceeds this size,
+# prune_repo_history_if_needed collapses history to a fresh root commit (loses
+# non-essential git history; keeps current files). Originally added to cap the
+# now-removed daily continuwuity blob (#32); retained as a general safety net.
 RETENTION_PRUNE_THRESHOLD_MB=300
+# Keep only the newest N archive-* tags. Each prune pins the pre-prune HEAD in an
+# archive-DATE tag; the ~100MB encrypted (undeltable) continuwuity blob it holds is
+# a fresh object GitHub keeps forever while the tag references it. Unbounded, that
+# was 45 tags / 4.37GB (2026-07-30). Capping retention keeps a rolling PITR window
+# without the runaway growth. Structural fix (object storage) tracked separately.
+ARCHIVE_TAG_RETENTION=${ARCHIVE_TAG_RETENTION:-7}
 
 # Colors for output
 RED='\033[0;31m'
@@ -51,6 +63,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # backup and restore can't drift apart (aiko_chat_gateway#1759).
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
+# Fail-closed container discovery — hardcoded names broke outline + kanbn for
+# months after a rename (see lib/resolve-container.sh).
+# shellcheck source=lib/resolve-container.sh
+. "$SCRIPT_DIR/lib/resolve-container.sh"
+# Release-asset tier for large binaries (object stores) — see the file header
+# for why these can't be committed to the backup repo's tree.
+# shellcheck source=lib/release-assets.sh
+. "$SCRIPT_DIR/lib/release-assets.sh"
 
 check_repo_size() {
   if [ ! -d "$GITHUB_BACKUP_DIR" ]; then
@@ -73,13 +93,35 @@ mkdir -p "$BACKUP_DIR"
 backup_kanbn() {
   log "Backing up Kan.bn..."
 
-  local backup_file="$BACKUP_DIR/kanbn-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/kanbn-$DATE.sql"
+  local err="$BACKUP_DIR/kanbn-$DATE.err"
+  local out="$BACKUP_DIR/kanbn-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec kanbn_postgres \
-    pg_dump -U kanbn kanbn | gzip > "$backup_file"
-
-  log "Kan.bn backup complete: kanbn-$DATE.sql.gz"
+  # Dump to a plain .sql first so pg_dump's REAL exit is seen — piping straight
+  # to gzip masks it behind gzip's status, silently committing a truncated/empty
+  # backup over the good one. Then require pg_dump's end-marker before gzip.
+  local container
+  if ! container=$(resolve_container '^(imagineering|img)-kanbn-postgres$' kanbn 2>&1); then
+    error "Kan.bn container not resolved: $container"
+    return 1
+  fi
+  if ! docker exec "$container" pg_dump -U kanbn kanbn > "$tmp" 2>"$err"; then
+    error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  # A COMPLETE pg_dump plain-text dump ends with the EXACT line
+  # '-- PostgreSQL database dump complete'. Anchor on the whole line (grep -qxF),
+  # not a loose substring, so a data row near EOF can't fake completeness after a
+  # truncation (same end-anchoring discipline as the sqlite COMMIT; check).
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"
+  # Check gzip's own exit — a failed compress (ENOSPC/SIGKILL) must not leave the
+  # function logging success with a missing/partial .gz (pipe-masks-exit reborn).
+  if ! gzip -f "$tmp"; then error "Kan.bn gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
+  log "Kan.bn backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_pm_bot() {
@@ -103,41 +145,134 @@ backup_pm_bot() {
 backup_outline() {
   log "Backing up Outline..."
 
-  local backup_file="$BACKUP_DIR/outline-$DATE.sql.gz"
+  local tmp="$BACKUP_DIR/outline-$DATE.sql"
+  local err="$BACKUP_DIR/outline-$DATE.err"
+  local out="$BACKUP_DIR/outline-$DATE.sql.gz"
 
-  # Dump PostgreSQL
-  docker exec outline_postgres \
-    pg_dump -U outline outline | gzip > "$backup_file"
-
-  log "Outline backup complete: outline-$DATE.sql.gz"
+  # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
+  # then require the completion marker before gzip.
+  local container
+  if ! container=$(resolve_container '^(imagineering|img)-outline-postgres$' outline 2>&1); then
+    error "Outline container not resolved: $container"
+    return 1
+  fi
+  if ! docker exec "$container" pg_dump -U outline outline > "$tmp" 2>"$err"; then
+    error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+    error "Outline dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  rm -f "$err"
+  if ! gzip -f "$tmp"; then error "Outline gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
+  log "Outline backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_radicale() {
   log "Backing up Radicale..."
 
-  local backup_file="$BACKUP_DIR/radicale-$DATE.tar.gz"
+  local out="$BACKUP_DIR/radicale-$DATE.tar.gz"
 
-  # Tar the collections from the Docker volume
-  docker exec radicale tar czf - /data/collections > "$backup_file"
+  # Resolve by compose project, NOT by name. `docker exec radicale` resolved to
+  # XDECA's container on this co-located box (imagineering's is `img-radicale`,
+  # project `radicale`; xdeca's is plain `radicale`, project `xdeca-radicale`),
+  # so this backup captured the wrong tenant's calendars while imagineering's
+  # own collections went unbacked. restore.sh drives the RIGHT container via
+  # `cd ~/apps/radicale && docker compose`, so the two halves disagreed: a
+  # restore would have overwritten imagineering's collections with xdeca's.
+  local container
+  if ! container=$(resolve_container_by_compose radicale radicale 2>&1); then
+    error "Radicale container not resolved: $container"
+    return 1
+  fi
 
-  log "Radicale backup complete: radicale-$DATE.tar.gz"
+  # Tar the collections from the Docker volume. The old code ignored tar's exit
+  # AND never checked the artifact, so a failed/partial tar committed silently.
+  if ! docker exec "$container" tar czf - /data/collections > "$out" 2>/dev/null; then
+    error "Radicale tar failed"; rm -f "$out"; return 1
+  fi
+  # Verify the archive is a readable, complete gzip'd tar (a truncated .tar.gz
+  # fails to list); catches a corrupt/partial write before it's committed.
+  if ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Radicale backup is not a valid tar.gz (truncated/empty)"; rm -f "$out"; return 1
+  fi
+  log "Radicale backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
+}
+
+backup_minio() {
+  log "Backing up MinIO object store..."
+
+  local out="$BACKUP_DIR/minio-$DATE.tar.gz"
+
+  local container
+  if ! container=$(resolve_container_by_compose imagineering-outline minio 2>&1); then
+    error "MinIO container not resolved: $container"
+    return 1
+  fi
+
+  # Read the volume through a throwaway sidecar rather than exec'ing into
+  # MinIO. The minio/minio image is minimal — it ships `mc` and NO `tar`, so
+  # `docker exec <minio> tar` fails and, under `set -e`, dies without a
+  # message while leaving a plausible-looking file containing the runtime's
+  # error text. Mounted :ro so the backup can never write to live object data.
+  local vol
+  vol=$(docker inspect "$container" \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null)
+  if [ -z "$vol" ]; then
+    error "MinIO /data volume not resolved for $container"
+    return 1
+  fi
+
+  if ! docker run --rm -v "${vol}:/data:ro" alpine tar czf - -C /data . > "$out" 2>/dev/null; then
+    error "MinIO tar failed"; rm -f "$out"; return 1
+  fi
+
+  # Content gate, not just a readability gate. List ONCE to a file and grep
+  # that: piping `tar tzf` into `grep -q` under `set -o pipefail` is a
+  # false-negative trap — grep exits at the first match, tar takes SIGPIPE,
+  # and the pipeline reports failure on a perfectly good archive.
+  local listing
+  listing=$(mktemp)
+  if ! tar tzf "$out" > "$listing" 2>/dev/null; then
+    error "MinIO backup is not a valid tar.gz (truncated/empty)"
+    rm -f "$out" "$listing"; return 1
+  fi
+  # .minio.sys carries bucket policies. Without it a restored bucket serves
+  # 403s to Outline and Kan.bn — a restore that looks successful and isn't.
+  local missing=""
+  if ! grep -q "^\./\.minio\.sys/" "$listing"; then missing=".minio.sys"; fi
+  if ! grep -qE "^\./[a-z0-9.-]+/" "$listing"; then missing="${missing} (no buckets)"; fi
+  if [ -n "$missing" ]; then
+    error "MinIO backup is missing $missing — refusing (would restore to a broken bucket)"
+    rm -f "$out" "$listing"; return 1
+  fi
+  rm -f "$listing"
+
+  log "MinIO backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 backup_claudius() {
   log "Backing up Claudius..."
 
-  local backup_file="$BACKUP_DIR/claudius-$DATE.tar.gz"
+  local out="$BACKUP_DIR/claudius-$DATE.tar.gz"
 
-  # Tar critical persistent state from the logs volume
+  # Some of these files may not exist yet; tar warns and exits non-zero but still
+  # archives whatever IS present — so we deliberately do NOT gate on tar's exit.
+  # Instead we validate the RESULT is a readable, non-empty tar.gz, which catches
+  # a truncated/corrupt write (the actual silent-loss risk) without failing the
+  # legitimate "some optional state files absent" case.
   docker exec claudius tar czf - \
     /workspace/logs/agent-state.json \
     /workspace/logs/persona-evolution.md \
     /workspace/logs/conversation.log \
     /workspace/logs/playwright-storage.json \
     /workspace/logs/initiative-state.json \
-    2>/dev/null > "$backup_file"
-
-  log "Claudius backup complete: claudius-$DATE.tar.gz"
+    2>/dev/null > "$out" || true
+  if [ ! -s "$out" ] || ! tar tzf "$out" >/dev/null 2>&1; then
+    error "Claudius backup is not a valid/non-empty tar.gz"; rm -f "$out"; return 1
+  fi
+  log "Claudius backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 # Dumps each mautrix bridge's SQLite DB + both relay-bots' DBs to .sql.gz.
@@ -161,26 +296,50 @@ backup_matrix() {
   local any_failed=0
   for entry in "${entries[@]}"; do
     IFS=: read -r name volume dbfile <<< "$entry"
+    local tmp="$BACKUP_DIR/${name}-$DATE.sql"
+    local err="$BACKUP_DIR/${name}-$DATE.err"
     local out="$BACKUP_DIR/${name}-$DATE.sql.gz"
 
-    # Mount volume read-only; dump to stdout via the pre-built
-    # sqlite-dumper:latest image (alpine + sqlite, built by deploy_backups).
-    # The pipe to gzip happens on the host. If the dump fails or produces
-    # an empty file we remove the artifact so backup_to_github errors
-    # loudly rather than silently committing zero bytes.
+    # Dump to a PLAIN .sql first (no pipe) so sqlite3's REAL exit is seen —
+    # piping straight to gzip would mask a sqlite3 failure behind gzip's exit
+    # status, and a gzip of empty input is still a non-empty container so an
+    # `-s` size check on the .gz lies (it "passes" for a zero-row dump). Mount
+    # the volume read-only (online-safe snapshot) and capture stderr so a
+    # WAL-locked/failed read reports loudly. Mirrors backup_aiko_island.
     if ! docker run --rm -v "${volume}:/data:ro" sqlite-dumper:latest \
-      sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump 2>/dev/null \
-       | gzip > "$out"; then
-      error "${name} sqlite3 .dump failed"
-      rm -f "$out"
+         sqlite3 -cmd '.timeout 5000' "/data/${dbfile}" .dump > "$tmp" 2>"$err"; then
+      error "${name} sqlite3 .dump failed: $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
     fi
-    if [ ! -s "$out" ]; then
-      error "${name} dump produced empty output"
-      rm -f "$out"
+    # A COMPLETE .dump's LAST non-blank line is exactly `COMMIT;`. Check the
+    # tail end-anchored (not `grep '^COMMIT;'`): application data can embed a
+    # multiline string whose line starts `COMMIT;` and fool a whole-file grep
+    # into accepting a truncated dump. A silent empty/truncated backup is worse
+    # than none — restore would replay it over a live bridge DB.
+    local lastline
+    lastline=$(grep -ve '^[[:space:]]*$' "$tmp" | tail -n1)
+    if [ "$lastline" != "COMMIT;" ]; then
+      error "${name} dump invalid (last line '$lastline', not COMMIT; — empty/truncated): $(tr '\n' ' ' < "$err")"
+      rm -f "$tmp" "$err"
       any_failed=1
       continue
+    fi
+    # Reject a structurally-valid but SCHEMALESS dump — `.dump` of an empty or
+    # wrong DB (opened fresh) ends in COMMIT; with no tables. A real bridge DB
+    # always emits CREATE TABLE; its absence means we'd back up an empty DB that
+    # restore would then replay over a live bridge (the silent-loss class moved
+    # from truncation to wrong/empty-DB — Carnot's catch).
+    if ! grep -q 'CREATE TABLE' "$tmp"; then
+      error "${name} dump has no CREATE TABLE (empty/wrong DB) — refusing"
+      rm -f "$tmp" "$err"
+      any_failed=1
+      continue
+    fi
+    rm -f "$err"
+    if ! gzip -f "$tmp"; then
+      error "${name} gzip failed (disk full?)"; rm -f "$tmp" "$out"; any_failed=1; continue
     fi
     log "  ${name} → $(basename "$out") ($(du -h "$out" | cut -f1))"
   done
@@ -239,111 +398,17 @@ backup_aiko_island() {
     rm -f "$tmp" "$err"
     return 1
   fi
+  # Schemaless-dump gate (same as backup_matrix, and MORE important here): the
+  # island DB is the SOLE copy, so a `.dump` of an empty/wrong volume ending in
+  # COMMIT; with no tables must not overwrite yesterday's good backup in the repo.
+  if ! grep -q 'CREATE TABLE' "$tmp"; then
+    error "aiko-island dump has no CREATE TABLE (empty/wrong DB) — refusing"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
   rm -f "$err"
-  gzip -f "$tmp"   # -> $out (aiko-island-$DATE.sql.gz)
+  if ! gzip -f "$tmp"; then error "aiko-island gzip failed (disk full?)"; rm -f "$tmp" "$out"; return 1; fi
   log "aiko-island backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
-}
-
-# Triggers Continuwuity's online RocksDB checkpoint via the admin API
-# (`!admin server backup-database`). Each run wipes the in-volume backup
-# dir first, then triggers the admin command which writes a fresh
-# checkpoint, then tars+age-encrypts the output. RocksDB BackupEngine
-# uses hardlinks back to the live SST files so the operation is fast
-# and online — Continuwuity stays available throughout. Encryption is
-# critical: this tarball contains the homeserver signing keys
-# (irreplaceable identity).
-backup_continuwuity() {
-  log "Backing up Continuwuity..."
-
-  if ! command -v age &>/dev/null; then
-    error "age not installed; run apt-get install -y age"
-    return 1
-  fi
-  if [ ! -f "$MATRIX_ADMIN_SECRETS_FILE" ]; then
-    error "Matrix admin secrets file missing at $MATRIX_ADMIN_SECRETS_FILE"
-    return 1
-  fi
-  # Source secrets file FIRST so MATRIX_ADMIN_TOKEN and AGE_RECIPIENT are
-  # populated before the checks below.
-  # shellcheck source=/dev/null
-  . "$MATRIX_ADMIN_SECRETS_FILE"
-  if [ -z "${MATRIX_ADMIN_TOKEN:-}" ]; then
-    error "MATRIX_ADMIN_TOKEN not set in $MATRIX_ADMIN_SECRETS_FILE"
-    return 1
-  fi
-  if [ -z "${AGE_RECIPIENT:-}" ]; then
-    error "AGE_RECIPIENT not set; refusing to back up signing keys in plaintext"
-    return 1
-  fi
-
-  local backup_volume="matrix_continuwuity_backups"
-  local out="$BACKUP_DIR/continuwuity-$DATE.tar.gz.age"
-
-  # Continuwuity uses RocksDB's BackupEngine (not Checkpoint API). Each
-  # call adds an incremental backup into the same directory (meta/,
-  # private/, shared_checksum/). If left alone, the dir grows over time as
-  # incrementals accumulate — meaning each daily tarball grows too.
-  #
-  # We wipe the dir before each run so every tarball is a fresh, complete
-  # snapshot of constant size (~equal to a single full RocksDB backup,
-  # which for our scale is ~50MB encrypted). Safe because shared_checksum/
-  # only holds hardlinks back to the live data dir's SST files — deleting
-  # the hardlinks doesn't touch the live database.
-
-  # 1. Wipe previous backup contents so this run produces a clean snapshot.
-  log "  Wiping previous backup contents..."
-  docker run --rm -v "${backup_volume}:/data" alpine \
-    sh -c "rm -rf /data/* /data/.* 2>/dev/null; true" >/dev/null 2>&1 || true
-
-  # 2. Trigger the online backup via the admin room.
-  local txn; txn=$(date +%s%N)
-  local trigger_resp
-  trigger_resp=$(curl -sf -X PUT \
-    -H "Authorization: Bearer $MATRIX_ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    "$CONTINUWUITY_HOMESERVER/_matrix/client/v3/rooms/$CONTINUWUITY_ADMIN_ROOM/send/m.room.message/$txn" \
-    -d '{"msgtype":"m.text","body":"!admin server backup-database"}' 2>&1) || {
-    error "Failed to send backup-database admin command: $trigger_resp"
-    return 1
-  }
-
-  # 3. Wait for the backup to appear (meta/ subdir gets created when
-  # BackupEngine writes its first backup). 5 min cap is generous for
-  # multi-GB databases; typical completion is <10s.
-  local meta_exists=0
-  for _ in $(seq 1 60); do
-    sleep 5
-    if docker run --rm -v "${backup_volume}:/data:ro" alpine \
-         test -d /data/meta 2>/dev/null; then
-      meta_exists=1
-      break
-    fi
-  done
-  if [ "$meta_exists" -ne 1 ]; then
-    error "Continuwuity backup did not complete within 5 minutes (meta/ never appeared)"
-    return 1
-  fi
-  log "  Backup completed"
-
-  # 4. Tar the whole backups dir through age encryption. Alpine ships
-  # busybox tar (not GNU), so we avoid GNU-specific flags. The dir is
-  # static at this point (we just produced a fresh snapshot and won't
-  # call backup-database again until tomorrow), so no concurrent-write
-  # concerns.
-  if ! docker run --rm -v "${backup_volume}:/data:ro" alpine \
-       tar czf - -C /data . 2>/dev/null \
-       | age -r "$AGE_RECIPIENT" > "$out"; then
-    error "Continuwuity tar/encrypt failed"
-    rm -f "$out"
-    return 1
-  fi
-  if [ ! -s "$out" ]; then
-    error "Continuwuity encrypted tarball is empty"
-    rm -f "$out"
-    return 1
-  fi
-
-  log "Continuwuity backup complete: $(basename "$out") ($(du -h "$out" | cut -f1))"
 }
 
 # Repo size management. Continuwuity tarballs are encrypted opaque binary
@@ -413,6 +478,99 @@ prune_repo_history_if_needed() {
     error "Failed to force-push pruned history; manual intervention needed"
     return 1
   fi
+
+  # Cap archive-tag retention. List archive tags on ORIGIN (a shallow clone has no
+  # local tags), keep the newest N, delete the rest. The end-anchored grep excludes
+  # any `^{}` deref lines; sort -ru gives newest-first, unique. Failures here don't
+  # fail the (already-succeeded) prune, but they are NOT silenced: an ls-remote
+  # failure means bloat pruning silently stopped, so it's surfaced + alerted
+  # (cage-match #141 Kelvin/Carnot/Tesla: the old `2>/dev/null` + pipe-to-`tail`
+  # fail-open let bloat resume in the dark — and the `| tail` masked git's own exit,
+  # the very pipe-masks-exit class this PR exists to kill).
+  # Fail-closed on this destructive op (cage-match #141 Carnot): a non-positive-int
+  # retention (0 / empty / negative / garbage from a bad cron env) would compute
+  # `tail -n +1` and delete EVERY archive tag. Refuse it and fall back to the safe
+  # default rather than mass-deleting the PITR window.
+  local keep=${ARCHIVE_TAG_RETENTION:-7}
+  case "$keep" in ''|*[!0-9]*) error "ARCHIVE_TAG_RETENTION='$keep' not a non-negative integer — using 7"; keep=7;; esac
+  [ "$keep" -lt 1 ] && { error "ARCHIVE_TAG_RETENTION=$keep < 1 would delete ALL archive tags — using 7"; keep=7; }
+  local remote_tags
+  if ! remote_tags=$(git -C "$repo" ls-remote --tags origin 2>&1); then
+    error "archive-tag retention: ls-remote failed — bloat pruning SKIPPED this run (retries next run): $remote_tags"
+    send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag ls-remote failed; repo-bloat pruning skipped this run. Repo growth may resume until the next successful run.')" || true
+  else
+    local old_tags
+    old_tags=$(printf '%s\n' "$remote_tags" \
+      | grep -oE 'refs/tags/archive-[0-9-]+$' | sed 's#refs/tags/##' \
+      | sort -ru | tail -n +$((keep + 1)))
+    if [ -n "$old_tags" ]; then
+      local del_count; del_count=$(printf '%s\n' "$old_tags" | wc -l | tr -d ' ')
+      # Fail-closed blast-radius cap (cage-match #141 r4 Tesla): a malformed ls-remote
+      # parse must not vacuum the entire archive set in one unattended cron tick.
+      # Steady state deletes 0-1 tags; refuse an implausibly large batch and alert.
+      local del_ceiling=${ARCHIVE_TAG_DELETE_CEILING:-30}
+      # Validate the ceiling too (cage-match #141 r5 Carnot): a garbage env value
+      # would error the integer test and FALL THROUGH to deleting the full set —
+      # the same fail-open class the retention validation above closes.
+      case "$del_ceiling" in ''|*[!0-9]*) error "ARCHIVE_TAG_DELETE_CEILING='$del_ceiling' not an integer — using 30"; del_ceiling=30;; esac
+      [ "$del_ceiling" -lt 1 ] && del_ceiling=30
+      if [ "$del_count" -gt "$del_ceiling" ]; then
+        error "archive-tag retention: $del_count tags queued for delete exceeds ceiling $del_ceiling — REFUSING (possible bad ls-remote parse), no tags deleted"
+        send_telegram_alert "$(printf '<b>Backup Retention BLOCKED</b>\n%s archive tags queued for delete (ceiling %s) — refused as a likely parse error; no tags deleted.' "$del_count" "$del_ceiling")" || true
+      else
+        # Delete one tag per call via a read loop (cage-match #141 r6 Carnot): the
+        # old single unquoted `$old_tags` leaned on word-splitting — brittle if a tag
+        # name ever contained whitespace and prone to an over-long argv. A per-tag
+        # loop is boring and robust; del_count is 0-1 in steady state so the extra
+        # calls are immaterial. del_fail stays in scope via a here-string (not a pipe).
+        local del_fail=0 tag del_err last_err=""
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          # Capture stderr (cage-match #141 r7 Kelvin): a failed remote delete's WHY
+          # is diagnostic (auth revoked, protected ref, network) and must reach the
+          # log/alert, not /dev/null. Keep the last error for the alert body.
+          if ! del_err=$(git -C "$repo" push --delete origin "$tag" 2>&1); then
+            del_fail=$((del_fail + 1)); last_err="$del_err"
+            error "archive-tag retention: failed to delete '$tag': $del_err"
+          fi
+        done <<< "$old_tags"
+        if [ "$del_fail" -eq 0 ]; then
+          log "archive-tag retention: kept newest $keep, pruned $del_count old tag(s)"
+        else
+          error "archive-tag retention: $del_fail of $del_count old tags not deleted (non-fatal, retried next run)"
+          send_telegram_alert "$(printf '<b>Backup Retention Warning</b>\narchive-tag delete failed for %s of %s tags; repo-bloat pruning incomplete this run. Last error: %s' "$del_fail" "$del_count" "$last_err")" || true
+        fi
+      fi
+    fi
+  fi
+}
+
+# Publish object-store archives as release assets, then prune aged-out
+# releases. Deliberately NOT routed through backup_to_github: that function
+# copies artifacts into the git tree, which is precisely where these must
+# never go.
+backup_objects_to_releases() {
+  local artifact="$BACKUP_DIR/minio-$DATE.tar.gz"
+
+  if [ ! -s "$artifact" ]; then
+    error "Object-store artifact missing or empty ($artifact) — nothing to publish"
+    return 1
+  fi
+
+  # Fail LOUDLY on a missing token rather than skipping quietly. A silent skip
+  # is how the object store went unbacked for the project's entire history in
+  # the first place; an absent credential must look like a failure, not like
+  # a successful run that happened to do less.
+  if ! release_auth_available; then
+    error "No GitHub release token (expected GH_TOKEN or /etc/imagineering-secrets/github-release.env) — object store NOT backed up"
+    return 1
+  fi
+
+  release_publish_asset "$GITHUB_BACKUP_SLUG" "objects-$DATE" "$artifact" || return 1
+  # Retention failures are non-fatal: the day's backup already landed, and
+  # storage growth is a slower problem than a missing backup. The prune
+  # surfaces and alerts on its own.
+  release_prune "$GITHUB_BACKUP_SLUG" "objects-" "$OBJECT_RELEASE_RETENTION"
 }
 
 backup_to_github() {
@@ -536,20 +694,32 @@ case $SERVICE in
         FAILED_SERVICES+=("$matrix_svc")
       fi
     done
-    # Continuwuity is a single encrypted tarball. Don't run if matrix
-    # bridges failed catastrophically — we'd be wasting time on a single
-    # service in a broader-outage situation. But individual matrix-bridge
-    # failures are fine; continuwuity is independent of bridge state.
-    if backup_continuwuity; then
-      SUCCEEDED+=("continuwuity")
-    else
-      error "continuwuity backup failed"
-      FAILED_SERVICES+=("continuwuity")
-    fi
+    # Continuwuity DB is deliberately NOT backed up (decision 2026-08-02). The only
+    # irreplaceable thing in it is the ~85-byte federation SIGNING KEY, which is
+    # IMMUTABLE — exported ONCE to a durable store (password manager), not re-copied.
+    # Everything else in the 136MB DB is a re-derivable mirror: message history lives
+    # in the bridged apps, room state re-federates, media is disposable cache. So a
+    # daily 100MB encrypted blob (the sole driver of backup-repo bloat, #32) bought
+    # only a no-re-login convenience restore. DR is now: fresh homeserver + re-inject
+    # the saved signing key + re-bridge. The backup_continuwuity + restore_continuwuity
+    # functions were removed as dead code; see git history if ever needed again.
     if [ ${#SUCCEEDED[@]} -gt 0 ]; then
       backup_to_github "${SUCCEEDED[@]}" || FAILED_SERVICES+=("github-upload")
     fi
+    # Object store goes to RELEASE ASSETS, not the tree — so it is handled
+    # after backup_to_github and is deliberately absent from SUCCEEDED (which
+    # is that function's copy-into-git list). Tracked in FAILED_SERVICES the
+    # same way, so a failure reaches the nightly alert.
+    if backup_minio; then
+      backup_objects_to_releases || FAILED_SERVICES+=("minio-release")
+    else
+      error "minio backup failed"
+      FAILED_SERVICES+=("minio")
+    fi
     cleanup_old_backups
+    ;;
+  minio)
+    backup_minio && backup_objects_to_releases || FAILED_SERVICES+=(minio)
     ;;
   kanbn)
     backup_kanbn && backup_to_github kanbn || FAILED_SERVICES+=(kanbn)
@@ -578,20 +748,24 @@ case $SERVICE in
       FAILED_SERVICES+=(matrix)
     fi
     ;;
-  continuwuity)
-    backup_continuwuity && backup_to_github continuwuity || FAILED_SERVICES+=(continuwuity)
-    ;;
   cleanup)
     cleanup_old_backups
     ;;
   *)
-    echo "Usage: $0 [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|continuwuity|cleanup]"
+    echo "Usage: $0 [all|kanbn|outline|radicale|pm-bot|claudius|aiko-island|matrix|cleanup]"
     exit 1
     ;;
 esac
 
 if [ ${#FAILED_SERVICES[@]} -gt 0 ]; then
   error "Backups failed for: ${FAILED_SERVICES[*]}"
+  # ALERT, don't just log. Repo-size and retention warnings already page via
+  # Telegram, but a total backup failure did not — so outline and kanbn failed
+  # every night for 40 nights into a log file nobody read, while the live
+  # outline DB had 93 documents and its backup had 0 bytes. Instrumenting the
+  # cheap annoyance and not the unrecoverable one is the wrong way round.
+  send_telegram_alert "$(printf '<b>Backup FAILED</b>\nServices: %s\nHost: %s\nSee /home/nick/logs/backup.log' \
+    "${FAILED_SERVICES[*]}" "$(hostname)")" || true
   exit 1
 fi
 

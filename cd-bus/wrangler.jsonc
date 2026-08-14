@@ -1,7 +1,6 @@
 {
   // CD Bus relay — fans out image.published events from CI to OCI-host
-  // subscribers over SSE. See cd-bus/README.md and the design doc:
-  // https://outline.imagineering.cc/doc/the-imagineering-deploy-bus-qz9QscpP6Q
+  // subscribers over SSE. See cd-bus/README.md and cd-bus/DESIGN.md.
   "name": "cd-bus",
   // The imagineering Cloudflare account (Nick's token can see >1 account, so
   // pin it explicitly — otherwise `wrangler deploy` fails in non-interactive

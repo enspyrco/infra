@@ -6,7 +6,7 @@ units + shared scripts** so any GHCR-built service gets push+poll CD by adding
 an env file and enabling three units. The relay itself lives one level up in
 [`../`](../README.md); this directory is the *subscriber* side.
 
-> Full design + rationale: [The Imagineering Deploy Bus](https://outline.imagineering.cc/doc/the-imagineering-deploy-bus-qz9QscpP6Q)
+> Full design + rationale: [../DESIGN.md](../DESIGN.md)
 
 ## How it works (per service `%i`)
 
