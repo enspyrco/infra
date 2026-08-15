@@ -12,20 +12,25 @@
 #   witness that closes that hole.
 #
 # ─── System-shape assumptions ──────────────────────────────────────────────
-#   1. Melbourne (nick-mel, 130.162.192.233) is always-on, and its cron is
+#   1. Melbourne (nick-mel, 158.179.17.233) is always-on, and its cron is
 #      healthy. (It already runs oci-instance-watch-melbourne.sh on the same
 #      box; if Melbourne itself dies, Sydney's oci-instance-watch.sh catches
 #      Melbourne — mutual peer monitoring. So neither box is its own witness.)
 #   2. Melbourne can SSH to Sydney as `ubuntu` (the same key the deploy/peer
 #      tooling already uses — Mel→Syd reachability is a standing assumption of
 #      the peer-watcher fleet).
-#   3. Melbourne holds a Telegram bot token DIRECTLY (via
-#      /etc/imagineering-secrets/telegram.env, loaded by lib/telegram.sh).
-#      This is the crux: the canary must NOT route its alert through the very
-#      Sydney notify service it is checking. It talks to api.telegram.org
-#      itself. Spreading the bot token is normally an anti-pattern (that's
-#      WHY notify exists) — but the one client that may not depend on notify
-#      is the client that watches notify. This is the documented exception.
+#   3. Melbourne holds a Telegram bot token DIRECTLY, in its own dedicated
+#      envfile /etc/imagineering-secrets/canary-telegram.env (CANARY_TG_TOKEN
+#      + CANARY_TG_CHAT). This is the crux: the canary must NOT route its alert
+#      through the very Sydney notify service it is checking. It POSTs to
+#      api.telegram.org itself, with its OWN inlined sender (below) — it does
+#      NOT use lib/telegram.sh, whose send_telegram_alert() was rerouted through
+#      the notify proxy in #74 (i.e. THROUGH the thing this canary watches). The
+#      token name is deliberately CANARY_TG_* — never NOTIFY_* — so the two
+#      credential paths can't be silently conflated. Spreading the bot token is
+#      normally an anti-pattern (that's WHY notify exists) — but the one client
+#      that may not depend on notify is the client that watches notify. This is
+#      the documented exception.
 #
 # ─── The probe (why three layers, not one TCP check) ───────────────────────
 #   A bare "is :8090 open?" or even a GET /health proves only that the HTTP
@@ -69,22 +74,27 @@ WATCHER_NAME="notify-canary-melbourne"
 CRON_TAG="notify-canary-melbourne"
 
 # ── Source the base lib for log()/run_watcher()/state plumbing ─────────────
-# NOTE: we deliberately do NOT use the lib's tg() helper — tg() POSTs through
-# notify.imagineering.cc, i.e. through the very Sydney service we're checking.
-# Our alert path is send_telegram_alert() from lib/telegram.sh, which hits
-# api.telegram.org directly with a bot token held on Melbourne.
+# NOTE: we use ONLY the state-machine plumbing (log/run_watcher/state), never
+# the lib's tg() helper — tg() POSTs through notify.imagineering.cc, i.e.
+# through the very Sydney service we're checking. This canary is deliberately
+# NOT wired to lib/telegram.sh either: its send_telegram_alert() was rerouted
+# through the notify proxy in #74, so it would post our "notify is down" alarm
+# to the corpse. Our alert path is the inlined DIRECT sender below.
 __lib="$(dirname "$0")/lib/watcher-base.sh"
 [[ -r "$__lib" ]] || __lib="$HOME/lib/watcher-base.sh"
 # shellcheck disable=SC1090
 source "$__lib"
 unset __lib
 
-# ── Source the DIRECT Telegram helper (independent alert path) ─────────────
-__tg="$(dirname "$0")/lib/telegram.sh"
-[[ -r "$__tg" ]] || __tg="$HOME/lib/telegram.sh"
+# ── Independent Telegram credentials (dedicated envfile, NEVER notify's) ────
+# CANARY_TG_TOKEN + CANARY_TG_CHAT are held on Melbourne in a file distinct
+# from any NOTIFY_* creds, so the two paths cannot be conflated. Absent creds
+# make the canary INERT (it logs and sends nothing) — it never falls back to
+# notify, because a fallback would silently defeat the independence it exists
+# to provide.
+CANARY_TG_ENV="${CANARY_TG_ENV:-/etc/imagineering-secrets/canary-telegram.env}"
 # shellcheck disable=SC1090
-source "$__tg"
-unset __tg
+[[ -r "$CANARY_TG_ENV" ]] && { set -a; . "$CANARY_TG_ENV"; set +a; }
 
 # ── Config (override via env if needed) ────────────────────────────────────
 SYDNEY_SSH="${SYDNEY_SSH:-149.118.69.221}"      # Sydney public IP
@@ -97,20 +107,53 @@ SSH_TIMEOUT="${SSH_TIMEOUT:-20}"                # seconds for the whole probe
 # debounce (one 🚨 per failure-episode) and to know when to fire the ✅.
 ALERT_SENTINEL="$CONFIG_DIR/$WATCHER_NAME.alerted"
 
-# ── alert <html-message> : INDEPENDENT path, never via notify ──────────────
+# ── Inlined escapers (self-contained — no shared lib whose contract can drift).
+# HTML for parse_mode=HTML; JSON for embedding in the sendMessage body.
+_html_escape() {
+    local s=${1:-}
+    s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+_json_escape() {
+    local s=${1:-}
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+    printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+
+# ── alert <html-message> : INDEPENDENT path, DIRECT to api.telegram.org ─────
 # DRY_RUN=1 logs instead of sending (smoke-testing without Telegram noise).
-# We re-implement the DRY_RUN gate here rather than calling tg(), because
-# tg() is the notify-routed path we must avoid even in production.
+# POSTs sendMessage straight to Telegram with Melbourne's own bot token — it
+# does NOT traverse notify, so it can still fire when notify is the thing that
+# died. Fail-closed: missing creds → log + send nothing, NEVER a notify fallback.
 alert() {
     local msg="$1"
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
         log "alert [DRY_RUN]: ${msg//$'\n'/ }"
         return 0
     fi
-    # send_telegram_alert is a silent no-op if the bot token is unset (e.g.
-    # creds not yet installed on Melbourne); it logs to stderr in that case.
-    send_telegram_alert "$msg"
-    log "alert: dispatched via direct Telegram API (independent of Sydney notify)"
+    if [[ -z "${CANARY_TG_TOKEN:-}" || -z "${CANARY_TG_CHAT:-}" ]]; then
+        log "alert: CANARY_TG_TOKEN/CANARY_TG_CHAT unset ($CANARY_TG_ENV) — canary INERT; refusing to fall back to notify (would defeat independence)"
+        return 0
+    fi
+    # Token is unavoidably in the URL path (Telegram Bot API has no header auth),
+    # so it appears in this short-lived curl's argv. Acceptable on a single-tenant
+    # box; the alternative (route via notify to keep it out of argv) is the exact
+    # coupling this canary must not have.
+    local payload out rc=0
+    payload=$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' \
+        "$CANARY_TG_CHAT" "$(_json_escape "$msg")")
+    out=$(curl -sS --max-time 10 \
+        "https://api.telegram.org/bot${CANARY_TG_TOKEN}/sendMessage" \
+        -H 'Content-Type: application/json' -d "$payload" 2>&1) || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        log "alert: DIRECT Telegram curl failed (rc=$rc): $out"
+        return 0
+    fi
+    case "$out" in
+        *'"ok":true'*) log "alert: dispatched DIRECT to api.telegram.org (independent of Sydney notify)" ;;
+        *) log "alert: Telegram rejected the direct send: $out" ;;
+    esac
 }
 
 # ── probe : runs the 3-layer check over ONE ssh hop. ───────────────────────
@@ -237,7 +280,7 @@ _fire_failure() {
         log "failure persists ($reason); already alerted this episode — debounced"
         return 0
     fi
-    esc=$(telegram_html_escape "$reason")
+    esc=$(_html_escape "$reason")
     alert "$(printf '🚨 <b>Sydney notify chain CANNOT DELIVER</b> (Melbourne canary)
 
 Probe result: <code>%s</code>
