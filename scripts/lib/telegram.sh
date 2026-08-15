@@ -1,6 +1,11 @@
 #!/bin/bash
 # Shared alert helper, sourced by infra cron scripts.
 #
+# Requires: bash (arrays, ${var//pat} pattern substitution, and process
+# substitution `-H @<(...)`). This lib is sourced, so it runs in the CALLER's
+# shell, not under this shebang — a #!/bin/sh consumer will fail at send-time,
+# not at source-time. Source it only from a bash script.
+#
 # Provides:
 #   telegram_html_escape <string>      -> echoes input with &, <, > escaped for HTML mode
 #   send_telegram_alert <html_message> -> POST to the notify proxy with parse_mode=HTML
@@ -106,8 +111,9 @@ send_telegram_alert() {
   # rather than argv, so the API key never appears in `ps` output or
   # /proc/*/cmdline while the send is in flight. The payload stays in
   # argv — alert text is operational, not secret.
+  # Append the HTTP status as a trailing line (-w) so we can gate on it too.
   local curl_out curl_rc
-  curl_out=$(curl -sS --max-time 10 -X POST "$NOTIFY_URL/send" \
+  curl_out=$(curl -sS --max-time 10 -w '\n%{http_code}' -X POST "$NOTIFY_URL/send" \
     -H @<(printf 'Authorization: Bearer %s\n' "$NOTIFY_API_KEY") \
     -H "Content-Type: application/json" \
     -d "$payload" 2>&1) || curl_rc=$?
@@ -116,17 +122,27 @@ send_telegram_alert() {
     echo "send_telegram_alert: curl failed (rc=$curl_rc): $curl_out" >&2
     return 0  # don't propagate — caller is in an alert path already
   fi
-  # curl exits 0 for an HTTP 4xx/5xx too (it got *a* response), so a
-  # rejection — bad API key, or a Telegram-side refusal relayed by notify —
-  # comes back with rc=0 and would otherwise pass silently. That is the
-  # exact silent-drop failure mode this alert path exists to avoid, so
-  # inspect the response body. notify relays Telegram's response verbatim
-  # on success, and Python's json.dumps puts a space after the colon, so
-  # match both spellings. (Plain glob, no jq dependency.)
-  case "$curl_out" in
-    *'"ok": true'* | *'"ok":true'*) : ;;  # delivered to Telegram
+  # Split the trailing %{http_code} line from the response body.
+  local http_code body
+  http_code=${curl_out##*$'\n'}
+  body=${curl_out%$'\n'*}
+  # curl exits 0 for an HTTP 4xx/5xx too (it got *a* response), so a rejection
+  # would otherwise pass silently — the exact silent-drop this alert path exists
+  # to avoid. A bare `"ok":true` glob is NOT enough: notify's own /health
+  # returns a static {"ok": true} WITHOUT touching Telegram, so a mis-aimed
+  # NOTIFY_URL (or a wrapped {"ok":true,"telegram":{"ok":false}}) could pass.
+  # Require BOTH a 200 AND a real delivery receipt — Telegram's relayed
+  # `message_id`, which only a genuine sendMessage carries. Matching the
+  # colon-terminated key alone is enough: the value (and json.dumps' space
+  # after the colon) is absorbed by the trailing glob. (Plain glob, no jq dep.)
+  if [ "$http_code" != "200" ]; then
+    echo "send_telegram_alert: notify returned HTTP $http_code (not 200): $body" >&2
+    return 0  # don't propagate — caller is already in an alert path
+  fi
+  case "$body" in
+    *'"message_id":'*) : ;;  # real Telegram delivery receipt
     *)
-      echo "send_telegram_alert: notify rejected the message (rc=0): $curl_out" >&2
+      echo "send_telegram_alert: no delivery receipt (message_id) in response — silent drop or /health hit? : $body" >&2
       return 0  # still don't propagate — caller is already in an alert path
       ;;
   esac
