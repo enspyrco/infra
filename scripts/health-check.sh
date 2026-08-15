@@ -1,9 +1,9 @@
 #!/bin/bash
 # Server health check - sends Telegram alerts when thresholds are exceeded.
-# Runs hourly via cron. Telegram credentials are loaded from
-# /etc/imagineering-secrets/telegram.env by the shared helper below — they are
-# no longer inlined into the cron entry (avoids leaking the bot token in a
-# world-readable /etc/cron.d/ file).
+# Runs hourly via cron. The notify proxy key (NOTIFY_API_KEY) is loaded from
+# /etc/imagineering-secrets/notify.env by the shared helper below — it is not
+# inlined into the cron entry (avoids leaking the key in a world-readable
+# /etc/cron.d/ file). Alerts route through notify, not a directly-held bot token.
 
 # Source shared Telegram helper (defines send_telegram_alert + loads creds).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -101,7 +101,11 @@ ${tags}"
 
     send_telegram_alert "$message"
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Alert sent: ${#issues[@]} issue(s)"
+    # send_telegram_alert always returns 0 (it never aborts an alert path), so
+    # this line records DISPATCH, not delivery. The actual delivery result —
+    # HTTP status + whether a message_id receipt came back — is logged to
+    # stderr by send_telegram_alert itself, and lands in this cron's log.
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Alert dispatched to notify: ${#issues[@]} issue(s) (see stderr above for delivery result)"
 else
     echo "$(date '+%Y-%m-%d %H:%M:%S') OK - all checks passed"
 fi
