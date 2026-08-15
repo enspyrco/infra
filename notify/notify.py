@@ -6,7 +6,13 @@ scheduled agents (claude.ai routines, GitHub Actions, etc.) can send Nick a
 Telegram message via a single curl call without holding the bot token themselves.
 
 Endpoints:
-  GET  /health                  -> 200 {"ok": true}
+  GET  /health                  -> 200 {"ok": true}  (unauthed liveness)
+  GET  /heartbeat               -> 200 {"last_delivery_ok": <epoch>, "age_seconds": N}
+       Header: Authorization: Bearer <NOTIFY_API_KEY>
+       The dead-man's-switch feed: `last_delivery_ok` is the epoch of the most
+       recent send that Telegram actually accepted (a real delivery). An outside
+       witness (the Melbourne canary) polls this; a stale age means Sydney's
+       alert chain can no longer deliver even though the box may be alive.
   POST /send                    -> forwards to Telegram sendMessage
        Header: Authorization: Bearer <NOTIFY_API_KEY>
        Body:   {"message": "...", "parse_mode": "HTML"|"MarkdownV2"|null,
@@ -28,6 +34,7 @@ import json
 import os
 import secrets
 import sys
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -50,6 +57,12 @@ BOTS = {
     "infra": (INFRA_BOT_TOKEN, INFRA_CHAT_ID),
 }
 
+# Dead-man's-switch state: epoch of the last send Telegram actually accepted.
+# Initialised to process start (optimistic — assume the chain works at boot; a
+# broken chain shows up when the next pulse fails to refresh this within the
+# witness's staleness threshold). Updated on every successful /send.
+last_delivery_ok = time.time()
+
 
 class NotifyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -63,15 +76,28 @@ class NotifyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_b)
 
+    def _authed(self):
+        auth = self.headers.get("Authorization", "")
+        return auth.startswith("Bearer ") and secrets.compare_digest(
+            auth.removeprefix("Bearer "), API_KEY)
+
     def do_GET(self):
         if self.path == "/health":
             self._reply(200, {"ok": True})
+        elif self.path == "/heartbeat":
+            # Authed: exposes the alert cadence, so keep it off the public web.
+            if not self._authed():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            self._reply(200, {
+                "last_delivery_ok": int(last_delivery_ok),
+                "age_seconds": int(time.time() - last_delivery_ok),
+            })
         else:
             self._reply(404, {"error": "not found"})
 
     def do_POST(self):
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or not secrets.compare_digest(auth.removeprefix("Bearer "), API_KEY):
+        if not self._authed():
             self._reply(401, {"error": "unauthorized"})
             return
         if self.path != "/send":
@@ -119,6 +145,10 @@ class NotifyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._reply(502, {"error": f"telegram api error: {e}"})
             return
+        if tg_body.get("ok"):
+            # A real delivery — refresh the dead-man's-switch timestamp.
+            global last_delivery_ok
+            last_delivery_ok = time.time()
         self._reply(200 if tg_body.get("ok") else 502, tg_body)
 
 
