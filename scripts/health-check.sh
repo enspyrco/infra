@@ -60,7 +60,7 @@ fi
 # one-shot jobs. (Without the skip the repo version alert-spams hourly;
 # the previously-deployed host copy had drifted and silently ignored
 # these containers.)
-ONESHOT_HELPERS_RE='^(img-)?(kanbn-migrate|outline[-_]minio_setup)$'
+ONESHOT_HELPERS_RE='^(imagineering|xdeca|img)-(kanbn-migrate|outline-minio-setup)$'
 while read -r name status; do
     if [[ "$status" == "Exited (0)"* ]] && [[ "$name" =~ $ONESHOT_HELPERS_RE ]]; then
         continue
