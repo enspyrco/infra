@@ -29,6 +29,11 @@ AGE_IDENTITY_FILE="${AGE_IDENTITY_FILE:-${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
+# Completion-marker guard — the SAME window backup.sh writes against. These two
+# must never diverge: a wider window on the write side than the read side stores
+# dumps that restore then rejects as "truncated" mid-disaster.
+# shellcheck source=lib/pg-dump-guard.sh
+. "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 
 # Usage check + dispatch are deferred to the guarded tail so the test harness
 # can source this file (RESTORE_LIB_ONLY=1) without triggering the arg check.
@@ -56,7 +61,7 @@ _validate_pg_dump() {
   if [ ! -s "$f" ]; then
     error "$svc: dump $(basename "$f") is empty — refusing (live DB untouched)"; return 1
   fi
-  if ! tail -n5 "$f" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  if ! pg_dump_is_complete "$f"; then
     error "$svc: dump incomplete (no completion marker — truncated) — refusing (live DB untouched)"; return 1
   fi
   if ! grep -q 'CREATE TABLE' "$f"; then

@@ -64,6 +64,32 @@ for ((i = 0; i < 60; i++)); do echo "row $i"; done >> "$TMP/sneaky.sql"
 pg_dump_is_complete "$TMP/sneaky.sql" && no "rejects marker-as-substring far from EOF" \
                                       || ok "rejects marker-as-substring far from EOF"
 
+echo "== WRITE/READ SYMMETRY: restore accepts everything backup stores =="
+# The guard has a third call site: restore.sh's _validate_pg_dump. It was left
+# on the old inline `tail -n5` when backup.sh's two sites moved to this lib —
+# which is strictly WORSE than the original bug, because a wider window on the
+# write side than the read side manufactures a band of dumps that back up fine
+# and are then refused at restore time, mid-disaster, with the error text
+# "truncated". The windows must be the same window, not merely similar numbers.
+sym=0
+for n in 1 2 5 10 20; do
+  # Subshell: restore.sh runs under `set -e`, which must not leak into the harness.
+  if ( set +e; RESTORE_LIB_ONLY=1 . "$SCRIPT_DIR/restore.sh" >/dev/null 2>&1
+       _validate_pg_dump test "$TMP/t$n.sql" >/dev/null 2>&1 ); then
+    sym=$((sym + 1))
+  fi
+done
+[ "$sym" -eq 5 ] && ok "restore.sh validates all 5 dumps backup.sh would store" \
+                 || no "restore.sh accepted only $sym/5 dumps backup.sh would store"
+
+echo "== the CLASS is closed: no inline tail -n5 marker guard survives =="
+# Corpus assertion, not a spot fix — this is the check that fails if a fourth
+# copy of the guard is ever pasted in rather than sourced from the lib.
+strays=$(grep -rln -- "tail -n *5 .*PostgreSQL database dump complete" "$SCRIPT_DIR" \
+         --include="*.sh" 2>/dev/null | grep -v 'test-pg-dump-guard.sh' || true)
+[ -z "$strays" ] && ok "no inline copies outside this test's deliberate oldguard()" \
+                 || no "inline tail -n5 guard still present in: $strays"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]
