@@ -119,6 +119,24 @@ jobs:
       - name: Run resolve-container tests
         run: ./scripts/test-resolve-container.sh
 
+      - name: Run release-assets tests
+        run: ./scripts/test-release-assets.sh
+
+      # Guards the pg_dump completion-marker check. The old inline `tail -n5`
+      # passed by exactly one line on pg_dump 15.17; one more trailer would have
+      # failed EVERY postgres backup and deleted the dump. The guard is now
+      # structural (footer shape, no line count) — the suite pins the real
+      # fixture shape, the footer-forgery class, and write/read symmetry.
+      # The guard is awk-based, and the production box's /usr/bin/awk is mawk.
+      # Installed explicitly so the suite's dialect sweep actually has something
+      # to sweep — an absent alternate awk would skip silently, and a skipped
+      # check reads exactly like a passing one.
+      - name: Install alternate awk dialects (mawk = the box's awk)
+        run: sudo apt-get install -y --no-install-recommends mawk gawk
+
+      - name: Run pg-dump-guard tests
+        run: ./scripts/test-pg-dump-guard.sh
+
   caddy-validate:
     name: Caddyfile Validate
     runs-on: ubuntu-latest
