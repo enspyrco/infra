@@ -114,8 +114,8 @@ backup_kanbn() {
     error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  # Completion-marker guard — see lib/pg-dump-guard.sh for why the tail window
-  # is sized the way it is (the marker sits 5 lines from EOF on pg_dump 15.17).
+  # Completion-marker guard — structural, NOT a tail window. See
+  # lib/pg-dump-guard.sh for why a line count was the wrong instrument.
   if ! pg_dump_is_complete "$tmp"; then
     error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1

@@ -77,6 +77,44 @@ echo "== forgery mid-COPY, with body continuing after it, is also rejected =="
 pg_dump_is_complete "$TMP/forge2.sql" && no "rejects marker mid-COPY with body after" \
                                       || ok "rejects marker mid-COPY with body after"
 
+echo "== an UNKNOWN psql meta-command trailer is accepted (no frozen token list) =="
+# The r2 finding that reframed the guard a second time: allowing only
+# \restrict/\unrestrict would freeze the tokens that exist TODAY, which is the
+# exact mistake `tail -n5` made with the line count — \unrestrict itself did not
+# exist before pg_dump 15.17. These fixtures stand in for whatever the next
+# Postgres release appends. If any of them fails, the guard has a token cliff
+# and a future release will delete every postgres backup.
+i=0
+for meta in '\set FOO bar' '\encoding UTF8' '\if false' '\unrestrict2 tok' '\somethingnobodyhasinventedyet x'; do
+  i=$((i + 1))
+  make_dump "$TMP/meta$i.sql" 1
+  printf '%s\n\n' "$meta" >> "$TMP/meta$i.sql"
+  if pg_dump_is_complete "$TMP/meta$i.sql"; then ok "accepts unknown trailer: $meta"
+  else no "accepts unknown trailer: $meta"; fi
+done
+
+echo "== a COPY block AFTER the marker is junk, not skippable data =="
+# Rule-order leak (cage-match #157 r2, Carnot): awk tries rules in source order,
+# so without the `!seen` guard a post-marker COPY header would set incopy and
+# have its rows skipped instead of counted as junk — a concatenated or
+# partially-overwritten file would pass as complete.
+make_dump "$TMP/copy-after.sql" 1
+{ echo "COPY t (body) FROM stdin;"; echo "surprise data"; echo "\\."; } >> "$TMP/copy-after.sql"
+pg_dump_is_complete "$TMP/copy-after.sql" && no "rejects a COPY block after the footer" \
+                                          || ok "rejects a COPY block after the footer"
+
+echo "== a COPY header with a WITH clause / uppercase STDIN still latches =="
+# Fail-OPEN direction (cage-match #157 r2, Tesla): if the COPY header is not
+# recognised, its rows are judged as top-level lines and the forgery aperture
+# reopens. The matcher is deliberately looser than what pg_dump emits today.
+for hdr in 'COPY d (body) FROM STDIN;' 'COPY d (body) FROM stdin WITH (FORMAT text);'; do
+  { echo "-- PostgreSQL database dump"; echo "CREATE TABLE d (body text);"
+    echo "$hdr"; echo "an ordinary row"
+    echo "-- PostgreSQL database dump complete"; } > "$TMP/hdr.sql"
+  pg_dump_is_complete "$TMP/hdr.sql" && no "rejects forgery under header: $hdr" \
+                                     || ok "rejects forgery under header: $hdr"
+done
+
 echo "== non-footer content AFTER a genuine marker is rejected =="
 # Truncation is not the only corruption: a concatenation accident or a partially
 # overwritten file leaves real SQL past the footer. That is not a complete dump.
@@ -149,6 +187,34 @@ knob=$(grep -rn --include="*.sh" -- "PG_DUMP_TAIL_WINDOW" "$SCRIPT_DIR" 2>/dev/n
        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
 [ -z "$knob" ] && ok "the PG_DUMP_TAIL_WINDOW env knob stays deleted" \
                || no "PG_DUMP_TAIL_WINDOW reintroduced: $knob"
+
+echo "== the guard behaves identically across awk dialects =="
+# This check exists because the guard moved completeness off `tail` + `grep -F`
+# (byte-identical everywhere) onto awk, so the awk DIALECT is now part of the
+# contract (cage-match #157 r2, Tesla). The production box is Ubuntu, whose
+# /usr/bin/awk is mawk; CI is ubuntu-latest; a developer's mac is BSD awk. A
+# construct that silently behaves differently on one of them means every dump
+# reads as junk and the caller deletes it.
+# Re-runs THIS ENTIRE FILE with each available awk shadowed onto PATH. The child
+# sets PG_GUARD_DIALECT_CHILD so it skips this section rather than recursing.
+if [ -z "${PG_GUARD_DIALECT_CHILD:-}" ]; then
+  swept=0
+  for a in mawk gawk busybox; do
+    command -v "$a" >/dev/null 2>&1 || continue
+    d=$(mktemp -d)
+    if [ "$a" = busybox ]; then printf '#!/bin/sh\nexec busybox awk "$@"\n' > "$d/awk"; chmod +x "$d/awk"
+    else ln -sf "$(command -v "$a")" "$d/awk"; fi
+    if PG_GUARD_DIALECT_CHILD=1 PATH="$d:$PATH" bash "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+      ok "full suite passes under $a"; swept=$((swept + 1))
+    else
+      no "full suite FAILS under $a — the guard depends on an awk extension"
+    fi
+    rm -rf "$d"
+  done
+  # Silence must not read as success: if no alternate awk was installed, say so
+  # rather than letting an unswept run look like a clean sweep.
+  [ "$swept" -gt 0 ] || printf '  \033[1;33m--\033[0m no alternate awk installed (mawk/gawk/busybox) — dialect sweep did NOT run\n'
+fi
 
 echo
 echo "passed: $PASS   failed: $FAIL"

@@ -29,9 +29,10 @@ AGE_IDENTITY_FILE="${AGE_IDENTITY_FILE:-${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
-# Completion-marker guard — the SAME window backup.sh writes against. These two
-# must never diverge: a wider window on the write side than the read side stores
-# dumps that restore then rejects as "truncated" mid-disaster.
+# Completion-marker guard — the SAME check backup.sh writes against (structural,
+# not a tail window). These two must never diverge: a laxer test on the write
+# side than the read side stores dumps that restore then rejects as "truncated"
+# mid-disaster. test-pg-dump-guard.sh asserts the symmetry.
 # shellcheck source=lib/pg-dump-guard.sh
 . "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 

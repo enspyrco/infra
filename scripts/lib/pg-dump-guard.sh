@@ -29,13 +29,18 @@
 #
 # So the window is gone. We assert the PROPERTY instead: the marker exists
 # OUTSIDE any COPY data block, and every line after it is footer-shaped (blank,
-# a `--` comment, or a `\restrict`/`\unrestrict` psql meta-command). That is
-# strictly stronger than "near the end" — it does not care about distance at
-# all — and it removes the tension the window created:
+# a `--` comment, or ANY `\<letter>` psql meta-command). That is strictly
+# stronger than "near the end" — it does not care about distance at all — and it
+# removes the tension the window created:
 #
-#   - Trailer growth is now free. A future pg_dump can append any number of
-#     comment/meta lines and the guard keeps passing. There is no cliff left to
-#     fall off, so there is no number to re-tune on the box.
+#   - Trailer growth is free in BOTH dimensions: any number of trailer lines,
+#     and any psql meta-command, known or not. The meta test is deliberately
+#     `\` + a letter rather than a list of `\restrict`/`\unrestrict`, because a
+#     list would re-commit the original sin one level up — `\unrestrict` is
+#     itself a trailer that did not exist before 15.17, and freezing the tokens
+#     we happen to have observed is a line count wearing a grammar's clothes
+#     (cage-match #157 r2, Tesla). There is no cliff left, so there is no
+#     number and no token list to re-tune on the box.
 #   - Body text can no longer forge the footer. A marker-shaped row inside a
 #     COPY block is never counted, and real dump body after a marker is not
 #     footer-shaped, so it fails.
@@ -48,12 +53,15 @@
 #   - There is no pipeline, so the `grep -q` early-exit SIGPIPE trap under a
 #     caller's `set -o pipefail` cannot fire here.
 #
-# RESIDUAL, stated honestly: a dump truncated at the exact byte after a
-# marker-shaped line that sits OUTSIDE a COPY block (e.g. inside a multi-line
-# string literal in an `--inserts` dump, with nothing but blank/comment lines
-# following) still passes. Our backups are plain `pg_dump <db>` (COPY format),
-# where that row is inside a COPY block and therefore ignored. This is a much
-# narrower aperture than any tail window, not a closed one.
+# RESIDUAL, stated honestly: the COPY filter only covers COPY data. A
+# marker-shaped line can sit outside any COPY block — inside a dollar-quoted
+# function body (`CREATE FUNCTION ... $$ ... $$`), or inside a multi-line string
+# literal under `--inserts` — and if the dump is truncated right after it, with
+# nothing but blank/comment/meta lines following, it passes. Note this reaches
+# the DEFAULT `pg_dump <db>` path via dollar-quoting; it is NOT confined to
+# `--inserts` (cage-match #157 r2, Tesla). Closing it needs real dollar-quote
+# state tracking. This is a much narrower aperture than any tail window, and it
+# is not a closed one.
 PG_DUMP_COMPLETION_MARKER='-- PostgreSQL database dump complete'
 
 # pg_dump_is_complete <file>
@@ -68,13 +76,33 @@ pg_dump_is_complete() {
   awk -v marker="$PG_DUMP_COMPLETION_MARKER" '
     # COPY data blocks are user content — a row inside one is never a footer
     # marker, however exactly it matches. The block ends at the lone "\." line.
-    /^COPY .* FROM stdin;$/ { incopy = 1; next }
-    incopy && $0 == "\\."   { incopy = 0; next }
-    incopy                  { next }
-    $0 == marker            { seen = 1; junk = 0; next }
+    #
+    # `!seen` is load-bearing, not decoration: awk tries rules in source order,
+    # so without it a COPY block appearing AFTER the marker would match here,
+    # set incopy, and have its data skipped instead of counted as junk (a
+    # concatenated or partially-overwritten file). Gating on !seen makes the
+    # post-marker rule below the only one that can see those lines.
+    #
+    # The header match is deliberately loose: `toupper` covers FROM STDIN case
+    # variation, and matching a substring rather than anchoring at `stdin;$`
+    # survives a `WITH (...)` suffix. A COPY header we fail to recognise fails
+    # OPEN (its rows would be judged as top-level lines), so this test is kept
+    # wider than the shape pg_dump emits today.
+    !seen && /^COPY / && toupper($0) ~ / FROM STDIN/ { incopy = 1; next }
+    incopy && $0 == "\\." { incopy = 0; next }
+    incopy                { next }
+    $0 == marker          { seen = 1; junk = 0; next }
     seen {
-      # Footer shape: blank, a "--" comment, or a psql \restrict/\unrestrict.
-      if ($0 == "" || $0 ~ /^--/ || $0 ~ /^\\(un)?restrict([[:space:]]|$)/) next
+      # Footer shape: blank, a "--" comment, or ANY psql meta-command.
+      #
+      # The meta-command test is `\` + a letter, NOT a list of the commands that
+      # exist today. Listing them would repeat the mistake this file exists to
+      # fix: `\unrestrict` did not exist before pg_dump 15.17, and it is exactly
+      # what broke the 5-line window. A grammar frozen to the tokens currently
+      # observed is a line count in another costume — the next new trailer
+      # command would set junk, fail every backup, and the caller would delete
+      # the dump. Anything starting `\<letter>` is psql plumbing, not dump body.
+      if ($0 == "" || $0 ~ /^--/ || $0 ~ /^\\[a-zA-Z]/) next
       junk = 1
     }
     END { exit (seen && !junk) ? 0 : 1 }
