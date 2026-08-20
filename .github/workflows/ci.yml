@@ -119,6 +119,16 @@ jobs:
       - name: Run resolve-container tests
         run: ./scripts/test-resolve-container.sh
 
+      - name: Run release-assets tests
+        run: ./scripts/test-release-assets.sh
+
+      # Guards the pg_dump completion-marker check. The old inline `tail -n5`
+      # passed by exactly one line on pg_dump 15.17; one more trailer would have
+      # failed EVERY postgres backup and deleted the dump. The suite pins the
+      # real fixture shape and proves headroom.
+      - name: Run pg-dump-guard tests
+        run: ./scripts/test-pg-dump-guard.sh
+
   caddy-validate:
     name: Caddyfile Validate
     runs-on: ubuntu-latest

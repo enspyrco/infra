@@ -67,6 +67,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # months after a rename (see lib/resolve-container.sh).
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
+# pg_dump completion-marker guard. Was `tail -n5` inline at two call sites; the
+# marker now sits EXACTLY 5 lines from EOF (pg_dump 15.17 appends a \unrestrict
+# trailer), so one more trailer line would have failed every postgres backup.
+# shellcheck source=lib/pg-dump-guard.sh
+. "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 # Release-asset tier for large binaries (object stores) — see the file header
 # for why these can't be committed to the backup repo's tree.
 # shellcheck source=lib/release-assets.sh
@@ -109,11 +114,9 @@ backup_kanbn() {
     error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  # A COMPLETE pg_dump plain-text dump ends with the EXACT line
-  # '-- PostgreSQL database dump complete'. Anchor on the whole line (grep -qxF),
-  # not a loose substring, so a data row near EOF can't fake completeness after a
-  # truncation (same end-anchoring discipline as the sqlite COMMIT; check).
-  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  # Completion-marker guard — see lib/pg-dump-guard.sh for why the tail window
+  # is sized the way it is (the marker sits 5 lines from EOF on pg_dump 15.17).
+  if ! pg_dump_is_complete "$tmp"; then
     error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
@@ -160,7 +163,7 @@ backup_outline() {
     error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  if ! pg_dump_is_complete "$tmp"; then
     error "Outline dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
