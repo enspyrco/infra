@@ -53,6 +53,24 @@
 #   - There is no pipeline, so the `grep -q` early-exit SIGPIPE trap under a
 #     caller's `set -o pipefail` cannot fire here.
 #
+# MEASURED AGAINST THE REAL CORPUS (2026-08-21), not just fixtures. Both live
+# dumps in imagineering-cc/imagineering-backups were run through this guard and
+# the old `tail -n5` one; both accept both, so this is not a behaviour change on
+# real data. The two probes that matter:
+#
+#   kanbn.sql   4075 lines: 32 COPY headers / 32 `\.` terminators, 1 line equal
+#               to the marker, 4 lines after it, 0 dollar-quoted bodies.
+#   outline.sql 5486 lines: 39 COPY headers / 39 `\.` terminators, 1 line equal
+#               to the marker, 4 lines after it, 4 dollar-quoted bodies.
+#
+# Headers and terminators BALANCE exactly, so the COPY latch never opens
+# spuriously on real data — the "a stray COPY header swallows the real footer
+# and the caller deletes a complete backup" failure (cage-match #157 r4, Tesla)
+# does not occur in this corpus. And "4 lines after the marker" independently
+# confirms the founding measurement: `tail -n5` was passing by exactly one line.
+# Note outline DOES contain dollar-quoted bodies, so the residual below is live
+# surface that simply has no marker-shaped line in it today, not a hypothetical.
+#
 # RESIDUAL, stated honestly: the COPY filter only covers COPY data. A
 # marker-shaped line can sit outside any COPY block — inside a dollar-quoted
 # function body (`CREATE FUNCTION ... $$ ... $$`), or inside a multi-line string
@@ -91,20 +109,41 @@ pg_dump_is_complete() {
     !seen && /^COPY / && toupper($0) ~ / FROM STDIN/ { incopy = 1; next }
     incopy && $0 == "\\." { incopy = 0; next }
     incopy                { next }
+    # Resetting junk here defines the semantic deliberately: the LAST top-level
+    # marker is the footer, and only what follows IT must be footer-shaped.
+    # The alternative (never reset, so any junk after any marker is fatal) was
+    # considered and rejected — it would break the "genuine footer after an
+    # earlier lookalike" case, which is the same shape as the concatenated-file
+    # case Carnot raised (cage-match #157 r4). They are indistinguishable from
+    # the bytes, so this picks the reading that keeps real dumps valid and
+    # documents the cost: a file with real SQL between two markers is accepted
+    # as complete. The escape-guard in restore.sh, not this function, is what
+    # stops that SQL doing damage on replay.
+    #
+    # NB: this awk program lives in a single-quoted shell string, so an
+    # apostrophe anywhere in these comments would CLOSE the string and hand the
+    # rest of the program to bash. Keep them apostrophe-free.
     $0 == marker          { seen = 1; junk = 0; next }
     seen {
-      # Footer shape: blank, a "--" comment, or ANY psql meta-command.
+      # Footer shape: blank, a "--" comment, or ANY psql backslash command.
       #
-      # The meta-command test is `\` + a letter, NOT a list of the commands that
-      # exist today. Listing them would repeat the mistake this file exists to
-      # fix: `\unrestrict` did not exist before pg_dump 15.17, and it is exactly
-      # what broke the 5-line window. A grammar frozen to the tokens currently
-      # observed is a line count in another costume — the next new trailer
-      # command would set junk, fail every backup, and the caller would delete
-      # the dump. Anything starting `\<letter>` is psql plumbing, not dump body.
-      if ($0 == "" || $0 ~ /^--/ || $0 ~ /^\\[a-zA-Z]/) next
+      # The meta test is a bare leading backslash, NOT a list of the commands
+      # that exist today, and not `\` + a letter either. Listing them repeats
+      # the mistake this file exists to fix: `\unrestrict` did not exist before
+      # pg_dump 15.17 and is exactly what broke the 5-line window. A grammar
+      # frozen to observed tokens is a line count in another costume. `[a-zA-Z]`
+      # was still that freeze one notch looser — it happens to admit
+      # `\unrestrict` because `u` is a letter, but would reject `\;` or `\!`
+      # (cage-match #157 r4, Tesla). A leading backslash is psql plumbing;
+      # nothing in a dump BODY starts one at column 0 except a COPY
+      # terminator, which is handled above.
+      if ($0 == "" || $0 ~ /^--/ || $0 ~ /^\\/) next
       junk = 1
     }
     END { exit (seen && !junk) ? 0 : 1 }
-  ' "$f"
+  ' < "$f"
+  # Fed on stdin rather than as an argv filename so a path beginning with "-"
+  # can never be parsed as an awk option (cage-match #157 r4, Tesla). Callers
+  # pass absolute paths today; this removes the class rather than relying on
+  # that staying true.
 }

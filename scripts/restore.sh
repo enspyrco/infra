@@ -51,8 +51,9 @@ cleanup_backups() {
 }
 
 # Validate a plain-text pg_dump BEFORE any destructive restore step: non-empty,
-# complete (end-anchored '-- PostgreSQL database dump complete'), and not a
-# schemaless/empty DB (has CREATE TABLE). Returns non-zero so the caller can abort
+# complete (structural footer check — see lib/pg-dump-guard.sh; NOT the old
+# `tail -n5` window), not a schemaless/empty DB (has CREATE TABLE), and free of
+# statements that escape the temp DB. Returns non-zero so the caller can abort
 # with the LIVE database still intact. The old restore_kanbn/outline dropped the
 # live DB FIRST, then blind-loaded — a corrupt/truncated repo dump wiped live data.
 # (The full atomic restore-into-temp-DB-then-rename is Phase 2 of #29 — needs a
@@ -77,6 +78,27 @@ _validate_pg_dump() {
   # so a real backup never trips this.
   if grep -qiE '^[[:space:]]*(\\c|\\connect|create database|drop database)\b' "$f"; then
     error "$svc: dump contains \\connect / CREATE DATABASE / DROP DATABASE (could act on the LIVE db mid-replay) — refusing. Expected a plain 'pg_dump <db>' dump."; return 1
+  fi
+  # Refuse psql meta-commands that reach OUTSIDE the database entirely. psql
+  # interprets these when replaying a script, so they are not SQL the temp-DB
+  # sandbox contains: `\!` runs a SHELL command, `\i`/`\ir`/`\include` read any
+  # file the restoring user can read, `\o`/`\w`/`\copy`/`\lo_export` WRITE files,
+  # `\g`/`\gexec` re-dispatch, `\e` opens an editor.
+  #
+  # This became reachable-by-omission when pg_dump_is_complete widened its footer
+  # grammar to accept ANY leading-backslash line (cage-match #157 r4, Carnot):
+  # completeness must stay permissive so a future pg_dump trailer cannot fail
+  # every backup, which means completeness can no longer double as safety. The
+  # two concerns are now explicitly separated — the guard above says "is this a
+  # whole dump", this one says "is it safe to replay".
+  #
+  # Deliberately a denylist, not an allowlist: COPY data legitimately contains
+  # backslash escapes (`\N` for NULL, `\.` terminators), so banning leading
+  # backslashes outright would refuse every real dump. A false positive here
+  # fails CLOSED with a named reason, which is the correct direction for a
+  # destructive path.
+  if grep -qiE '^[[:space:]]*\\(!|i|ir|include|include_relative|o|out|w|write|copy|g|gexec|gset|e|edit|s|setenv|lo_import|lo_export)([[:space:]]|$)' "$f"; then
+    error "$svc: dump contains a psql meta-command that escapes the database (\\! shell, \\i include, \\o/\\copy file write, …) — refusing. Expected a plain 'pg_dump <db>' dump."; return 1
   fi
   return 0
 }

