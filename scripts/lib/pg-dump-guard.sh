@@ -29,18 +29,27 @@
 #
 # So the window is gone. We assert the PROPERTY instead: the marker exists
 # OUTSIDE any COPY data block, and every line after it is footer-shaped (blank,
-# a `--` comment, or ANY `\<letter>` psql meta-command). That is strictly
-# stronger than "near the end" — it does not care about distance at all — and it
-# removes the tension the window created:
+# a `--` comment, or a psql backslash command that is not a known-dangerous
+# one). That is strictly stronger than "near the end" — it does not care about
+# distance at all — and it removes the tension the window created:
 #
 #   - Trailer growth is free in BOTH dimensions: any number of trailer lines,
-#     and any psql meta-command, known or not. The meta test is deliberately
-#     `\` + a letter rather than a list of `\restrict`/`\unrestrict`, because a
-#     list would re-commit the original sin one level up — `\unrestrict` is
-#     itself a trailer that did not exist before 15.17, and freezing the tokens
-#     we happen to have observed is a line count wearing a grammar's clothes
-#     (cage-match #157 r2, Tesla). There is no cliff left, so there is no
-#     number and no token list to re-tune on the box.
+#     and any UNKNOWN psql command. The meta test is a bare leading backslash
+#     rather than a list of `\restrict`/`\unrestrict`, because a list would
+#     re-commit the original sin one level up — `\unrestrict` is itself a
+#     trailer that did not exist before 15.17, and freezing the tokens we happen
+#     to have observed is a line count wearing a grammar's clothes (cage-match
+#     #157 r2, Tesla). There is no cliff left, so there is no number and no
+#     token list to re-tune on the box.
+#   - The one exception runs the OTHER way, and exists to prevent a regression:
+#     a small set of known-dangerous psql commands (`\!`, `\i`, `\o`, `\copy`,
+#     `\gexec`, `\q`, …) is NOT footer-shaped. Pure "any backslash" was more
+#     permissive than the window it replaced — appending `\! cmd` to a real
+#     footer pushed the marker to the 6th-from-last line, so `tail -n5` rejected
+#     that dump and it never reached psql (cage-match #157 r7, Tesla; measured).
+#     Note the direction: unknown tokens stay ACCEPTED, so no cliff is created;
+#     only names dangerous TODAY are refused. This restores parity with the
+#     window. It is NOT a replay-safety guard — see the note by that clause.
 #   - Body text can no longer forge the footer. A marker-shaped row inside a
 #     COPY block is never counted, and real dump body after a marker is not
 #     footer-shaped, so it fails.
@@ -153,7 +162,37 @@ pg_dump_is_complete() {
       # (cage-match #157 r4, Tesla). A leading backslash is psql plumbing;
       # nothing in a dump BODY starts one at column 0 except a COPY
       # terminator, which is handled above.
-      if ($0 == "" || $0 ~ /^--/ || $0 ~ /^\\/) next
+      # Leading whitespace tolerated: a future pretty-printer that indents the
+      # trailer must not fail every backup (cage-match #157 r7, Tesla).
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*--/) next
+      if ($0 ~ /^[[:space:]]*\\/) {
+        # NO-REGRESSION CLAUSE. Accepting any backslash line buys trailer
+        # headroom, but it must not make this guard MORE PERMISSIVE than the
+        # `tail -n5` window it replaces. It did: appending `\! cmd` after a
+        # 15.17 footer pushes the marker to the 6th-from-last line, so the old
+        # window REJECTED that dump as truncated and it never reached psql —
+        # while a pure "any backslash is footer-shaped" rule ACCEPTS it, on both
+        # the write and read paths (cage-match #157 r7, Tesla; measured, and my
+        # own round-6 claim that the exposure was "entirely pre-existing" was
+        # tested only with the command in the BODY, where it is).
+        #
+        # So the known-dangerous psql commands are explicitly NOT footer-shaped.
+        # This is a denylist, and a denylist is what got frozen three times in
+        # this file already — but the direction of the freeze is what matters:
+        # an UNKNOWN token stays ACCEPTED (headroom preserved, no cliff), and
+        # only names that are dangerous TODAY are refused. A future psql verb
+        # is therefore permitted by this guard, exactly as `\unrestrict` needed
+        # to be. Closing that remaining gap needs the whole-file, COPY-aware
+        # parser tracked separately; this clause only restores parity with the
+        # window, it is NOT a replay-safety guard and must not be read as one.
+        #
+        # Token boundary is "not a letter", not whitespace: psql does not
+        # require a separator, so `\i/etc/passwd` is a real include (Tesla).
+        # `!` needs no boundary since it is not a letter, so `\!id` is caught.
+        if ($0 ~ /^[[:space:]]*\\!/) { junk = 1; next }
+        if ($0 ~ /^[[:space:]]*\\(i|ir|o|w|g|e|s|c|q|copy|gexec|gset|include|include_relative|lo_import|lo_export|out|write|edit|quit|connect)([^a-zA-Z]|$)/) { junk = 1; next }
+        next
+      }
       junk = 1
     }
     END { exit (seen && !junk) ? 0 : 1 }
