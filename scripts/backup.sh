@@ -67,9 +67,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # months after a rename (see lib/resolve-container.sh).
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
-# pg_dump completion-marker guard. Was `tail -n5` inline at two call sites; the
-# marker now sits EXACTLY 5 lines from EOF (pg_dump 15.17 appends a \unrestrict
-# trailer), so one more trailer line would have failed every postgres backup.
+# pg_dump completion-marker guard. Was `tail -n5` inline at three call sites
+# (two here, one in restore.sh). Measured on the real dumps: exactly 4 lines
+# follow the marker (pg_dump 15.17 appends `--`, blank, \unrestrict, blank), so
+# the marker was the 5th-from-last line — the last one a 5-line window could
+# see. One more trailer line would have failed every postgres backup, and the
+# call sites below DELETE a dump that fails validation. The guard is now
+# structural rather than a line count; see lib/pg-dump-guard.sh for why.
 # shellcheck source=lib/pg-dump-guard.sh
 . "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 # Release-asset tier for large binaries (object stores) — see the file header

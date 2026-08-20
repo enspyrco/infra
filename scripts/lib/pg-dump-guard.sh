@@ -68,8 +68,16 @@
 # and the caller deletes a complete backup" failure (cage-match #157 r4, Tesla)
 # does not occur in this corpus. And "4 lines after the marker" independently
 # confirms the founding measurement: `tail -n5` was passing by exactly one line.
-# Note outline DOES contain dollar-quoted bodies, so the residual below is live
-# surface that simply has no marker-shaped line in it today, not a hypothetical.
+#
+# Both halves of the dollar-quote risk were then measured separately, because
+# they fail in OPPOSITE directions and only one had been checked:
+#   - a MARKER inside a $$ body would fake a footer (fail open),
+#   - a COPY HEADER inside a $$ body would latch with no `\.` to close it,
+#     swallow the real footer, and make the caller delete a COMPLETE dump
+#     (fail closed — the more destructive of the two).
+# outline has 4 dollar-quote delimiters and ZERO COPY headers inside them;
+# kanbn has none at all. So the surface is live but currently unoccupied in
+# both directions. It is a residual, not a defect — and not a hypothetical.
 #
 # RESIDUAL, stated honestly: the COPY filter only covers COPY data. A
 # marker-shaped line can sit outside any COPY block — inside a dollar-quoted
@@ -101,12 +109,19 @@ pg_dump_is_complete() {
     # concatenated or partially-overwritten file). Gating on !seen makes the
     # post-marker rule below the only one that can see those lines.
     #
-    # The header match is deliberately loose: `toupper` covers FROM STDIN case
-    # variation, and matching a substring rather than anchoring at `stdin;$`
-    # survives a `WITH (...)` suffix. A COPY header we fail to recognise fails
-    # OPEN (its rows would be judged as top-level lines), so this test is kept
-    # wider than the shape pg_dump emits today.
-    !seen && /^COPY / && toupper($0) ~ / FROM STDIN/ { incopy = 1; next }
+    # The header match is deliberately loose: case-insensitive FROM STDIN, and a
+    # substring rather than an anchor at `stdin;$` so a `WITH (...)` suffix still
+    # latches. A COPY header we fail to recognise fails OPEN (its rows would be
+    # judged as top-level lines), so this test is kept wider than the shape
+    # pg_dump emits today.
+    #
+    # Spelled as a per-character class rather than toupper(): toupper is a
+    # LOCALE function, and under a Turkish locale "i" uppercases to a dotted
+    # capital, so "stdin" would never match "STDIN" and the latch would never
+    # close (cage-match #157 r6, Tesla). Measured as NOT biting on this awk, but
+    # cron locale is an environment input — the same class as the env knob this
+    # file deleted — so the dependency is removed rather than relied upon.
+    !seen && /^COPY / && /[ ][Ff][Rr][Oo][Mm][ ]+[Ss][Tt][Dd][Ii][Nn]/ { incopy = 1; next }
     incopy && $0 == "\\." { incopy = 0; next }
     incopy                { next }
     # Resetting junk here defines the semantic deliberately: the LAST top-level
@@ -117,8 +132,9 @@ pg_dump_is_complete() {
     # case Carnot raised (cage-match #157 r4). They are indistinguishable from
     # the bytes, so this picks the reading that keeps real dumps valid and
     # documents the cost: a file with real SQL between two markers is accepted
-    # as complete. The escape-guard in restore.sh, not this function, is what
-    # stops that SQL doing damage on replay.
+    # as complete. This function answers "is this a whole dump", nothing more —
+    # whether a dump is SAFE to replay is a separate question owned by
+    # _validate_pg_dump, and completeness must never be read as a safety claim.
     #
     # NB: this awk program lives in a single-quoted shell string, so an
     # apostrophe anywhere in these comments would CLOSE the string and hand the

