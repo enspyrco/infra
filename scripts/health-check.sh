@@ -1,11 +1,25 @@
 #!/bin/bash
-# Server health check - sends Telegram alerts when thresholds are exceeded.
-# Runs hourly via cron. The notify proxy key (NOTIFY_API_KEY) is loaded from
-# /etc/imagineering-secrets/notify.env by the shared helper below — it is not
-# inlined into the cron entry (avoids leaking the key in a world-readable
-# /etc/cron.d/ file). Alerts route through notify, not a directly-held bot token.
+# Server health check — EVENT-DRIVEN Telegram alerts via the notify proxy.
+#
+# Runs hourly via cron. Alerts ONLY on CHANGE:
+#   • a newly-appeared issue fires once,
+#   • a persisting issue stays SILENT (no hourly re-spam — the thing that made
+#     this noisy: a container stopped days ago was re-alerted every hour),
+#   • a cleared issue fires a one-time ✅ recovery.
+#
+# State (the set of currently-active issue KEYS) is kept in $HEALTHCHECK_STATE
+# between runs. Keys are STABLE identifiers — container:<name>, disk:<mount>,
+# memory, swap — so a drifting detail in the human message (e.g. "Exited (0)
+# 5 days ago", whose relative time changes every run) never reads as a new
+# issue. A chronic condition is reported once, not once an hour; if you want
+# periodic "still broken" reminders, that's a separate digest, deliberately not
+# this.
+#
+# NOTIFY_API_KEY is loaded from /etc/imagineering-secrets/notify.env by the
+# shared helper below (never inlined into a world-readable cron entry).
+#
+# Requires bash 4+ (associative arrays). Both hosts (Sydney, Melbourne) run 5.
 
-# Source shared Telegram helper (defines send_telegram_alert + loads creds).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/telegram.sh
 . "$SCRIPT_DIR/lib/telegram.sh"
@@ -13,99 +27,116 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISK_THRESHOLD=80
 MEMORY_THRESHOLD=90
 SWAP_THRESHOLD=50
+STATE_FILE="${HEALTHCHECK_STATE:-$HOME/.cache/health-check-state}"
 
-# NOTE: the downstream-server /api/health data-loss canary moved to the
-# downstream repo (nickmeinhold/downstream
-# deploy/oci/scripts/health-check-downstream.sh, cron hourly :05) in the
-# #291 Phase B ops-move. This script keeps the shared-host checks below
-# (disk/memory/swap/exited containers), which cover img-downstream-server
-# as a container on the shared box.
+# NOTE: the downstream-server /api/health data-loss canary lives in the
+# downstream repo (health-check-downstream.sh, cron :05). This script keeps the
+# shared-host checks (disk/memory/swap/exited-or-restarting containers).
 
-issues=()
+# Current issues as stable-key -> human message.
+declare -A issues
 
-# Check disk usage (all mounted filesystems, excluding tmpfs/devtmpfs)
+# Disk (all real filesystems).
 while read -r usage mount; do
     pct=${usage%\%}
     if [ "$pct" -gt "$DISK_THRESHOLD" ]; then
-        issues+=("Disk ${mount}: ${pct}% used (threshold: ${DISK_THRESHOLD}%)")
+        issues["disk:${mount}"]="Disk ${mount}: ${pct}% used (threshold ${DISK_THRESHOLD}%)"
     fi
 done < <(df -h --output=pcent,target -x tmpfs -x devtmpfs -x overlay | tail -n +2 | awk '{print $1, $2}')
 
-# Check memory usage
+# Memory.
 mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 mem_available=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-if [ "$mem_total" -gt 0 ]; then
+if [ "${mem_total:-0}" -gt 0 ]; then
     mem_used_pct=$(( (mem_total - mem_available) * 100 / mem_total ))
     if [ "$mem_used_pct" -gt "$MEMORY_THRESHOLD" ]; then
-        issues+=("Memory: ${mem_used_pct}% used (threshold: ${MEMORY_THRESHOLD}%)")
+        issues["memory"]="Memory: ${mem_used_pct}% used (threshold ${MEMORY_THRESHOLD}%)"
     fi
 fi
 
-# Check swap usage
+# Swap.
 swap_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 swap_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
-if [ "$swap_total" -gt 0 ]; then
+if [ "${swap_total:-0}" -gt 0 ]; then
     swap_used_pct=$(( (swap_total - swap_free) * 100 / swap_total ))
     if [ "$swap_used_pct" -gt "$SWAP_THRESHOLD" ]; then
-        issues+=("Swap: ${swap_used_pct}% used (threshold: ${SWAP_THRESHOLD}%)")
+        issues["swap"]="Swap: ${swap_used_pct}% used (threshold ${SWAP_THRESHOLD}%)"
     fi
 fi
 
-# Check for unhealthy Docker containers. Known one-shot helper containers
-# (compose migrate/setup jobs) exit 0 by design and sit in "Exited (0)"
-# forever — a clean exit from THESE is not a failure. The skip is an
-# explicit name allowlist, NOT a blanket "Exited (0) is fine": a
-# long-running service that exits cleanly (docker stop, handled SIGTERM)
-# is still down and must alert. Extend the allowlist when adding new
-# one-shot jobs. (Without the skip the repo version alert-spams hourly;
-# the previously-deployed host copy had drifted and silently ignored
-# these containers.)
+# Containers: exited (non-allowlisted) or restarting. Known one-shot helpers
+# (compose migrate/setup jobs) exit 0 by design and are skipped by name.
 ONESHOT_HELPERS_RE='^(imagineering|xdeca|img)-(kanbn-migrate|outline-minio-setup)$'
 while read -r name status; do
+    [ -n "$name" ] || continue
     if [[ "$status" == "Exited (0)"* ]] && [[ "$name" =~ $ONESHOT_HELPERS_RE ]]; then
         continue
     fi
-    issues+=("Container <b>${name}</b>: ${status}")
+    issues["container:${name}"]="Container <b>${name}</b>: ${status}"
 done < <(docker ps -a --filter "status=exited" --filter "status=restarting" --format "{{.Names}} {{.Status}}" 2>/dev/null)
 
-# Send alert if any issues found
-if [ ${#issues[@]} -gt 0 ]; then
-    if [ -z "$NOTIFY_API_KEY" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT but missing NOTIFY_API_KEY"
-        printf '  - %s\n' "${issues[@]}"
-        exit 1
-    fi
-
-    # Build HTML message body. Issue strings come from `docker ps`, /proc,
-    # and curl rc codes — no HTML metacharacters in practice — and the
-    # container-name issue deliberately includes literal `<b>...</b>` tags
-    # for emphasis. We therefore concatenate as-is rather than passing each
-    # issue through telegram_html_escape (which would double-escape the
-    # tags). If a future check ingests untrusted text, escape it at the
-    # source before pushing into ${issues[@]}.
-    body=""
-    for issue in "${issues[@]}"; do
-        body="${body}
-- ${issue}"
-    done
-
-    # Tag team members (literal text, no Markdown link)
-    tags="@sentientcogs"
-
-    # U+1F6A8 ROTATING LIGHT — written as ANSI-C $'...' so the bytes are
-    # explicit and don't depend on bash's printf-format \xNN handling.
-    siren=$'\xF0\x9F\x9A\xA8'
-    message="<b>${siren} Server Health Alert</b>${body}
-
-${tags}"
-
-    send_telegram_alert "$message"
-
-    # send_telegram_alert always returns 0 (it never aborts an alert path), so
-    # this line records DISPATCH, not delivery. The actual delivery result —
-    # HTTP status + whether a message_id receipt came back — is logged to
-    # stderr by send_telegram_alert itself, and lands in this cron's log.
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Alert dispatched to notify: ${#issues[@]} issue(s) (see stderr above for delivery result)"
-else
-    echo "$(date '+%Y-%m-%d %H:%M:%S') OK - all checks passed"
+# Previous active keys.
+declare -A prev
+if [ -f "$STATE_FILE" ]; then
+    while IFS= read -r k; do [ -n "$k" ] && prev["$k"]=1; done < "$STATE_FILE"
 fi
+
+# Diff: what's newly-broken, what just cleared.
+new_msgs=()
+resolved_keys=()
+for k in "${!issues[@]}"; do
+    [ -n "${prev[$k]:-}" ] || new_msgs+=("${issues[$k]}")
+done
+for k in "${!prev[@]}"; do
+    [ -n "${issues[$k]:-}" ] || resolved_keys+=("$k")
+done
+
+# Persist current active set atomically (temp + rename).
+mkdir -p "$(dirname "$STATE_FILE")"
+tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
+if [ ${#issues[@]} -gt 0 ]; then
+    printf '%s\n' "${!issues[@]}" > "$tmp"
+else
+    : > "$tmp"
+fi
+mv -f "$tmp" "$STATE_FILE"
+
+now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# No change since last run → stay silent. This is the whole point.
+if [ ${#new_msgs[@]} -eq 0 ] && [ ${#resolved_keys[@]} -eq 0 ]; then
+    echo "$now OK - no change (${#issues[@]} active issue(s))"
+    exit 0
+fi
+
+# Build a change notification (only the new + the resolved).
+siren=$'\xF0\x9F\x9A\xA8'   # U+1F6A8 rotating light
+check=$'\xE2\x9C\x85'       # U+2705 check mark
+body=""
+if [ ${#new_msgs[@]} -gt 0 ]; then
+    body="${body}
+<b>${siren} New:</b>"
+    for m in "${new_msgs[@]}"; do body="${body}
+- ${m}"; done
+fi
+if [ ${#resolved_keys[@]} -gt 0 ]; then
+    body="${body}
+<b>${check} Resolved:</b>"
+    for k in "${resolved_keys[@]}"; do body="${body}
+- ${k}"; done
+fi
+
+if [ -z "$NOTIFY_API_KEY" ]; then
+    echo "$now CHANGE but missing NOTIFY_API_KEY"
+    printf '%s\n' "$body"
+    exit 1
+fi
+
+# Issue strings come from docker ps / /proc — no untrusted HTML — and the
+# container message deliberately carries literal <b> tags, so concatenate as-is
+# (do not telegram_html_escape, which would double-escape the tags).
+message="<b>Server Health</b>${body}
+
+@sentientcogs"
+send_telegram_alert "$message"
+echo "$now Change dispatched: ${#new_msgs[@]} new, ${#resolved_keys[@]} resolved (see stderr for delivery)"
