@@ -577,7 +577,22 @@ Host github-imagineering-backups
     IdentitiesOnly yes
 SSHEOF'
     # Ensure main SSH config includes config.d
-    ssh "$REMOTE" 'grep -q "Include config.d/\*" ~/.ssh/config 2>/dev/null || printf "Include config.d/*\n\n" | cat - ~/.ssh/config 2>/dev/null > /tmp/ssh_config_tmp && mv /tmp/ssh_config_tmp ~/.ssh/config || printf "Include config.d/*\n" > ~/.ssh/config'
+    # `||` and `&&` are LEFT-ASSOCIATIVE with EQUAL precedence, so the previous
+    # one-liner parsed as ((grep || build-tmp) && mv) || overwrite. On the
+    # ALREADY-CORRECT path — grep finds the Include — the first group is true,
+    # `mv` still runs, fails because no temp file was ever built, and the
+    # trailing `|| printf > ~/.ssh/config` TRUNCATES the operator's SSH config
+    # to a single line. It misfires only when nothing needed fixing, which is
+    # why a deploy reporting success has been quietly discarding any Host block
+    # kept in ~/.ssh/config (reproduced: 5 lines -> 1, 2026-08-26). The stderr
+    # `mv: cannot stat` was the only symptom. Spelled as an explicit if/else so
+    # no branch can fall through into the destructive one.
+    ssh "$REMOTE" 'if ! grep -q "Include config.d/\*" ~/.ssh/config 2>/dev/null; then
+        umask 077
+        tmp=$(mktemp) || exit 1
+        mkdir -p ~/.ssh
+        { printf "Include config.d/*\n\n"; cat ~/.ssh/config 2>/dev/null || true; } > "$tmp" && mv "$tmp" ~/.ssh/config || { rm -f "$tmp"; exit 1; }
+    fi'
     ssh "$REMOTE" "chmod 600 ~/.ssh/config ~/.ssh/config.d/imagineering-backups"
 
     # Ensure GitHub host key is trusted
