@@ -76,6 +76,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # structural rather than a line count; see lib/pg-dump-guard.sh for why.
 # shellcheck source=lib/pg-dump-guard.sh
 . "$SCRIPT_DIR/lib/pg-dump-guard.sh"
+# Positive control for the source above. This script has no `set -e`, so a
+# missing or unreadable lib prints to stderr and CONTINUES — leaving
+# pg_dump_is_complete UNDEFINED. An undefined function is silent and returns
+# 127, which the call sites below read as "dump incomplete" and answer by
+# `rm -f`-ing the dump. That is the guard deleting every postgres backup
+# because the guard is absent: the exact catastrophe this file exists to
+# prevent, arriving through the deploy path instead of the pg_dump one. The
+# test suite has this control (cage-match #157 r4); production did not.
+if [ "$(type -t pg_dump_is_complete || true)" != "function" ]; then
+    echo "FATAL: pg_dump_is_complete undefined after sourcing $SCRIPT_DIR/lib/pg-dump-guard.sh" >&2
+    echo "FATAL: refusing to run — every postgres dump would be judged truncated and DELETED" >&2
+    exit 1
+fi
 # Release-asset tier for large binaries (object stores) — see the file header
 # for why these can't be committed to the backup repo's tree.
 # shellcheck source=lib/release-assets.sh
