@@ -127,11 +127,14 @@ jobs:
       # failed EVERY postgres backup and deleted the dump. The guard is now
       # structural (footer shape, no line count) — the suite pins the real
       # fixture shape, the footer-forgery class, and write/read symmetry.
-      # The guard is awk-based, and the production box's /usr/bin/awk is mawk.
-      # Installed explicitly so the suite's dialect sweep actually has something
-      # to sweep — an absent alternate awk would skip silently, and a skipped
-      # check reads exactly like a passing one.
-      - name: Install alternate awk dialects (mawk = the box's awk)
+      # The guard is awk-based. Measured on 149.118.69.221 (2026-08-26):
+      # /usr/bin/awk is GNU Awk 5.2.1, NOT mawk as this step previously claimed
+      # — so gawk is the dialect that must not regress, and mawk is defensive
+      # cover for a box whose awk alternative gets switched. Both are installed
+      # explicitly so the suite's dialect sweep actually has something to sweep:
+      # an absent alternate awk would skip silently, and a skipped check reads
+      # exactly like a passing one.
+      - name: Install alternate awk dialects (gawk = the box's awk; mawk defensive)
         run: sudo apt-get install -y --no-install-recommends mawk gawk
 
       - name: Run pg-dump-guard tests
