@@ -67,6 +67,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # months after a rename (see lib/resolve-container.sh).
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
+# pg_dump completion-marker guard. Was `tail -n5` inline at three call sites
+# (two here, one in restore.sh). Measured on the real dumps: exactly 4 lines
+# follow the marker (pg_dump 15.17 appends `--`, blank, \unrestrict, blank), so
+# the marker was the 5th-from-last line — the last one a 5-line window could
+# see. One more trailer line would have failed every postgres backup, and the
+# call sites below DELETE a dump that fails validation. The guard is now
+# structural rather than a line count; see lib/pg-dump-guard.sh for why.
+# shellcheck source=lib/pg-dump-guard.sh
+. "$SCRIPT_DIR/lib/pg-dump-guard.sh"
+# Positive control for the source above. This script has no `set -e`, so a
+# missing or unreadable lib prints to stderr and CONTINUES — leaving
+# pg_dump_is_complete UNDEFINED. An undefined function is silent and returns
+# 127, which the call sites below read as "dump incomplete" and answer by
+# `rm -f`-ing the dump. That is the guard deleting every postgres backup
+# because the guard is absent: the exact catastrophe this file exists to
+# prevent, arriving through the deploy path instead of the pg_dump one. The
+# test suite has this control (cage-match #157 r4); production did not.
+if [ "$(type -t pg_dump_is_complete || true)" != "function" ]; then
+    echo "FATAL: pg_dump_is_complete undefined after sourcing $SCRIPT_DIR/lib/pg-dump-guard.sh" >&2
+    echo "FATAL: refusing to run — every postgres dump would be judged truncated and DELETED" >&2
+    exit 1
+fi
 # Release-asset tier for large binaries (object stores) — see the file header
 # for why these can't be committed to the backup repo's tree.
 # shellcheck source=lib/release-assets.sh
@@ -109,11 +131,9 @@ backup_kanbn() {
     error "Kan.bn pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  # A COMPLETE pg_dump plain-text dump ends with the EXACT line
-  # '-- PostgreSQL database dump complete'. Anchor on the whole line (grep -qxF),
-  # not a loose substring, so a data row near EOF can't fake completeness after a
-  # truncation (same end-anchoring discipline as the sqlite COMMIT; check).
-  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  # Completion-marker guard — structural, NOT a tail window. See
+  # lib/pg-dump-guard.sh for why a line count was the wrong instrument.
+  if ! pg_dump_is_complete "$tmp"; then
     error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
@@ -160,7 +180,7 @@ backup_outline() {
     error "Outline pg_dump failed: $(tr '\n' ' ' < "$err")"
     rm -f "$tmp" "$err"; return 1
   fi
-  if ! tail -n5 "$tmp" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  if ! pg_dump_is_complete "$tmp"; then
     error "Outline dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi

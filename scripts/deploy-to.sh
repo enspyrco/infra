@@ -496,7 +496,22 @@ deploy_backups() {
     # didn't stage — better no deploy than a half-deploy over a live cron path.
     # (Remote rsync is implicitly proven present: the staging rsync above would
     # have failed here, before any mutation, if it were missing.)
-    ssh "$REMOTE" "test -s '$rstage/lib/aiko-volume.sh' && test -s '$rstage/lib/telegram.sh'" \
+    # The required-lib contract is DERIVED from the repo, not hand-listed. It was
+    # `aiko-volume.sh && telegram.sh` — written when those were the only two — and
+    # every lib added since (resolve-container, release-assets, pg-dump-guard) rode
+    # in unasserted. A partial rsync can drop one without failing, and the `bash -n`
+    # sweep below globs what IS there, so it cannot see an ABSENT file. backup.sh has
+    # no `set -e`: a missing lib leaves its functions undefined, and an undefined
+    # function is silent and non-zero — pg_dump_is_complete would then judge every
+    # dump truncated and the caller would DELETE it. Deriving the list means a new
+    # helper is covered the moment it lands, with nothing to remember.
+    local libname libtests_stage="true" libtests_live="true"
+    for libname in "$REPO_ROOT"/scripts/lib/*.sh; do
+        libname=$(basename "$libname")
+        libtests_stage="$libtests_stage && test -s '$rstage/lib/$libname'"
+        libtests_live="$libtests_live && test -r '/opt/scripts/lib/$libname'"
+    done
+    ssh "$REMOTE" "$libtests_stage" \
         || { echo "ERROR: required libs missing from staging — aborting before install"; ssh "$REMOTE" "rm -rf '$rstage'"; return 1; }
     # Parse the STAGED payload BEFORE mutating /opt/scripts: a syntactically broken
     # script/lib must be caught while the live tree is still untouched (fail closed
@@ -517,10 +532,11 @@ deploy_backups() {
         || { echo "ERROR: remote install failed"; ssh "$REMOTE" "rm -rf '$rstage'" 2>/dev/null; return 1; }
     # Post-install falsifier: deploy exit 0 must mean "the cron won't abort on a
     # missing/broken source", not just "bytes moved". Two checks: (1) the REQUIRED
-    # runtime contract — aiko-volume.sh + telegram.sh must be present + readable
-    # (a glob can't catch a MISSING required file); (2) every installed script and
+    # runtime contract — EVERY lib the repo ships must be present + readable, the
+    # same derived list asserted at staging (a glob can't catch a MISSING required
+    # file, which is why this is not the bash -n sweep); (2) every installed script and
     # lib/*.sh must parse (bash -n — no execution, so no telegram side effects).
-    ssh "$REMOTE" "test -r /opt/scripts/lib/aiko-volume.sh && test -r /opt/scripts/lib/telegram.sh \
+    ssh "$REMOTE" "$libtests_live \
         && for f in /opt/scripts/backup.sh /opt/scripts/restore.sh /opt/scripts/lib/*.sh; do bash -n \"\$f\" || { echo \"bash -n failed: \$f\"; exit 1; }; done" \
         || { echo "ERROR: post-install source check FAILED — backup cron would break; investigate the box"; return 1; }
     echo "  backup scripts + lib installed and source-verified"
