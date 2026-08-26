@@ -84,11 +84,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # because the guard is absent: the exact catastrophe this file exists to
 # prevent, arriving through the deploy path instead of the pg_dump one. The
 # test suite has this control (cage-match #157 r4); production did not.
-if [ "$(type -t pg_dump_is_complete || true)" != "function" ]; then
-    echo "FATAL: pg_dump_is_complete undefined after sourcing $SCRIPT_DIR/lib/pg-dump-guard.sh" >&2
-    echo "FATAL: refusing to run — every postgres dump would be judged truncated and DELETED" >&2
-    exit 1
-fi
+# Both functions, not just the first: an undefined pg_dump_has_schema returns 127
+# exactly like an undefined pg_dump_is_complete, and would reject every dump as
+# schemaless. Loop so a helper added to the lib later is covered by adding it here
+# rather than by remembering to duplicate the check.
+for _fn in pg_dump_is_complete pg_dump_has_schema; do
+    if [ "$(type -t "$_fn" || true)" != "function" ]; then
+        echo "FATAL: $_fn undefined after sourcing $SCRIPT_DIR/lib/pg-dump-guard.sh" >&2
+        echo "FATAL: refusing to run — every postgres dump would be rejected and DELETED" >&2
+        exit 1
+    fi
+done
+unset _fn
 # Release-asset tier for large binaries (object stores) — see the file header
 # for why these can't be committed to the backup repo's tree.
 # shellcheck source=lib/release-assets.sh
@@ -137,6 +144,15 @@ backup_kanbn() {
     error "Kan.bn dump incomplete (no completion marker — truncated/empty)"
     rm -f "$tmp" "$err"; return 1
   fi
+  # Schema gate — the WRITE side of the check restore.sh has always made. Without
+  # it backup.sh stores a dump restore.sh will categorically refuse, and the
+  # refusal surfaces at DR time. Failing here is the cheap direction: the run
+  # alerts via FAILED_SERVICES and backup_to_github never runs, so the previously
+  # stored backup survives. See lib/pg-dump-guard.sh for the harm asymmetry.
+  if ! pg_dump_has_schema "$tmp"; then
+    error "Kan.bn dump has no CREATE TABLE (empty/wrong DB?) — refusing to overwrite the stored backup"
+    rm -f "$tmp" "$err"; return 1
+  fi
   rm -f "$err"
   # Check gzip's own exit — a failed compress (ENOSPC/SIGKILL) must not leave the
   # function logging success with a missing/partial .gz (pipe-masks-exit reborn).
@@ -182,6 +198,15 @@ backup_outline() {
   fi
   if ! pg_dump_is_complete "$tmp"; then
     error "Outline dump incomplete (no completion marker — truncated/empty)"
+    rm -f "$tmp" "$err"; return 1
+  fi
+  # Schema gate — the WRITE side of the check restore.sh has always made. Without
+  # it backup.sh stores a dump restore.sh will categorically refuse, and the
+  # refusal surfaces at DR time. Failing here is the cheap direction: the run
+  # alerts via FAILED_SERVICES and backup_to_github never runs, so the previously
+  # stored backup survives. See lib/pg-dump-guard.sh for the harm asymmetry.
+  if ! pg_dump_has_schema "$tmp"; then
+    error "Outline dump has no CREATE TABLE (empty/wrong DB?) — refusing to overwrite the stored backup"
     rm -f "$tmp" "$err"; return 1
   fi
   rm -f "$err"

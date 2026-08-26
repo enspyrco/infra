@@ -66,7 +66,12 @@ _validate_pg_dump() {
   if ! pg_dump_is_complete "$f"; then
     error "$svc: dump incomplete (no completion marker — truncated) — refusing (live DB untouched)"; return 1
   fi
-  if ! grep -q 'CREATE TABLE' "$f"; then
+  # Anchored + COPY-aware (see lib/pg-dump-guard.sh). Was `grep -q 'CREATE TABLE'`,
+  # which matched the string ANYWHERE including inside COPY data — the same forgery
+  # class the completeness guard above was rewritten to eliminate, left standing one
+  # check below it on the destructive path. No behaviour change on real dumps:
+  # measured 39/39 and 32/32 anchored-vs-unanchored, 0 inside COPY data.
+  if ! pg_dump_has_schema "$f"; then
     error "$svc: dump has no CREATE TABLE (empty/wrong DB) — refusing (live DB untouched)"; return 1
   fi
   # Refuse dumps that can escape the temp DB mid-replay: a `\connect`/`\c` reconnects

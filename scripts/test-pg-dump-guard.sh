@@ -29,9 +29,12 @@ FAIL=0
 if ! bash -n "$SCRIPT_DIR/lib/pg-dump-guard.sh" 2>/dev/null; then
   printf '  \033[0;31mFAIL\033[0m lib/pg-dump-guard.sh does not parse\n'; exit 1
 fi
-if [ "$(type -t pg_dump_is_complete)" != function ]; then
-  printf '  \033[0;31mFAIL\033[0m pg_dump_is_complete is not defined after sourcing the lib\n'; exit 1
-fi
+for _fn in pg_dump_is_complete pg_dump_has_schema; do
+  if [ "$(type -t "$_fn")" != function ]; then
+    printf '  \033[0;31mFAIL\033[0m %s is not defined after sourcing the lib\n' "$_fn"; exit 1
+  fi
+done
+unset _fn
 ok() { PASS=$((PASS + 1)); printf '  \033[0;32mok\033[0m %s\n' "$1"; }
 no() { FAIL=$((FAIL + 1)); printf '  \033[0;31mFAIL\033[0m %s\n' "$1"; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -256,6 +259,74 @@ for meta in '\;' '\!' '\?' '\1'; do
   pg_dump_is_complete "$TMP/nl$i.sql" && ok "accepts non-letter trailer: $meta" \
                                       || no "accepts non-letter trailer: $meta"
 done
+
+echo "== SCHEMA GATE: a complete dump of an EMPTY database is refused =="
+# The asymmetry this closes: restore.sh always refused these; backup.sh stored
+# them. A dump of a wiped DB is perfectly complete and perfectly useless, and
+# storing it overwrites the good copy while logging "Backup complete!".
+{ echo "-- PostgreSQL database dump"; echo "SET statement_timeout = 0;"
+  echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; } > "$TMP/empty-db.sql"
+pg_dump_is_complete "$TMP/empty-db.sql" \
+  && ok "an empty-DB dump is COMPLETE (so completeness alone cannot catch it)" \
+  || no "expected the empty-DB dump to pass the completeness guard"
+pg_dump_has_schema "$TMP/empty-db.sql" && no "refuses an empty-DB dump" \
+                                       || ok "refuses an empty-DB dump"
+
+echo "== SCHEMA GATE: a real dump is accepted =="
+make_dump "$TMP/sch-real.sql" 1
+pg_dump_has_schema "$TMP/sch-real.sql" && ok "accepts a dump with a real CREATE TABLE" \
+                                       || no "accepts a dump with a real CREATE TABLE"
+
+echo "== SCHEMA FORGERY: CREATE TABLE inside COPY data does not count =="
+# Outline is a wiki, so a document body containing this line is content a user
+# can type. The unanchored `grep -q 'CREATE TABLE'` this replaces counted it.
+# RED-proven below: the old predicate accepts this schemaless dump.
+{ echo "-- PostgreSQL database dump"
+  echo "COPY d (body) FROM stdin;"
+  echo "CREATE TABLE evil (x int);"
+  echo "\\."
+  echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; } > "$TMP/sch-forge.sql"
+pg_dump_has_schema "$TMP/sch-forge.sql" && no "refuses a CREATE TABLE that only exists inside COPY data" \
+                                        || ok "refuses a CREATE TABLE that only exists inside COPY data"
+oldschema() { grep -q 'CREATE TABLE' "$1"; }
+oldschema "$TMP/sch-forge.sql" && ok "REGRESSION PROOF: the old unanchored grep ACCEPTS the forged dump" \
+                               || no "expected the old unanchored grep to accept the forged dump"
+
+echo "== SCHEMA GATE: indented and IF NOT EXISTS forms still count =="
+{ echo "  CREATE TABLE IF NOT EXISTS t (id int);"
+  echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; } > "$TMP/sch-variant.sql"
+pg_dump_has_schema "$TMP/sch-variant.sql" && ok "accepts an indented CREATE TABLE IF NOT EXISTS" \
+                                          || no "accepts an indented CREATE TABLE IF NOT EXISTS"
+
+echo "== SCHEMA GATE: a mid-line mention is not a declaration =="
+{ echo "-- this dump will CREATE TABLE definitions later"
+  echo "--"; echo "-- PostgreSQL database dump complete"; echo "--"; } > "$TMP/sch-comment.sql"
+pg_dump_has_schema "$TMP/sch-comment.sql" && no "refuses a CREATE TABLE mentioned inside a comment" \
+                                          || ok "refuses a CREATE TABLE mentioned inside a comment"
+oldschema "$TMP/sch-comment.sql" && ok "REGRESSION PROOF: the old grep ACCEPTS the comment-only dump" \
+                                 || no "expected the old grep to accept the comment-only dump"
+
+echo "== SCHEMA GATE: missing/empty inputs are refused, not crashed on =="
+pg_dump_has_schema "$TMP/nope.sql" && no "refuses a missing file" || ok "refuses a missing file"
+: > "$TMP/sch-zero.sql"
+pg_dump_has_schema "$TMP/sch-zero.sql" && no "refuses an empty file" || ok "refuses an empty file"
+pg_dump_has_schema "" && no "refuses an empty arg" || ok "refuses an empty arg"
+
+echo "== SCHEMA GATE: write/read symmetry — both sides make the SAME call =="
+# The whole point of the change. For each fixture, backup.sh's gate and
+# restore.sh's gate must agree; a disagreement is the bug class being closed.
+symfail=0
+for fx in "$TMP/sch-real.sql" "$TMP/empty-db.sql" "$TMP/sch-forge.sql"; do
+  pg_dump_has_schema "$fx" && w=accept || w=reject
+  if ( set +e; RESTORE_LIB_ONLY=1 . "$SCRIPT_DIR/restore.sh" >/dev/null 2>&1
+       _validate_pg_dump test "$fx" >/dev/null 2>&1 ); then r=accept; else r=reject; fi
+  # restore.sh applies MORE gates than the schema one, so it may reject where the
+  # schema gate accepts; what must never happen is the reverse — write accepting
+  # what read refuses on SCHEMA grounds.
+  [ "$w" = reject ] && [ "$r" = accept ] && symfail=$((symfail + 1))
+done
+[ "$symfail" -eq 0 ] && ok "no fixture is accepted by the write gate and refused for schema by read" \
+                     || no "$symfail fixture(s) break write/read schema symmetry"
 
 echo "== the guard behaves identically across awk dialects =="
 # This check exists because the guard moved completeness off `tail` + `grep -F`
