@@ -47,8 +47,7 @@ lives in another repo), and **tooling**.
 ├── notify/                   # stack: internal Telegram-send proxy (notify.imagineering.cc)
 ├── outline/                  # stack: team wiki (Notion alternative)
 ├── radicale/                 # stack: CalDAV/CardDAV server
-├── realm-token-server/       # config-only: Realm credential exchange + LiveKit token mint
-│                             #   (realm-token.imagineering.cc; see caddy/Caddyfile)
+├── realm-token-server/       # config-only: Realm token mint (realm-token.imagineering.cc)
 ├── scripts/                  # deployment, backup, restore + watchers/
 ├── self-healer/              # tooling: in-prod log-reading operator (Node)
 ├── tech-world-bots/          # stack: tw-clawd / tw-gremlin (tw-dreamfinder disabled)
@@ -92,7 +91,7 @@ Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) a
 | livekit | - | livekit.imagineering.cc | WebRTC SFU (TURN/TLS at :5349 currently disabled — see memory) |
 | realm-token-server | - | realm-token.imagineering.cc | Realm credential exchange + LiveKit token mint. Live Caddy vhost (`caddy/Caddyfile`); this repo holds deploy config + SOPS secrets only, no source. |
 | youtube-rag | 3010/8010 | rag.imagineering.cc, rag-api.imagineering.cc | YouTube transcript RAG (frontend + backend + chroma) |
-| img-contact | 3014 | invite.imagineering.cc | Contact-form / QR invite landing |
+| img-contact | 3014 | imagineering.cc/api/contact | Contact-form backend. **Not** a vhost of its own — Caddy reaches it via `handle_path /api/contact` inside the `imagineering.cc` apex block. `invite.imagineering.cc` is a SEPARATE plain file server (`root * /srv/invite`) and does not proxy this. Corrected 2026-08-26 against `caddy/Caddyfile`. |
 | Claudius | - | - | Headless email-polling Claude Code agent |
 | cd-bus | - | cd-bus.nick-meinhold.workers.dev | Deploy-bus SSE relay (Cloudflare Worker + Durable Object, source in `cd-bus/`) — fans CI `image.published` events to host subscribers; pilot live on downstream-server since 2026-06-12 |
 
