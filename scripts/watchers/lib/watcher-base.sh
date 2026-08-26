@@ -198,7 +198,7 @@ run_watcher() {
             rc=0
             phase_a_check || rc=$?
             case "$rc" in
-                0) set_state B; log "A → B" ;;
+                0) set_state B; [[ "${DRY_RUN:-0}" == "1" ]] || log "A → B" ;;
                 1) ;;
                 2) ;;
                 *) log "phase_a_check returned unexpected rc=$rc; treating as waiting" ;;
@@ -209,7 +209,7 @@ run_watcher() {
             rc=0
             phase_b_check || rc=$?
             case "$rc" in
-                0) set_state DONE; self_disable; log "B → DONE" ;;
+                0) set_state DONE; self_disable; [[ "${DRY_RUN:-0}" == "1" ]] || log "B → DONE" ;;
                 1) ;;
                 2) ;;
                 *) log "phase_b_check returned unexpected rc=$rc; treating as waiting" ;;

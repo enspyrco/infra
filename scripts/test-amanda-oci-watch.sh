@@ -109,5 +109,35 @@ echo "=== FAIL-CLOSED ARM (no oci-accounts.env at all) ==="
 OMIT_ENV=1 run_arm "missing AMANDA_TENANCY_OCID"   1 0 '{"data":[]}'
 
 echo
+echo "=== ENTRYPOINT ARM (run_watcher end-to-end — the shape cron actually runs) ==="
+# Everything above sed's run_watcher into a bare phase_a_check call, which means
+# no arm ever stands where cron stands. A RETURN trap set inside phase_a_check
+# is structurally unhearable that way: it fires again when run_watcher returns,
+# with its local out of scope, and set -u kills the shell AFTER the check
+# decided correctly. Waiting MUST exit 0 or cron reports every idle tick failed.
+run_entrypoint_arm() {
+    local sandbox; sandbox=$(mktemp -d)
+    mkdir -p "$sandbox/.config/imagineering" "$sandbox/bin" "$sandbox/watchers/lib"
+    printf '#!/usr/bin/env bash\necho %s\n' "'{\"data\":[]}'" > "$sandbox/bin/oci"
+    chmod +x "$sandbox/bin/oci"
+    printf 'AMANDA_TENANCY_OCID=ocid1.tenancy.oc1..TESTFIXTURE\n' \
+        > "$sandbox/.config/imagineering/oci-accounts.env"
+    cp "$REPO/scripts/watchers/lib/watcher-base.sh" "$sandbox/watchers/lib/"
+    cp "$REPO/scripts/watchers/amanda-oci-watch.sh" "$sandbox/watchers/"
+    local rc=0
+    HOME="$sandbox" PATH="$sandbox/bin:$PATH" \
+        bash "$sandbox/watchers/amanda-oci-watch.sh" > "$sandbox/out.txt" 2>&1 || rc=$?
+    if [ "$rc" = "0" ]; then
+        printf '  PASS  %-46s rc=0 (waiting tick exits clean)\n' "run_watcher, not-up-yet"; PASS=$((PASS+1))
+    else
+        printf '  FAIL  %-46s want rc=0 got rc=%s\n' "run_watcher, not-up-yet" "$rc"; FAIL=$((FAIL+1))
+        sed 's/^/          /' "$sandbox/out.txt" | head -4
+    fi
+    tail -2 "$sandbox/amanda-oci-watch.log" 2>/dev/null | sed 's/^/          log: /'
+    rm -rf "$sandbox"
+}
+run_entrypoint_arm
+
+echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

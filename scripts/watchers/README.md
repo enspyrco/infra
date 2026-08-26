@@ -154,8 +154,14 @@ ssh 149.118.69.221 'tail -f ~/cert-expiry-watch.log'
 ## The self-disable mechanic
 
 ```bash
-crontab -l | grep -vF "$CRON_TAG" | crontab -
+{ crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true; } | crontab -
 ```
+
+The `|| true` is not decoration. When this watcher's line is the LAST one in
+the crontab, `grep -vF` matches nothing and exits 1; under the caller's
+`set -o pipefail` that kills the script AFTER `crontab -` has already installed
+the (correctly) empty crontab. The disable succeeds, the success is never
+logged, and cron reports a failure for a step that worked.
 
 Three things to know:
 
