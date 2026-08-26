@@ -85,7 +85,14 @@ and `phase_b_check`. Typical watcher size: 50-80 lines.
 
 **`/opt/scripts/watchers/` is the only place a watcher may run from.** That is
 where `deploy-to.sh scripts` installs them, so it is the only path the repo can
-reach. `ubuntu`'s crontab invokes them there by absolute path.
+reach, and every cron entry must invoke them there by absolute path.
+
+> **TODAY IT DOES NOT.** As of 2026-08-26 `ubuntu`'s crontab still executes five
+> watchers from `/home/ubuntu/`. The cutover is a separate, deliberate step
+> (#3482) and is NOT done. Until it is, this section describes the target, not
+> the box — do not read it as a description of what is running. Stating this
+> plainly matters: a confident present-tense claim in this very file is what let
+> the split survive for months of spot-checks.
 
 This was not always true, and the failure is worth knowing because it was
 invisible for months: watchers used to run from a hand-maintained copy in
@@ -136,7 +143,7 @@ ssh 149.118.69.221 'ls -la ~/.config/imagineering/notify-credentials'
 #    `chmod 0600`.
 
 # 4. Install the cron entry. Tag it with the same name as CRON_TAG.
-ssh 149.118.69.221 'crontab -l | { cat; echo "*/15 * * * * /opt/scripts/watchers/cert-expiry-watch.sh  # cert-expiry-watch"; } | crontab -'
+ssh 149.118.69.221 'sudo -u ubuntu crontab -l | { cat; echo "*/15 * * * * /opt/scripts/watchers/cert-expiry-watch.sh  # cert-expiry-watch"; } | sudo -u ubuntu crontab -'
 #    Note the trailing comment — self_disable() greps for it. The literal
 #    string after the # must match $CRON_TAG exactly.
 
@@ -343,7 +350,7 @@ rm -f /tmp/brevo-credentials; unset BREVO_KEY
 # 3. Install the cron entry (every 4 hours, off the hour). Tag MUST match
 #    CRON_TAG. Idempotent: strips any existing email-health-watch line first so
 #    re-running this step never creates duplicate entries / duplicate alerts.
-ssh 149.118.69.221 'crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /opt/scripts/watchers/email-health-watch.sh  # email-health-watch"; } | crontab -'
+ssh 149.118.69.221 'sudo -u ubuntu crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /opt/scripts/watchers/email-health-watch.sh  # email-health-watch"; } | sudo -u ubuntu crontab -'
 
 # 4. Confirm first cycle (force a run, watch the log).
 ssh 149.118.69.221 '/opt/scripts/watchers/email-health-watch.sh; tail ~/email-health-watch.log'
@@ -440,7 +447,7 @@ ssh nick-mel 'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@149.118.69.221 "e
 #    user ubuntu — offset to :47, clear of the oci-watcher's :17). Tag MUST
 #    match CRON_TAG. Idempotent: strips any existing line first.
 ssh nick-mel 'DRY_RUN=1 ~/notify-canary-melbourne.sh; tail ~/notify-canary-melbourne.log'
-ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * /opt/scripts/watchers/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
+ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * ~/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
 ```
 
 ## See also

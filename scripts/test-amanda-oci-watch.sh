@@ -4,7 +4,7 @@
 # that cannot produce the bad state cannot clear it.
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 
 run_arm() {
@@ -12,24 +12,35 @@ run_arm() {
     local sandbox; sandbox=$(mktemp -d)
     mkdir -p "$sandbox/.config/imagineering" "$sandbox/bin" "$sandbox/watchers/lib"
 
+    # Resolve fixtures BEFORE building the stub. Inline `${VAR:-{"data":[]}}`
+    # cannot be used: the `}` inside the default value closes the parameter
+    # expansion early and the stub then emits a stray trailing `}`, i.e. invalid
+    # JSON. That silently "worked" while the watcher parsed leniently.
+    local vnic_out="${VNIC_OUT:-}"
+    [ -n "$vnic_out" ] || vnic_out='{"data":[]}'
+    local vnic_rc="${VNIC_RC:-0}"
+
     # stub oci
     cat > "$sandbox/bin/oci" <<STUB
 #!/usr/bin/env bash
 if [ "\$2" = "list-vnics" ] || [ "\$3" = "list-vnics" ]; then
   cat <<'VNIC'
-${VNIC_OUT:-{\"data\":[]}}
+$vnic_out
 VNIC
-  exit ${VNIC_RC:-0}
+  exit $vnic_rc
 fi
 cat <<'OUT'
 $oci_out
 OUT
+${OCI_STDERR:+printf '%s\n' "\$OCI_STDERR" >&2}
 exit $oci_rc
 STUB
     chmod +x "$sandbox/bin/oci"
 
-    printf 'AMANDA_TENANCY_OCID=ocid1.tenancy.oc1..TESTFIXTURE\n' \
-        > "$sandbox/.config/imagineering/oci-accounts.env"
+    if [ "${OMIT_ENV:-0}" != "1" ]; then
+        printf 'AMANDA_TENANCY_OCID=ocid1.tenancy.oc1..TESTFIXTURE\n' \
+            > "$sandbox/.config/imagineering/oci-accounts.env"
+    fi
     printf 'NOTIFY_URL=http://127.0.0.1:9\nNOTIFY_API_KEY=testfixture\n' \
         > "$sandbox/.config/imagineering/notify-credentials"
 
@@ -49,6 +60,7 @@ STUB
 
     local rc=0
     HOME="$sandbox" PATH="$sandbox/bin:$PATH" DRY_RUN="${DRY_RUN_ARM:-1}" \
+        OCI_STDERR="${OCI_STDERR:-}" \
         bash "$harness" > "$sandbox/out.txt" 2>&1 || rc=$?
 
     if [ "$rc" = "$want_rc" ]; then
@@ -59,6 +71,10 @@ STUB
     fi
     tail -3 "$sandbox/amanda-oci-watch.log" 2>/dev/null | sed 's/^/          log: /'
     rm -rf "$sandbox"
+    # A `VAR=x run_arm ...` prefix assignment persists after a FUNCTION call in
+    # bash (unlike for an external command), so without this every arm inherits
+    # the previous arm's fixtures.
+    unset VNIC_OUT VNIC_RC OCI_STDERR OMIT_ENV DRY_RUN_ARM
 }
 
 echo "=== FAILURE ARMS (must NOT read as 'not up yet') ==="
@@ -82,6 +98,15 @@ echo
 echo "=== DELIVERY ARM (real notify attempt to a dead port must NOT self-advance) ==="
 VNIC_OUT='{"data":[{"public-ip":"10.0.0.7"}]}' DRY_RUN_ARM=0 \
   run_arm "landed but notify unreachable"        2 0 '{"data":[{"id":"ocid1.instance.oc1..X","shape-config":{"ocpus":2}}]}'
+
+echo
+echo "=== STDERR ARM (oci exits 0, JSON on stdout, warning on stderr) ==="
+OCI_STDERR="WARNING: this flag is deprecated and will be removed" \
+  run_arm "exit 0 + JSON stdout + stderr warning"  1 0 '{"data":[]}'
+
+echo
+echo "=== FAIL-CLOSED ARM (no oci-accounts.env at all) ==="
+OMIT_ENV=1 run_arm "missing AMANDA_TENANCY_OCID"   1 0 '{"data":[]}'
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

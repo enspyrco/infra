@@ -11,8 +11,18 @@ WATCHER_NAME="amanda-oci-watch"
 # shellcheck disable=SC2034
 CRON_TAG="amanda-oci-watch"
 
+# NO $HOME/lib fallback. The other watchers carry one because they still run
+# from the legacy /home/ubuntu tree, but a fallback is precisely the mechanism
+# that lets a copy of this script placed anywhere bind to a DIFFERENT library
+# than the one deployed beside it — which is the parallel-tree failure this
+# whole change exists to end. Fail closed instead: the lib must sit next to the
+# script that is running.
 __lib="$(dirname "$0")/lib/watcher-base.sh"
-[[ -r "$__lib" ]] || __lib="$HOME/lib/watcher-base.sh"
+if [[ ! -r "$__lib" ]]; then
+    echo "amanda-oci-watch: no watcher-base.sh beside $0 (looked for $__lib)." >&2
+    echo "This watcher must run from the deployed tree (/opt/scripts/watchers/)." >&2
+    exit 1
+fi
 # shellcheck disable=SC1090  # dynamic path; resolved at runtime
 source "$__lib"
 unset __lib
@@ -44,17 +54,23 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 # region, and a 401/403 all IDENTICAL to "no RUNNING instance" — the watcher
 # would log "not up yet" forever while nothing was actually being watched. Only
 # a SUCCESSFUL call returning zero instances may mean "not up yet".
+# stderr is captured to a SEPARATE file, never merged into stdout. The oci CLI
+# routinely exits 0 with valid JSON on stdout and a deprecation/retry warning on
+# stderr; folding them together makes that ordinary success unparseable, and the
+# watcher would then log "non-JSON" every ten minutes forever while the box sits
+# there landed. Parse stdout only; keep stderr for the log line.
 phase_a_check() {
-    local instances rc=0
+    local instances rc=0 errf
+    errf=$(mktemp); trap 'rm -f "$errf"' RETURN
     instances=$(oci compute instance list --profile "$PROFILE" --region "$REGION" \
         --compartment-id "$TENANCY" --display-name "amandas-oci" \
-        --lifecycle-state RUNNING 2>&1) || rc=$?
+        --lifecycle-state RUNNING 2>"$errf") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        log "oci list FAILED (rc=$rc) — cannot distinguish 'not up' from broken creds/PATH/region: ${instances//$'\n'/ }"
+        log "oci list FAILED (rc=$rc) — cannot distinguish 'not up' from broken creds/PATH/region: $(tr '\n' ' ' < "$errf")"
         return 2
     fi
     if ! jq -e . >/dev/null 2>&1 <<<"$instances"; then
-        log "oci list returned non-JSON — treating as transient: ${instances//$'\n'/ }"
+        log "oci list exited 0 but stdout is not JSON — transient: stdout=${instances//$'\n'/ } stderr=$(tr '\n' ' ' < "$errf")"
         return 2
     fi
 
@@ -68,11 +84,18 @@ phase_a_check() {
     local ocpus ip vnics
     ocpus=$(jq -r '.data[0]."shape-config".ocpus // "?"' <<<"$instances")
     vnics=$(oci compute instance list-vnics --profile "$PROFILE" --region "$REGION" \
-        --instance-id "$iid" 2>&1) || {
-        log "instance $iid is RUNNING but list-vnics failed — retrying for the address"
+        --instance-id "$iid" 2>"$errf") || {
+        log "instance $iid is RUNNING but list-vnics failed — retrying for the address: $(tr '\n' ' ' < "$errf")"
         return 2
     }
-    ip=$(jq -r '.data[0]."public-ip" // empty' <<<"$vnics" 2>/dev/null || true)
+    # Same separation as above, and a parse failure must be reported AS a parse
+    # failure — collapsing it into an empty IP would log "address not assigned
+    # yet" forever for what is actually a broken CLI.
+    if ! jq -e . >/dev/null 2>&1 <<<"$vnics"; then
+        log "list-vnics exited 0 but stdout is not JSON — transient: stderr=$(tr '\n' ' ' < "$errf")"
+        return 2
+    fi
+    ip=$(jq -r '.data[0]."public-ip" // empty' <<<"$vnics")
     # RUNNING-with-no-address is a PHASE, not a destination. The address is the
     # whole point of the alert, so firing on a placeholder would announce
     # `ssh ubuntu@pending` and then self-disable, never to fire again.

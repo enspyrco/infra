@@ -149,8 +149,17 @@ tg_confirmed() {
 #   Removes any crontab line containing $CRON_TAG (the trailing-comment tag).
 #   Idempotent. Operates on the invoking user's crontab.
 self_disable() {
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        log "self_disable [DRY_RUN]: would remove crontab entry tagged: $CRON_TAG"
+        return 0
+    fi
     if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
-        crontab -l 2>/dev/null | grep -vF "$CRON_TAG" | crontab -
+        # `|| true` is load-bearing: when this watcher's line is the LAST one in
+        # the crontab, grep -vF matches nothing and exits 1. Under the callers'
+        # `set -o pipefail` that kills the script AFTER `crontab -` has already
+        # installed the (correctly) empty crontab — so the disable succeeds but
+        # the success is never logged and cron reports a failure.
+        { crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true; } | crontab -
         log "self-disabled cron entry tagged: $CRON_TAG"
     else
         log "self_disable: no cron entry found for tag: $CRON_TAG (already removed?)"
@@ -164,6 +173,21 @@ self_disable() {
 #                 → state transitions A→B or B→DONE+self-disable
 #     return 1  → still waiting; cron retries next cycle
 #     return 2  → transient error (logged); cron retries next cycle
+# set_state <phase>
+#   Writes the state file, EXCEPT under DRY_RUN. A dry run must not advance the
+#   state machine: the README tells operators to smoke-test with DRY_RUN=1, and
+#   if the watched condition happens to be true at that moment, tg_confirmed
+#   short-circuits to success, phase advances A→B, and the next REAL cron tick
+#   runs phase_b_check and self-disables the watcher. A smoke test must not be
+#   able to switch off the thing it is testing.
+set_state() {
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        log "set_state [DRY_RUN]: would set phase=$1 (state file untouched)"
+        return 0
+    fi
+    echo "$1" > "$STATE_FILE"
+}
+
 run_watcher() {
     local phase rc
     phase=$(cat "$STATE_FILE" 2>/dev/null || echo "A")
@@ -174,7 +198,7 @@ run_watcher() {
             rc=0
             phase_a_check || rc=$?
             case "$rc" in
-                0) echo "B" > "$STATE_FILE"; log "A → B" ;;
+                0) set_state B; log "A → B" ;;
                 1) ;;
                 2) ;;
                 *) log "phase_a_check returned unexpected rc=$rc; treating as waiting" ;;
@@ -185,7 +209,7 @@ run_watcher() {
             rc=0
             phase_b_check || rc=$?
             case "$rc" in
-                0) echo "DONE" > "$STATE_FILE"; self_disable; log "B → DONE" ;;
+                0) set_state DONE; self_disable; log "B → DONE" ;;
                 1) ;;
                 2) ;;
                 *) log "phase_b_check returned unexpected rc=$rc; treating as waiting" ;;
@@ -197,7 +221,7 @@ run_watcher() {
             ;;
         *)
             log "unknown phase=$phase; resetting to A"
-            echo "A" > "$STATE_FILE"
+            set_state A
             ;;
     esac
 }
