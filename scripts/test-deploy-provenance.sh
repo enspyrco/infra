@@ -114,6 +114,42 @@ DEPLOY_ALLOW_UNVERIFIED=1; export DEPLOY_ALLOW_UNVERIFIED
 [ "$(verdict "$TMP/nogit")" = PASS ] && ok "DEPLOY_ALLOW_UNVERIFIED=1 permits it" || no "DEPLOY_ALLOW_UNVERIFIED=1 did not permit it"
 unset DEPLOY_ALLOW_UNVERIFIED
 
+echo "== FORCED ARM: a FAILED measurement must not read as a clean tree =="
+# Found by Kelvin in the #162 cage-match. `git status | wc -l` returns the
+# PIPELINE's status, so a git that exits 128 is invisible and wc counts zero
+# lines of nothing. Pre-fix, with a genuinely dirty tree and a corrupt index,
+# this reported dirty=0 and ALLOWED the deploy with a clean provenance stamp.
+git -C "$TMP/work" checkout -q main
+cp -R "$TMP/work" "$TMP/corrupt"
+echo mutate >> "$TMP/corrupt/tracked.txt"          # genuinely dirty ...
+# POSITIVE CONTROL: prove the probe can see the dirt BEFORE we break the index.
+[ "$(verdict "$TMP/corrupt")" = REFUSE ] && ok "control: the dirty tree is refused while git works" \
+                                         || no "control failed — the dirty tree was not refused, so the next assertion proves nothing"
+printf 'CORRUPT' > "$TMP/corrupt/.git/index"       # ... and now unmeasurable
+[ "$(verdict "$TMP/corrupt")" = REFUSE ] && ok "refuses when git status FAILS (unknown != clean)" \
+                                         || no "a failed git status read as a clean tree and the deploy was allowed"
+
+echo "== FORCED ARM: a repo with no commits =="
+mkdir -p "$TMP/empty/scripts"; cp "$DEPLOY" "$TMP/empty/scripts/deploy-to.sh"
+git init -q "$TMP/empty"
+[ "$(verdict "$TMP/empty")" = REFUSE ] && ok "refuses a repo with no commits (no revision to attribute)" \
+                                       || no "deployed from a repo with no commits"
+# It must also not spray raw git plumbing errors at the operator.
+body "$TMP/empty" | grep -q "fatal: ambiguous argument" && no "leaks a raw git 'fatal: ambiguous argument' to the operator" \
+                                                        || ok "reports the no-commits case in its own words, not git's"
+
+echo "== FORCED ARM: origin/main not present locally =="
+mkdir -p "$TMP/noremote/scripts"; cp "$DEPLOY" "$TMP/noremote/scripts/deploy-to.sh"
+git init -q "$TMP/noremote"
+git -C "$TMP/noremote" config user.email t@example.invalid
+git -C "$TMP/noremote" config user.name test
+git -C "$TMP/noremote" add -A >/dev/null; git -C "$TMP/noremote" commit -qm solo
+[ "$(verdict "$TMP/noremote")" = REFUSE ] && ok "refuses when there is no origin/main to compare against" \
+                                          || no "deployed with no origin/main to compare against"
+body "$TMP/noremote" | grep -q "cannot compare HEAD against origin/main" \
+  && ok "names the real reason (no comparable ref), not 'unmerged branch'" \
+  || no "reported a misleading reason for the missing-ref case"
+
 echo ""
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -76,25 +76,56 @@ deploy_provenance_preflight() {
         return 0
     fi
 
-    local head_sha ref dirty
-    head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD)
-    ref=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)
+    local head_sha ref dirty status_out
+    # An empty repo (initialised, no commits) cannot answer "which commit is
+    # this?", so provenance is unestablishable — the same category as not being
+    # a git tree at all. Handled explicitly rather than letting git print a raw
+    # `fatal: ambiguous argument HEAD` at the operator.
+    if ! head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null); then
+        _refuse "${DEPLOY_ALLOW_UNVERIFIED:-0}" "DEPLOY_ALLOW_UNVERIFIED=1 — shipping from a repo with no commits" \
+            "$REPO_ROOT is a git repo with no commits, so there is no revision to attribute this deploy to. Set DEPLOY_ALLOW_UNVERIFIED=1 to override."
+        [ "$ok" = "1" ] || return 1
+        head_sha=0000000000
+    fi
+    ref=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo UNKNOWN)
     # Best-effort refresh so the comparison is not against a stale origin/main.
     # Offline must not block a deploy, so failure only downgrades the check.
     if ! git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null; then
         echo "  note: could not fetch origin/main — comparing against the local ref"
     fi
 
-    dirty=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no | wc -l | tr -d " ")
+    # Capture the command, then count — NEVER pipe straight into `wc`. A pipeline
+    # returns its LAST command's status, so a `git status` that exits 128 (corrupt
+    # index, unreadable objects) is invisible: `wc` counts zero lines of nothing and
+    # the tree reads CLEAN. Measured 2026-08-26 — with a genuinely dirty tree and a
+    # corrupted .git/index the old form reported dirty=0 and the preflight ALLOWED
+    # the deploy, stamping a clean provenance line. A failed measurement must never
+    # be indistinguishable from a clean result (cage-match #162, Kelvin).
+    if ! status_out=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>&1); then
+        _refuse "${DEPLOY_ALLOW_DIRTY:-0}" "DEPLOY_ALLOW_DIRTY=1 — deploying without knowing if the tree is clean" \
+            "git status failed in $REPO_ROOT, so whether the tree is clean is UNKNOWN (not clean). Set DEPLOY_ALLOW_DIRTY=1 to override. git said: $(printf '%s' "$status_out" | head -1)"
+        [ "$ok" = "1" ] || return 1
+        status_out=""
+    fi
+    dirty=$(printf '%s' "$status_out" | grep -c . || true)
     if [ "$dirty" != "0" ]; then
-        git -C "$REPO_ROOT" status --porcelain --untracked-files=no | sed "s/^/         /" >&2
+        printf '%s\n' "$status_out" | sed "s/^/         /" >&2
         _refuse "${DEPLOY_ALLOW_DIRTY:-0}" "DEPLOY_ALLOW_DIRTY=1 — shipping uncommitted changes" \
             "working tree has $dirty uncommitted change(s) to tracked files; deploying now ships bytes no commit can reproduce. Commit them, or set DEPLOY_ALLOW_DIRTY=1 to override."
     fi
 
     # Contained-in-main, not equal-to-main: deploying an OLDER main commit is a
     # legitimate rollback and must not need an override.
-    if ! git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+    # `--is-ancestor` exits 0 = yes, 1 = no, >1 = ERROR (e.g. origin/main absent on
+    # a fresh clone or a repo with no such remote). Collapsing >1 into "not an
+    # ancestor" would be safe-by-accident here (both refuse) but would report a
+    # misleading reason, so the error case says what actually happened.
+    local mb_rc=0
+    git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null || mb_rc=$?
+    if [ "$mb_rc" -gt 1 ]; then
+        _refuse "${DEPLOY_FROM_BRANCH:-0}" "DEPLOY_FROM_BRANCH=1 — deploying without an origin/main to compare against" \
+            "cannot compare HEAD against origin/main (git exit $mb_rc) — the ref may not exist locally. Fetch it, or set DEPLOY_FROM_BRANCH=1 to override."
+    elif [ "$mb_rc" -eq 1 ]; then
         _refuse "${DEPLOY_FROM_BRANCH:-0}" "DEPLOY_FROM_BRANCH=1 — shipping unmerged ref $ref" \
             "HEAD ($ref @ ${head_sha:0:8}) is not contained in origin/main. This tree is shared with peer sessions; deploying an unmerged branch ships code main cannot reproduce. Set DEPLOY_FROM_BRANCH=1 to override."
     fi
