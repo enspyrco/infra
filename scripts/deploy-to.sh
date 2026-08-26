@@ -21,6 +21,95 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE="nick@$IP"
 
 # ---------------------------------------------------------------------------
+# DEPLOY PROVENANCE PREFLIGHT
+#
+# Every deploy path below rsyncs/scps out of $REPO_ROOT — the WORKING TREE, not
+# a git object. So what reaches production is whatever happens to be checked out
+# and saved, which nothing here previously checked. Two ways that goes wrong,
+# both live:
+#
+#   1. UNCOMMITTED changes ship. No commit can reproduce the bytes on the box,
+#      so a rollback has nothing to roll back to and `git log` describes a
+#      machine state that never existed.
+#   2. THE WRONG BRANCH ships. This repo's working tree is shared with peer
+#      Claude sessions, so it frequently sits on someone else's branch. On
+#      2026-08-26 it sat on `chore/reconcile-caddyfile-with-box` for a whole
+#      session while three production deploys ran — safe only because each was
+#      driven from a worktree hand-pinned to origin/main. Deploying `caddy` off
+#      the wrong ref is not abstract: the tracked Caddyfile has drifted from the
+#      box, and shipping the wrong one DROPS LIVE VHOSTS.
+#
+# A convention ("always deploy from a pinned worktree") is not enough — it was
+# written down and then broken within hours by its own author. So the check is
+# here, in the path that touches production, rather than in anyone's memory.
+#
+# Deliberately a PREFLIGHT and not a rewrite to `git archive <ref>`, which is
+# the real structural fix (it would make shipping non-git bytes impossible
+# rather than merely refused). This script is slated for retirement in favour of
+# a config-pull leg, so it gets the cheap guard that dies with it, not the
+# rebuild. If that retirement stalls, `git archive` is the upgrade.
+#
+# Overrides exist because deploying a feature branch to test it is legitimate.
+# They are loud and they name what is being shipped, so the unusual case is
+# visible in the log rather than silent.
+deploy_provenance_preflight() {
+    # Each check reports at the severity of its OUTCOME, not of its condition:
+    # a refused deploy says ERROR, an overridden one says WARN. Printing ERROR on
+    # a run that then proceeds trains a reader to skim past ERROR lines, which is
+    # the habit that lets a real one through.
+    local ok=1
+    _refuse() {  # <override-var-value> <stamp> <message...>
+        local ov=$1 stamp=$2; shift 2
+        if [ "$ov" = "1" ]; then
+            echo "  WARN: $*"
+            echo "  !! $stamp"
+        else
+            echo "ERROR: $*" >&2
+            ok=0
+        fi
+    }
+
+    if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        _refuse "${DEPLOY_ALLOW_UNVERIFIED:-0}" "DEPLOY_ALLOW_UNVERIFIED=1 — shipping bytes with NO git provenance" \
+            "$REPO_ROOT is not a git work tree, so deploy provenance cannot be verified. Set DEPLOY_ALLOW_UNVERIFIED=1 to override."
+        [ "$ok" = "1" ] || return 1
+        return 0
+    fi
+
+    local head_sha ref dirty
+    head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    ref=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)
+    # Best-effort refresh so the comparison is not against a stale origin/main.
+    # Offline must not block a deploy, so failure only downgrades the check.
+    if ! git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null; then
+        echo "  note: could not fetch origin/main — comparing against the local ref"
+    fi
+
+    dirty=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no | wc -l | tr -d " ")
+    if [ "$dirty" != "0" ]; then
+        git -C "$REPO_ROOT" status --porcelain --untracked-files=no | sed "s/^/         /" >&2
+        _refuse "${DEPLOY_ALLOW_DIRTY:-0}" "DEPLOY_ALLOW_DIRTY=1 — shipping uncommitted changes" \
+            "working tree has $dirty uncommitted change(s) to tracked files; deploying now ships bytes no commit can reproduce. Commit them, or set DEPLOY_ALLOW_DIRTY=1 to override."
+    fi
+
+    # Contained-in-main, not equal-to-main: deploying an OLDER main commit is a
+    # legitimate rollback and must not need an override.
+    if ! git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+        _refuse "${DEPLOY_FROM_BRANCH:-0}" "DEPLOY_FROM_BRANCH=1 — shipping unmerged ref $ref" \
+            "HEAD ($ref @ ${head_sha:0:8}) is not contained in origin/main. This tree is shared with peer sessions; deploying an unmerged branch ships code main cannot reproduce. Set DEPLOY_FROM_BRANCH=1 to override."
+    fi
+
+    [ "$ok" = "1" ] || return 1
+    echo "  provenance: $ref @ ${head_sha:0:8}$([ "$dirty" != "0" ] && echo " +dirty")"
+    return 0
+}
+
+if ! deploy_provenance_preflight; then
+    echo "Aborting deploy of '$SERVICE' to $IP — see above." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Secret-safe value quoting helpers (defense-in-depth).
 #
 # Generated config files interpolate decrypted secrets. A secret containing
