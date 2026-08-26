@@ -88,6 +88,63 @@ tg() {
     fi
 }
 
+# html_escape <text>
+#   Escapes &, < and > for HTML-mode Telegram messages. Lives here rather than
+#   in lib/diagnose.sh because a watcher that needs only this one helper must
+#   not have to source diagnose.sh (which is absent on some hosts and would
+#   crash the watcher at startup under set -e).
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    printf '%s' "$s"
+}
+
+# tg_confirmed <html-message>
+#   Like tg(), but returns NON-ZERO unless the send produced a real Telegram
+#   delivery receipt. For watchers whose next act is irreversible (self-disable,
+#   state advance), where an unnoticed silent drop means the alert is lost
+#   forever.
+#
+#   The receipt test is `"message_id":`, matching scripts/lib/telegram.sh — a
+#   bare {"ok":true} is NOT sufficient, because notify's own /health returns
+#   exactly that WITHOUT touching Telegram, so a mis-aimed NOTIFY_URL would
+#   otherwise read as delivered. That lesson was learned on the alert path
+#   (#154) and never reached this fleet's tg(); this is it arriving.
+#
+#   tg() is deliberately left unchanged: it returns 0 unconditionally and five
+#   watchers call it under `set -e`, so making it fail would abort them.
+tg_confirmed() {
+    local msg="$1"
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        log "tg_confirmed [DRY_RUN]: ${msg//$'\n'/ }"
+        return 0
+    fi
+    if [[ -z "${NOTIFY_URL:-}" || -z "${NOTIFY_API_KEY:-}" ]]; then
+        log "tg_confirmed: NOTIFY_URL/NOTIFY_API_KEY not set — cannot confirm delivery"
+        return 1
+    fi
+    local payload body
+    payload=$(jq -n --arg m "$msg" --arg b "${TG_BOT:-infra}" \
+        '{message:$m, parse_mode:"HTML", bot:$b}')
+    if ! body=$(curl -sS --max-time 10 -X POST "${NOTIFY_URL}/send" \
+            -H "Authorization: Bearer ${NOTIFY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" 2>&1); then
+        log "tg_confirmed: curl failed: $body"
+        return 1
+    fi
+    case "$body" in
+        *'"message_id":'*)
+            log "tg_confirmed: delivery receipt received"
+            return 0 ;;
+        *)
+            log "tg_confirmed: NO delivery receipt (message_id) in response — silent drop or /health hit?: $body"
+            return 1 ;;
+    esac
+}
+
 # self_disable
 #   Removes any crontab line containing $CRON_TAG (the trailing-comment tag).
 #   Idempotent. Operates on the invoking user's crontab.

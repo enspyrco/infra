@@ -122,11 +122,11 @@ $EDITOR /tmp/cert-expiry-watch.sh
 #    - Implement phase_a_check + phase_b_check.
 
 # 2. Ship the watcher (and the lib if Sydney doesn't have it yet) to Sydney.
-ssh 149.118.69.221 'mkdir -p /home/ubuntu/lib'
+ssh 149.118.69.221 'sudo mkdir -p /opt/scripts/watchers/lib'
 scp scripts/watchers/lib/watcher-base.sh 149.118.69.221:/tmp/   # one-time
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/watcher-base.sh /home/ubuntu/lib/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/watcher-base.sh /opt/scripts/watchers/lib/'
 scp /tmp/cert-expiry-watch.sh 149.118.69.221:/tmp/
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/cert-expiry-watch.sh /home/ubuntu/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/cert-expiry-watch.sh /opt/scripts/watchers/'
 
 # 3. Confirm notify creds exist on the box (one-time, already in place
 #    if any other watcher has run there):
@@ -136,7 +136,7 @@ ssh 149.118.69.221 'ls -la ~/.config/imagineering/notify-credentials'
 #    `chmod 0600`.
 
 # 4. Install the cron entry. Tag it with the same name as CRON_TAG.
-ssh 149.118.69.221 'crontab -l | { cat; echo "*/15 * * * * /home/ubuntu/cert-expiry-watch.sh  # cert-expiry-watch"; } | crontab -'
+ssh 149.118.69.221 'crontab -l | { cat; echo "*/15 * * * * /opt/scripts/watchers/cert-expiry-watch.sh  # cert-expiry-watch"; } | crontab -'
 #    Note the trailing comment — self_disable() greps for it. The literal
 #    string after the # must match $CRON_TAG exactly.
 
@@ -223,7 +223,7 @@ notify.imagineering.cc. Use this while iterating on a new watcher to
 avoid Telegram noise:
 
 ```bash
-DRY_RUN=1 sudo -u ubuntu /home/ubuntu/.smoketest-foo.sh
+DRY_RUN=1 sudo -u ubuntu /opt/scripts/watchers/.smoketest-foo.sh
 tail /home/ubuntu/foo-watch.log
 # [<ts>] tg [DRY_RUN]: 🚨 ... (your alert text, newlines flattened)
 ```
@@ -320,9 +320,9 @@ footprint is just the lib + the script.
 ```bash
 # 1. Lib + script (lib likely already present from other watchers).
 scp scripts/watchers/lib/watcher-base.sh 149.118.69.221:/tmp/   # if not already there
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/watcher-base.sh /home/ubuntu/lib/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/watcher-base.sh /opt/scripts/watchers/lib/'
 scp scripts/watchers/email-health-watch.sh 149.118.69.221:/tmp/
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/email-health-watch.sh /home/ubuntu/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/email-health-watch.sh /opt/scripts/watchers/'
 
 # 2. Install the Brevo credential file (mode 0600, mirrors notify-credentials).
 #    The key lives in notify/secrets.yaml under brevo_api_key. Build the
@@ -343,10 +343,10 @@ rm -f /tmp/brevo-credentials; unset BREVO_KEY
 # 3. Install the cron entry (every 4 hours, off the hour). Tag MUST match
 #    CRON_TAG. Idempotent: strips any existing email-health-watch line first so
 #    re-running this step never creates duplicate entries / duplicate alerts.
-ssh 149.118.69.221 'crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /home/ubuntu/email-health-watch.sh  # email-health-watch"; } | crontab -'
+ssh 149.118.69.221 'crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /opt/scripts/watchers/email-health-watch.sh  # email-health-watch"; } | crontab -'
 
 # 4. Confirm first cycle (force a run, watch the log).
-ssh 149.118.69.221 '/home/ubuntu/email-health-watch.sh; tail ~/email-health-watch.log'
+ssh 149.118.69.221 '/opt/scripts/watchers/email-health-watch.sh; tail ~/email-health-watch.log'
 ```
 
 ## Built: notify-canary-melbourne
@@ -440,7 +440,7 @@ ssh nick-mel 'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@149.118.69.221 "e
 #    user ubuntu — offset to :47, clear of the oci-watcher's :17). Tag MUST
 #    match CRON_TAG. Idempotent: strips any existing line first.
 ssh nick-mel 'DRY_RUN=1 ~/notify-canary-melbourne.sh; tail ~/notify-canary-melbourne.log'
-ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * /home/ubuntu/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
+ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * /opt/scripts/watchers/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
 ```
 
 ## See also
