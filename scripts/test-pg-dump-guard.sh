@@ -312,21 +312,61 @@ pg_dump_has_schema "$TMP/nope.sql" && no "refuses a missing file" || ok "refuses
 pg_dump_has_schema "$TMP/sch-zero.sql" && no "refuses an empty file" || ok "refuses an empty file"
 pg_dump_has_schema "" && no "refuses an empty arg" || ok "refuses an empty arg"
 
-echo "== SCHEMA GATE: write/read symmetry — both sides make the SAME call =="
-# The whole point of the change. For each fixture, backup.sh's gate and
-# restore.sh's gate must agree; a disagreement is the bug class being closed.
-symfail=0
-for fx in "$TMP/sch-real.sql" "$TMP/empty-db.sql" "$TMP/sch-forge.sql"; do
-  pg_dump_has_schema "$fx" && w=accept || w=reject
+echo "== WRITE/READ ASYMMETRY LEDGER: the set of dumps backup stores and restore refuses =="
+# The previous version of this test was VACUOUS and could never fail (found by
+# Kelvin/gemini-2.5-pro reviewing this PR). It asserted `write=reject AND
+# read=accept`, but restore.sh applies a SUPERSET of backup.sh's gates, so a
+# write-reject always implies a read-reject. The condition was unreachable.
+#
+# The direction that can actually happen — and that matters — is the reverse:
+# backup.sh STORES a dump restore.sh will categorically REFUSE, so the refusal
+# surfaces mid-disaster. This test enumerates that set exactly.
+#
+# It is falsifiable in BOTH directions, which the old one was in neither:
+#   - a NEW asymmetry appears  -> the set grows -> FAIL
+#   - a known gap gets closed  -> the set shrinks -> FAIL (update the ledger)
+# And the set being NON-EMPTY is its own positive control: the detector is
+# demonstrably able to report something, so a future empty result means the
+# gap closed, not that the check went blind.
+#
+# WHY THE REMAINING GAP IS NOT CLOSED HERE. restore.sh also refuses replay
+# escapes (\connect, CREATE/DROP DATABASE). Moving that grep to the write side
+# looks like the obvious symmetry fix and is a TRAP: the grep is case-insensitive
+# and NOT COPY-aware, so an Outline document whose body line begins
+# "create database ..." would match. On the READ side a false reject is safe —
+# it refuses to restore and the live DB is untouched. On the WRITE side it
+# DELETES the dump and fails the run, handing any wiki user a nightly backup
+# outage. Verified: the grep does match such a COPY row; the live corpus has 0
+# occurrences, so the surface is live but unoccupied. The escape guard needs the
+# top-level COPY-aware parser tracked separately before it can be symmetrised.
+mkfix() { printf -- "$2" > "$TMP/asym-$1.sql"; }  # $2 IS the format; no extra -- at the call site
+mkfix real   '-- d\nCREATE TABLE t (id int);\nCOPY t (id) FROM stdin;\n1\n\\.\n--\n-- PostgreSQL database dump complete\n--\n'
+mkfix empty  '-- d\nSET x = 0;\n--\n-- PostgreSQL database dump complete\n--\n'
+mkfix escape '-- d\nCREATE TABLE t (id int);\n\\connect postgres\n--\n-- PostgreSQL database dump complete\n--\n'
+mkfix dropdb '-- d\nCREATE TABLE t (id int);\nDROP DATABASE outline;\n--\n-- PostgreSQL database dump complete\n--\n'
+# NB: fixtures are built with printf, never echo. Under zsh the builtin echo
+# interprets backslash escapes, and `\c` means "stop output here" — which
+# silently truncated a fixture during development and produced a confident
+# wrong reading.
+asym=""
+for fx in real empty escape dropdb; do
+  f="$TMP/asym-$fx.sql"
+  # WRITE side = exactly what backup.sh enforces before storing.
+  if pg_dump_is_complete "$f" && pg_dump_has_schema "$f"; then w=accept; else w=reject; fi
   if ( set +e; RESTORE_LIB_ONLY=1 . "$SCRIPT_DIR/restore.sh" >/dev/null 2>&1
-       _validate_pg_dump test "$fx" >/dev/null 2>&1 ); then r=accept; else r=reject; fi
-  # restore.sh applies MORE gates than the schema one, so it may reject where the
-  # schema gate accepts; what must never happen is the reverse — write accepting
-  # what read refuses on SCHEMA grounds.
-  [ "$w" = reject ] && [ "$r" = accept ] && symfail=$((symfail + 1))
+       _validate_pg_dump test "$f" >/dev/null 2>&1 ); then r=accept; else r=reject; fi
+  [ "$w" = accept ] && [ "$r" = reject ] && asym="$asym $fx"
 done
-[ "$symfail" -eq 0 ] && ok "no fixture is accepted by the write gate and refused for schema by read" \
-                     || no "$symfail fixture(s) break write/read schema symmetry"
+asym=${asym# }
+[ "$asym" = "escape dropdb" ] \
+  && ok "write/read asymmetry is exactly the known escape-guard gap: $asym" \
+  || no "write/read asymmetry ledger changed — expected 'escape dropdb', got '$asym'"
+# Positive control on the detector itself: the schema fixture must NOT be in the
+# set, and the set must be non-empty. An empty set here would mean either the
+# gap closed or the detector went blind, and those must not look alike.
+[ -n "$asym" ] && ok "asymmetry detector is live (non-empty set proves it can report)" \
+               || no "asymmetry detector returned an empty set — closed gap, or blind check?"
+case " $asym " in *" empty "*) no "the SCHEMA asymmetry is back — this PR regressed";; *) ok "the schema asymmetry this PR closes stays closed";; esac
 
 echo "== the guard behaves identically across awk dialects =="
 # This check exists because the guard moved completeness off `tail` + `grep -F`
