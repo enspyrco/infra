@@ -181,3 +181,66 @@ pg_dump_is_complete() {
   # Fed on stdin rather than as an argv filename so a path beginning with "-"
   # can never be parsed as an awk option (cage-match #157 r4, Tesla).
 }
+
+# ---------------------------------------------------------------------------
+# SCHEMA PRESENCE — a SEPARATE predicate, deliberately not folded into the one
+# above. The header's rule is that completeness must not double as safety; that
+# is about one GATE serving two contradictory demands, not about one file
+# holding two independent questions. "Is this a whole dump" and "does this dump
+# contain a schema" are orthogonal: a dump of a wiped database is perfectly
+# complete and perfectly useless. Both live here so the write and read sides
+# cannot drift apart, which is the bug this function exists to fix.
+#
+# WHY THE WRITE SIDE NEEDS THIS AT ALL
+# restore.sh refused a schemaless dump; backup.sh happily STORED one. That
+# asymmetry manufactures a backup the restore path will categorically reject —
+# discovered at DR time, which is the worst possible moment. Worse, storing it
+# overwrites the good copy in the working tree and logs "Backup complete!".
+# This repo has already lived that failure once: outline and kanbn failed every
+# night for 40 nights while the live outline DB held 93 documents and its backup
+# held 0 bytes (see the FAILED_SERVICES alert block in backup.sh).
+#
+# The harms are asymmetric and they point the other way from the completeness
+# guard, which is why the answer differs. There, a false reject DESTROYED a good
+# dump, so it broke toward accepting. Here a false reject at backup time only
+# fails the run: the Telegram alert fires and `backup_to_github` never runs (it
+# is `&&`-chained), so YESTERDAY's good backup survives untouched. Refusing
+# costs one noisy night; accepting costs the backup.
+#
+# ANCHORED AND COPY-AWARE, unlike the `grep -q 'CREATE TABLE'` it replaces.
+# That grep matched the string ANYWHERE, including inside COPY data — the exact
+# forgery class the completeness guard was rewritten to eliminate, left standing
+# one check below it on the DESTRUCTIVE path. Measured on the live corpus
+# (2026-08-26): outline.sql 39 unanchored / 39 anchored / 0 inside COPY data,
+# kanbn.sql 32 / 32 / 0. So anchoring is not a behaviour change on real dumps —
+# the surface is live but currently unoccupied, and outline is a wiki, so a
+# document body is content a user can type.
+#
+# Case-sensitive on the keyword, matching what pg_dump actually emits. A
+# case-insensitive match would fail OPEN (more ways to satisfy "has schema"),
+# and this predicate guards a destructive path where closed is the right
+# direction. A hand-written lowercase dump is refused on purpose.
+#
+# RESIDUAL: shares residual 1 above — a top-level `CREATE TABLE` inside a
+# dollar-quoted function body would count. Closing it needs dollar-quote state,
+# tracked as its own task; it is a fail-OPEN gap on a check that is itself a
+# second line of defence, so it does not gate this change.
+
+# pg_dump_has_schema <file>
+# 0 if the dump declares at least one table OUTSIDE any COPY data block.
+pg_dump_has_schema() {
+  local f=${1:-}
+  [ -n "$f" ] && [ -s "$f" ] || return 1
+  awk '
+    { sub(/\r$/, "") }
+    # Same COPY latch as pg_dump_is_complete, and same loose header match for
+    # the same locale reason (toupper is locale-dependent; under a Turkish
+    # locale stdin never matches STDIN and the latch never closes).
+    /^COPY / && /[ ][Ff][Rr][Oo][Mm][ ]+[Ss][Tt][Dd][Ii][Nn]/ { incopy = 1; next }
+    incopy && $0 == "\\." { incopy = 0; next }
+    incopy { next }
+    /^[[:space:]]*CREATE TABLE/ { found = 1; exit }
+    END { exit found ? 0 : 1 }
+  ' < "$f"
+  # stdin, not argv, so a path beginning with "-" is never an awk option.
+}
