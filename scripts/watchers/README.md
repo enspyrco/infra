@@ -81,10 +81,36 @@ Each watcher sources `lib/watcher-base.sh`, which provides `log()`, `tg()`,
 watcher itself defines only `WATCHER_NAME`, `CRON_TAG`, `phase_a_check`,
 and `phase_b_check`. Typical watcher size: 50-80 lines.
 
-On Sydney, the lib is deployed once at `/home/ubuntu/lib/watcher-base.sh`
-and watchers source it via `"$(dirname "$0")/lib/watcher-base.sh"` (or
-`$HOME/lib/watcher-base.sh` as fallback). Updating the lib is a single
-file change that all watchers pick up on next cron tick.
+### Where watchers run on Sydney — ONE location
+
+**`/opt/scripts/watchers/` is the only place a watcher may run from.** That is
+where `deploy-to.sh scripts` installs them, so it is the only path the repo can
+reach. `ubuntu`'s crontab invokes them there by absolute path.
+
+This was not always true, and the failure is worth knowing because it was
+invisible for months: watchers used to run from a hand-maintained copy in
+`/home/ubuntu/`, while deploys landed in `/opt/scripts/watchers/`. Two complete
+parallel installs, drifting in *both* directions — the run tree had a newer
+`lib/`, the deploy tree had newer watcher scripts. Three of five were
+byte-identical, which is what made spot-checks pass. PR #94 merged 2026-08-13
+and never executed once.
+
+Path resolution supports the single location: a watcher sources
+`"$(dirname "$0")/lib/watcher-base.sh"`, so the lib always comes from beside
+the script that is actually running. Everything *stateful* — `CONFIG_DIR`,
+`STATE_FILE`, `LOG_FILE`, `CRED_FILE` — resolves under `$HOME` instead, so
+state, credentials and logs stay in `/home/ubuntu/` regardless of where the
+code lives. That separation is deliberate: **code is repo-owned and
+deploy-replaced; state is host-owned and must survive a deploy.**
+
+Updating the lib is still a single file change that all watchers pick up on
+the next cron tick — it just has to go through a deploy now.
+
+> **Known remaining gap:** the *schedule* is still `ubuntu`'s user crontab,
+> hand-edited and invisible to this repo. Only the *code* is repo-authoritative.
+> Moving the schedule into a deployed `/etc/cron.d/` entry is blocked on
+> `self_disable()`, which works by rewriting the user crontab and would fail
+> silently against a `cron.d` file. See the self-disable section below.
 
 ## Spawn a new watcher
 
