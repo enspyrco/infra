@@ -119,6 +119,16 @@ jobs:
       - name: Run resolve-container tests
         run: ./scripts/test-resolve-container.sh
 
+      # Guards deploy-to.sh's provenance preflight. The preflight decides whether
+      # production may receive the working tree, and its failure mode is silent:
+      # a check that always passes is indistinguishable from a clean deploy. The
+      # suite is RED-proven — neutering the preflight to `return 0` turns 5
+      # assertions red and the suite exits 1, so this step cannot go green on a
+      # dead guard. It opens no connections (TEST-NET-3 + an unknown service that
+      # exits before dispatch).
+      - name: Run deploy-provenance tests
+        run: ./scripts/test-deploy-provenance.sh
+
       - name: Run release-assets tests
         run: ./scripts/test-release-assets.sh
 
