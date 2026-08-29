@@ -92,9 +92,19 @@ function runClaude({ system, prompt, model }) {
 
     // Empty cwd so there's no project CLAUDE.md / settings to auto-discover —
     // keeps the call closer to pure inference and trims startup work.
+    // stdio stdin MUST be 'ignore'. Without it the child inherits this server
+    // process's stdin, which under docker is an open pipe nobody ever writes
+    // to. The claude CLI waits 3s for stdin data, prints
+    //   "Warning: no stdin data received in 3s, proceeding without it"
+    // and then EXITS 1 — so a warning becomes a hard failure. Measured in the
+    // container log 2026-08-30: 11 of 50 /chat calls (22%) died exactly this
+    // way, in a tight 4.5-5.2s band. It is the single largest failure class,
+    // more than twice as common as the 180s timeouts everyone was looking at.
+    // The CLI's own message names the fix: redirect stdin explicitly.
     const proc = spawn('claude', args, {
       cwd: '/tmp',
       env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';
