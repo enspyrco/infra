@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 // Proves the stdio fix in server.js does what it claims.
 //
-// The bug: spawn() without a stdio option gives the child THIS process's stdin.
-// Under docker that is an open pipe nobody writes to, so the claude CLI waits
-// for input, warns, and exits 1 — turning a warning into a hard failure for
-// 22% of /chat calls.
+// The bug: spawn()'s default stdio is 'pipe' (NOT 'inherit'), so the child gets
+// a fresh pipe on fd 0 whose write end this process holds open and never writes
+// to or closes. The child blocks on a read that can never yield data OR EOF, so
+// the claude CLI waits, warns at 3s, and exits 1 — turning a warning into a
+// hard failure for 22% of /chat calls.
+//
+// The distinction matters for whoever debugs this next: the culprit is a pipe
+// WE created, not stdin inherited across the docker boundary.
 //
 // Both arms are built here, because an arm that cannot produce the failure
 // cannot clear it:
-//   RED   — inherited stdin: the child blocks on a read that never completes
+//   RED   — default stdio: parent-held pipe on fd 0, never written or closed;
+//             the child blocks on a read that can never complete
 //   GREEN — stdio[0]='ignore': fd 0 is /dev/null, the read returns immediately
 //
 // Run: node claude-shim/src/stdin-spawn.test.mjs
@@ -42,11 +47,12 @@ function runArm(stdio) {
 
 const results = [];
 
-// RED arm. Deliberately reproduces the production defect: default stdio gives
-// the child a pipe on fd 0 that this test never writes to and never ends.
+// RED arm. Reproduces the production defect exactly: default stdio ('pipe')
+// puts a parent-owned pipe on the child's fd 0 which we never write to and
+// never close.
 const red = await runArm(null);
 results.push({
-  arm: 'RED  inherited/piped stdin, never written',
+  arm: 'RED  default stdio: parent-held pipe, never written',
   want: 'BLOCKED', got: red.outcome,
 });
 
@@ -70,6 +76,6 @@ if (red.outcome !== 'BLOCKED') {
 }
 
 console.log(failed === 0
-  ? '\nOK — inherited stdin hangs the child; ignore does not.'
+  ? '\nOK — a parent-held unwritten pipe hangs the child; ignore does not.'
   : `\n${failed} arm(s) wrong`);
 process.exit(failed === 0 ? 0 : 1);
