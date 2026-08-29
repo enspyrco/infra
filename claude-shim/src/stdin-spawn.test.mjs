@@ -21,7 +21,7 @@
 import { spawn } from 'node:child_process';
 
 // Stand-in for the claude CLI: block until stdin reaches EOF, then report.
-// With an inherited never-written pipe that EOF never arrives.
+// With a parent-held never-written pipe, that EOF never arrives.
 const CHILD = 'process.stdin.resume();' +
   'let n=0;' +
   'process.stdin.on("data",d=>{n+=d.length});' +
