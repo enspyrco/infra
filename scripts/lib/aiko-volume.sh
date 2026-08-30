@@ -34,10 +34,26 @@
 # locate the volume until the container is running again. Widening to
 # `docker ps -a` is deferred because it changes backup semantics and must first
 # resolve post-cutover exited-container ambiguity (see the #1759 PR discussion).
+# The image match tolerates a registry prefix: the island moved from a locally
+# built `aiko-chat-island:tag` to `ghcr.io/nickmeinhold/aiko-chat-island:0.3.0`,
+# and the old start-anchored pattern stopped matching, failing the nightly dump.
+#
+# The image alone is no longer a unique key either — the compose stack runs
+# aiko-chat-island-1, aiko-chat-1 and aiko-registrar-1 from that one image, so
+# matching on it returns three and the ambiguity guard below rejects all of
+# them. Narrow by the thing that actually defines the island for our purposes:
+# the container mounting /data, which is where aiko.db lives. That is this
+# file's stated source of truth already, so it discriminates without inventing
+# a name-shaped heuristic that would drift again at the next rename.
 aiko_island_container() {
   local matches count
   matches=$(docker ps --format '{{.Names}}\t{{.Image}}' \
-    | awk -F'\t' '$2 ~ /^aiko-chat-(island|gateway):/ {print $1}')
+    | awk -F'\t' '$2 ~ /(^|\/)aiko-chat-(island|gateway):/ {print $1}' \
+    | while read -r name; do
+        [ -n "$(docker inspect "$name" \
+          --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' \
+          2>/dev/null)" ] && printf '%s\n' "$name"
+      done)
   count=$(printf '%s' "$matches" | grep -c .)
   if [ "$count" -eq 0 ]; then
     echo "aiko-volume: no running island container (image aiko-chat-island|gateway:*)" >&2

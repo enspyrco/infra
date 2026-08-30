@@ -18,18 +18,44 @@ The OCI instance has decent resources (24GB RAM, 4 vCPU) but running many `docke
 
 ## Structure
 
+Every top-level dir, generated from disk 2026-08-26 (the previous block listed 9
+of 26 and had drifted since the early days of the repo). Dirs fall into three
+kinds: a **stack** (its own `docker-compose.yml`, built and run here), a
+**config-only** dir (SOPS secrets + deploy config for a service whose SOURCE
+lives in another repo), and **tooling**.
+
 ```
 .
-├── backups/            # Backup config (GitHub)
-├── caddy/              # Reverse proxy (Caddy)
-├── kanbn/              # Kanban boards (Trello alternative)
-├── outline/            # Team wiki (Notion alternative)
-├── radicale/           # CalDAV/CardDAV server
-├── scripts/            # Deployment & backup scripts
-├── claudius/            # Headless email agent (Claudius Maximus)
-├── dreamfinder/  # Matrix PM bot (Dreamfinder)
-└── .sops.yaml          # SOPS encryption config
+├── aiko-island/              # config-only: aiko-chat-island secrets (source: nickmeinhold/aiko-chat-island)
+├── aiko-island-enspyr/       # config-only: the enspyr-tenant island instance
+├── avatar-deploy/            # tooling: avatar deploy/rollback helpers + rehearsal runbook
+├── backups/                  # Backup config (GitHub) + release-asset token
+├── caddy/                    # Reverse proxy (Caddy), all vhosts
+├── cd-bus/                   # Cloudflare Worker source for the deploy-bus SSE relay
+├── claude-shim/              # stack: headless Claude Code shim used by the self-healer
+├── claudius/                 # stack: headless email agent (Claudius Maximus)
+├── docs/                     # design docs + runbooks
+├── dreamfinder/              # stack: Matrix PM bot (Dreamfinder)
+├── dreamfinder-avatar/       # stack: 3D avatar voice frontend (df.imagineering.cc)
+├── familiars-server/         # stack: Familiars backend (internal, Caddy-fronted)
+├── imagineering-contact-us/  # stack: contact-form / QR invite backend (img-contact)
+├── invite/                   # static site served at invite.imagineering.cc
+├── kanbn/                    # stack: Kanban boards (Trello alternative)
+├── livekit/                  # stack: WebRTC SFU
+├── lugh/                     # stack: auxiliary worker
+├── matrix/                   # stack: Continuwuity homeserver + mautrix bridges + relay bots
+├── notify/                   # stack: internal Telegram-send proxy (notify.imagineering.cc)
+├── outline/                  # stack: team wiki (Notion alternative)
+├── radicale/                 # stack: CalDAV/CardDAV server
+├── realm-token-server/       # config-only: Realm token mint (realm-token.imagineering.cc)
+├── scripts/                  # deployment, backup, restore + watchers/
+├── self-healer/              # tooling: in-prod log-reading operator (Node)
+├── tech-world-bots/          # stack: tw-clawd / tw-gremlin (tw-dreamfinder disabled)
+└── .sops.yaml                # SOPS encryption config
 ```
+
+> **Config-only dirs hold no source.** Editing one changes what gets DEPLOYED,
+> not what the service DOES — the code lives in the repo named beside it.
 
 ## CI & Branch Protection
 
@@ -44,25 +70,28 @@ The OCI instance has decent resources (24GB RAM, 4 vCPU) but running many `docke
 
 ## Services
 
-Sydney (149.118.69.221) hosts both **imagineering** services (img-* containers, ports 30xx/90xx) and co-located **xdeca** services (bare names, original 30xx/9000). Caddy routes by hostname.
+Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) and co-located **xdeca** services (bare names, original 30xx/9000). Caddy routes by hostname.
+
+> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule — the tenant-collision this creates is exactly what `scripts/lib/resolve-container.sh` exists to resolve, and a bare `docker exec radicale` reaches xdeca's container, not ours.
 
 ### Imagineering (public)
 
 | Service | Port | URL | Description |
 |---------|------|-----|-------------|
 | Caddy | 80/443 | - | Reverse proxy, auto-TLS via Let's Encrypt |
-| img-outline | 3012 | outline.imagineering.cc | Team wiki (Notion-like) |
-| (img-outline-minio) | 9010 | storage.imagineering.cc | S3-compatible file storage for img-outline |
-| img-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative) |
-| Radicale | 5232/5233 | dav.imagineering.cc | CalDAV/CardDAV (calendar & contacts) |
-| matrix-continuwuity | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork) |
+| imagineering-outline | 3012 | outline.imagineering.cc | Team wiki (Notion-like). Container is `imagineering-outline`, NOT `img-outline` — verified live 2026-08-26. Its postgres/redis are `imagineering-outline-postgres` / `-redis`. |
+| (imagineering-outline-minio) | 9010 | storage.imagineering.cc | S3-compatible file storage for outline + kanbn |
+| imagineering-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative). Container is `imagineering-kanbn`, NOT `img-kanbn`. Its DB is `imagineering-kanbn-postgres`. |
+| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` hits xdeca's tenant instead — that collision is real and is why `scripts/lib/resolve-container.sh` exists. Use it, not a bare name. |
+| matrix-continuwuity-1 | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork). Compose appends the `-1` suffix; the whole matrix stack does. |
 | (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot + relay-bot-hf |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
 | dreamfinder-avatar | 3015 | df.imagineering.cc | 3D avatar voice frontend |
 | symposium | 3016 | symposium.imagineering.cc | Discussion/event space |
 | livekit | - | livekit.imagineering.cc | WebRTC SFU (TURN/TLS at :5349 currently disabled — see memory) |
+| realm-token-server | - | realm-token.imagineering.cc | Realm credential exchange + LiveKit token mint. Live Caddy vhost (`caddy/Caddyfile`); this repo holds deploy config + SOPS secrets only, no source. |
 | youtube-rag | 3010/8010 | rag.imagineering.cc, rag-api.imagineering.cc | YouTube transcript RAG (frontend + backend + chroma) |
-| img-contact | 3014 | invite.imagineering.cc | Contact-form / QR invite landing |
+| img-contact | 3014 | imagineering.cc/api/contact | Contact-form backend. **Not** a vhost of its own — Caddy reaches it via `handle_path /api/contact` inside the `imagineering.cc` apex block. `invite.imagineering.cc` is a SEPARATE plain file server (`root * /srv/invite`) and does not proxy this. Corrected 2026-08-26 against `caddy/Caddyfile`. |
 | Claudius | - | - | Headless email-polling Claude Code agent |
 | cd-bus | - | cd-bus.nick-meinhold.workers.dev | Deploy-bus SSE relay (Cloudflare Worker + Durable Object, source in `cd-bus/`) — fans CI `image.published` events to host subscribers; pilot live on downstream-server since 2026-06-12 |
 
@@ -78,7 +107,7 @@ Sydney (149.118.69.221) hosts both **imagineering** services (img-* containers, 
 
 | Service | Port | URL | Description |
 |---------|------|-----|-------------|
-| tw-clawd, tw-dreamfinder, tw-gremlin | 8080 (internal) | world.imagineering.cc | Three Tech-World bots (Discord/Matrix/Telegram facades) |
+| tw-clawd, tw-gremlin | 8080 (internal) | world.imagineering.cc | Tech-World bots (Discord/Matrix/Telegram facades). **`tw-dreamfinder` is DISABLED** (commented out in `tech-world-bots/docker-compose.yml`, c2b86aa — it collided with the main dreamfinder); only two run. |
 
 ### Co-located xdeca services
 
@@ -211,7 +240,7 @@ Everything runs on Oracle Cloud's Always Free tier — no billing, no trial expi
 
 | Shape | OCPUs | RAM | Instances | Notes |
 |-------|-------|-----|-----------|-------|
-| VM.Standard.A1.Flex (Arm) | 4 total | 24 GB total | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently |
+| VM.Standard.A1.Flex (Arm) | 4 total¹ | 24 GB total¹ | Up to 4 | Ampere Altra 3 GHz. OCPU/RAM ratio is flexible — allocate independently. ¹Grandfathered accounts (our Sydney tenancy) get 4/24; **newer tenancies are now capped at 2 OCPU / 12 GB** (Oracle shrank the A1 grant). `scripts/oci-retry-provision.sh` auto-detects the real per-tenancy limit and adapts. |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 each (burstable) | 1 GB each | Up to 2 | **Separate CPU budget** — does not eat into A1 allocation. Can burst above baseline |
 
 Total baseline: **4.25 OCPUs + 26 GB RAM** across up to 6 instances.

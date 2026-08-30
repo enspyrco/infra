@@ -10,11 +10,17 @@ Endpoints:
   POST /send                    -> forwards to Telegram sendMessage
        Header: Authorization: Bearer <NOTIFY_API_KEY>
        Body:   {"message": "...", "parse_mode": "HTML"|"MarkdownV2"|null,
-                "chat_id": "<override>"} (chat_id optional)
+                "chat_id": "<override>", "bot": "dreams"|"infra"} (all optional)
+
+`bot` selects the sending identity (default "dreams"); "infra" sends as the
+Enspyr Infra bot so infra alerts don't wear the dreams identity. Unknown
+selectors are rejected 400.
 
 All secrets come from env vars:
-  TELEGRAM_BOT_TOKEN  - bot token from @BotFather
+  TELEGRAM_BOT_TOKEN  - dreams bot token from @BotFather
   TELEGRAM_CHAT_ID    - default chat to send to
+  INFRA_BOT_TOKEN     - infra bot token (optional; falls back to dreams)
+  INFRA_CHAT_ID       - infra default chat (optional; falls back to dreams)
   NOTIFY_API_KEY      - shared secret clients must present in Bearer auth
   PORT                - listen port (default 8090)
 """
@@ -29,6 +35,20 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 API_KEY = os.environ["NOTIFY_API_KEY"]
 PORT = int(os.environ.get("PORT", "8090"))
+
+# Optional second identity for infra alerts, so they arrive as "Enspyr Infra"
+# rather than co-mingling with dreams traffic. Falls back to the dreams bot if
+# the infra creds aren't deployed, so a `bot: "infra"` request is always safe.
+INFRA_BOT_TOKEN = os.environ.get("INFRA_BOT_TOKEN") or BOT_TOKEN
+INFRA_CHAT_ID = os.environ.get("INFRA_CHAT_ID") or CHAT_ID
+
+# Named-bot registry: selector -> (token, default chat_id). "dreams" is the
+# default so existing callers (watchers, remote agents, GitHub Actions) that
+# send no `bot` field are completely unchanged.
+BOTS = {
+    "dreams": (BOT_TOKEN, CHAT_ID),
+    "infra": (INFRA_BOT_TOKEN, INFRA_CHAT_ID),
+}
 
 
 class NotifyHandler(BaseHTTPRequestHandler):
@@ -70,8 +90,13 @@ class NotifyHandler(BaseHTTPRequestHandler):
         if not message:
             self._reply(400, {"error": "missing 'message' field"})
             return
+        bot = payload.get("bot", "dreams")
+        if bot not in BOTS:
+            self._reply(400, {"error": f"unknown bot '{bot}' (known: {', '.join(BOTS)})"})
+            return
+        bot_token, bot_chat = BOTS[bot]
         tg_payload = {
-            "chat_id": payload.get("chat_id", CHAT_ID),
+            "chat_id": payload.get("chat_id", bot_chat),
             "text": message,
         }
         parse_mode = payload.get("parse_mode", "HTML")
@@ -81,7 +106,7 @@ class NotifyHandler(BaseHTTPRequestHandler):
             tg_payload["disable_notification"] = True
 
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
             data=json.dumps(tg_payload).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",

@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
         with:
           scandir: './scripts'
           additional_files: '.githooks/pre-commit'
@@ -24,9 +24,23 @@ jobs:
       # scripts; scandir above only covers ./scripts, so lint cd-bus/ too —
       # otherwise "Shell Linting" would be green while not covering them.
       - name: Run ShellCheck (cd-bus)
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
         with:
           scandir: './cd-bus'
+          severity: warning
+
+      # The avatar deploy/rollback substrate (avatar-deploy/bin/) lived only in
+      # ~/bin on the production box until 2026-08-10 and was never linted. The
+      # very first shellcheck run on it flagged SC2034 "IMG appears unused" —
+      # which was a real, live defect: a trailing comment had swallowed
+      # `echo "image=$IMG"`, silently dropping the image identity from every
+      # lyra release record. scandir above covers neither ./cd-bus nor this, so
+      # without its own step "Shell Linting" would be green while blind to the
+      # scripts that can roll production back onto a vulnerable image.
+      - name: Run ShellCheck (avatar-deploy)
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
+        with:
+          scandir: './avatar-deploy'
           severity: warning
 
   yaml-lint:
@@ -90,6 +104,51 @@ jobs:
         env:
           REQUIRE_ALL: "1"
         run: ./scripts/test-restore-aiko-island.sh
+
+  backup-libs:
+    name: Backup Library Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hermetic unit tests for the backup helper libs — `docker` and `gh` are
+      # stubbed, so no daemon, no token, no network, and nothing real is
+      # mutated. These cover the fail-closed guards on container resolution,
+      # where a wrong answer silently backs up the WRONG tenant's data (see
+      # lib/resolve-container.sh) rather than failing visibly.
+      - name: Run resolve-container tests
+        run: ./scripts/test-resolve-container.sh
+
+      # Guards deploy-to.sh's provenance preflight. The preflight decides whether
+      # production may receive the working tree, and its failure mode is silent:
+      # a check that always passes is indistinguishable from a clean deploy. The
+      # suite is RED-proven — neutering the preflight to `return 0` turns 5
+      # assertions red and the suite exits 1, so this step cannot go green on a
+      # dead guard. It opens no connections (TEST-NET-3 + an unknown service that
+      # exits before dispatch).
+      - name: Run deploy-provenance tests
+        run: ./scripts/test-deploy-provenance.sh
+
+      - name: Run release-assets tests
+        run: ./scripts/test-release-assets.sh
+
+      # Guards the pg_dump completion-marker check. The old inline `tail -n5`
+      # passed by exactly one line on pg_dump 15.17; one more trailer would have
+      # failed EVERY postgres backup and deleted the dump. The guard is now
+      # structural (footer shape, no line count) — the suite pins the real
+      # fixture shape, the footer-forgery class, and write/read symmetry.
+      # The guard is awk-based. Measured on 149.118.69.221 (2026-08-26):
+      # /usr/bin/awk is GNU Awk 5.2.1, NOT mawk as this step previously claimed
+      # — so gawk is the dialect that must not regress, and mawk is defensive
+      # cover for a box whose awk alternative gets switched. Both are installed
+      # explicitly so the suite's dialect sweep actually has something to sweep:
+      # an absent alternate awk would skip silently, and a skipped check reads
+      # exactly like a passing one.
+      - name: Install alternate awk dialects (gawk = the box's awk; mawk defensive)
+        run: sudo apt-get install -y --no-install-recommends mawk gawk
+
+      - name: Run pg-dump-guard tests
+        run: ./scripts/test-pg-dump-guard.sh
 
   caddy-validate:
     name: Caddyfile Validate

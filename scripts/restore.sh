@@ -2,13 +2,7 @@
 # Restore script for all services
 # Restores from GitHub backup repo (imagineering-cc/imagineering-backups)
 # Usage: ./restore.sh <service>
-#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity
-#
-# Note: continuwuity requires the age private key path in $AGE_IDENTITY_FILE
-# (default: ~/.config/sops/age/keys.txt — same file SOPS uses; age will try
-# each key in the file until one matches). Restoring continuwuity replaces
-# the live homeserver state — only do it on a fresh instance or after
-# confirming the existing state is unrecoverable.
+#   service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix
 
 set -e
 
@@ -35,6 +29,12 @@ AGE_IDENTITY_FILE="${AGE_IDENTITY_FILE:-${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
+# Completion-marker guard — the SAME check backup.sh writes against (structural,
+# not a tail window). These two must never diverge: a laxer test on the write
+# side than the read side stores dumps that restore then rejects as "truncated"
+# mid-disaster. test-pg-dump-guard.sh asserts the symmetry.
+# shellcheck source=lib/pg-dump-guard.sh
+. "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 
 # Usage check + dispatch are deferred to the guarded tail so the test harness
 # can source this file (RESTORE_LIB_ONLY=1) without triggering the arg check.
@@ -51,8 +51,9 @@ cleanup_backups() {
 }
 
 # Validate a plain-text pg_dump BEFORE any destructive restore step: non-empty,
-# complete (end-anchored '-- PostgreSQL database dump complete'), and not a
-# schemaless/empty DB (has CREATE TABLE). Returns non-zero so the caller can abort
+# complete (structural footer check — see lib/pg-dump-guard.sh; NOT the old
+# `tail -n5` window), not a schemaless/empty DB (has CREATE TABLE), and free of
+# statements that escape the temp DB. Returns non-zero so the caller can abort
 # with the LIVE database still intact. The old restore_kanbn/outline dropped the
 # live DB FIRST, then blind-loaded — a corrupt/truncated repo dump wiped live data.
 # (The full atomic restore-into-temp-DB-then-rename is Phase 2 of #29 — needs a
@@ -62,11 +63,26 @@ _validate_pg_dump() {
   if [ ! -s "$f" ]; then
     error "$svc: dump $(basename "$f") is empty — refusing (live DB untouched)"; return 1
   fi
-  if ! tail -n5 "$f" | grep -qxF -- '-- PostgreSQL database dump complete'; then
+  if ! pg_dump_is_complete "$f"; then
     error "$svc: dump incomplete (no completion marker — truncated) — refusing (live DB untouched)"; return 1
   fi
-  if ! grep -q 'CREATE TABLE' "$f"; then
+  # Anchored + COPY-aware (see lib/pg-dump-guard.sh). Was `grep -q 'CREATE TABLE'`,
+  # which matched the string ANYWHERE including inside COPY data — the same forgery
+  # class the completeness guard above was rewritten to eliminate, left standing one
+  # check below it on the destructive path. No behaviour change on real dumps:
+  # measured 39/39 and 32/32 anchored-vs-unanchored, 0 inside COPY data.
+  if ! pg_dump_has_schema "$f"; then
     error "$svc: dump has no CREATE TABLE (empty/wrong DB) — refusing (live DB untouched)"; return 1
+  fi
+  # Refuse dumps that can escape the temp DB mid-replay: a `\connect`/`\c` reconnects
+  # to another DB (incl. the LIVE one), and cluster-level `CREATE DATABASE` /
+  # `DROP DATABASE` act on OTHER databases regardless of the current connection — any
+  # of these replays against live BEFORE the atomic swap, breaking the "temp DB only,
+  # live untouched" invariant (cage-match #140, Carnot r1 + Wu r2). Case-insensitive
+  # so lowercase SQL keywords don't slip past. Our backups are plain `pg_dump <db>`,
+  # so a real backup never trips this.
+  if grep -qiE '^[[:space:]]*(\\c|\\connect|create database|drop database)\b' "$f"; then
+    error "$svc: dump contains \\connect / CREATE DATABASE / DROP DATABASE (could act on the LIVE db mid-replay) — refusing. Expected a plain 'pg_dump <db>' dump."; return 1
   fi
   return 0
 }
@@ -117,6 +133,140 @@ _validate_sqlite_db() {
   return 0
 }
 
+# Atomically restore a postgres DB from a plain dump WITHOUT ever leaving the live
+# DB empty (#29 Phase 2). The postgres analog of _restore_island_core's temp-file +
+# atomic-mv: load the dump into a TEMP database, integrity-gate it, then swap it into
+# place with two ALTER DATABASE renames — keeping the prior live DB as a timestamped
+# rescue. The old restore_kanbn/outline dropped the live DB FIRST then loaded, so a
+# dump that passed validation but errored mid-replay left the DB EMPTY. Here the live
+# DB is untouched until a fully-replayed, non-empty candidate exists.
+#
+# Validated end-to-end against postgres:alpine (cage-match #138 → #29 Phase 2):
+# good dump swaps in with the old DB preserved as rescue; a truncated dump fails the
+# temp load and the live DB is never touched.
+#
+# Args: <svc> <container> <pguser> <db> <composedir> <dumpfile>
+# Requires the dump to have already passed _validate_pg_dump.
+_restore_pg_atomic() {
+  local svc="$1" container="$2" user="$3" db="$4" composedir="$5" dumpfile="$6"
+  local ts temp rescue
+  ts=$(date +%Y%m%d_%H%M%S)
+  temp="${db}_restore_${ts}"
+  rescue="${db}_rescue_${ts}"
+
+  cd "$composedir" || { error "$svc: cannot cd $composedir"; return 1; }
+  docker compose up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+  docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 || { error "$svc: postgres not ready after 30s"; return 1; }
+
+  # 1. Load into a fresh temp DB — live $db untouched. --single-transaction +
+  #    ON_ERROR_STOP so a mid-replay error aborts with the temp DB discarded.
+  log "$svc: loading dump into temp DB $temp (live $db untouched)..."
+  docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+  docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "CREATE DATABASE \"$temp\";" >/dev/null 2>&1 \
+    || { error "$svc: could not create temp DB $temp — live $db untouched"; return 1; }
+  if ! docker exec -i "$container" psql -v ON_ERROR_STOP=1 --single-transaction -U "$user" -d "$temp" < "$dumpfile" >/dev/null 2>&1; then
+    error "$svc: dump failed to replay into temp DB — live $db UNTOUCHED. Dropping temp; investigate the dump before retrying."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # 2. Integrity gate: the candidate must have loaded at least one public table.
+  local ntables
+  # `|| true` so a hard docker/psql failure doesn't trip set -e on the assignment
+  # (leaving temp undropped) — the numeric guard below treats empty as a failed gate.
+  ntables=$(docker exec "$container" psql -U "$user" -d "$temp" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || true)
+  # Validate ntables is actually a number before the -ge (a failed docker exec /
+  # psql can emit a non-numeric error line, which would make `[ -ge ]` itself
+  # error — treat any non-digit result as a failed gate, live untouched).
+  if ! [[ "$ntables" =~ ^[0-9]+$ ]] || [ "$ntables" -lt 1 ]; then
+    error "$svc: temp DB integrity gate failed (no public tables, or count query errored: '$ntables') — live $db UNTOUCHED. Dropping temp."
+    docker exec "$container" psql -U "$user" -d postgres -c "DROP DATABASE IF EXISTS \"$temp\";" >/dev/null 2>&1
+    return 1
+  fi
+
+  # Small helpers for the swap phase — every step is explicitly checked rather than
+  # leaning on `set -e` (cage-match #140 round 2: Carnot/Tesla/Wu all flagged bare
+  # set -e commands with no recovery). _pgx runs a psql statement with ON_ERROR_STOP
+  # and returns its status; _unfence best-effort re-enables connections on a DB.
+  # _pgx runs a CHECKED psql statement (ON_ERROR_STOP) — always used in `if !` so
+  # set -e never aborts on it. _unfence + _apprestart are BEST-EFFORT recovery: they
+  # end in `|| true` so a failure can never trip set -e and skip the recovery step
+  # that follows (cage-match #140 r3, Carnot+Tesla: "best-effort under set -e is a
+  # lie"). The critical path is the explicit `if !` checks, not set -e.
+  _pgx() { docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "$1" >/dev/null 2>&1; }
+  _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1 || true; }
+  _apprestart() { docker compose up -d >/dev/null 2>&1 || true; }
+
+  # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
+  #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
+  #    ASSERT readiness — a not-ready postgres must not proceed to fence/rename.
+  log "$svc: stopping app for the atomic swap..."
+  docker compose stop >/dev/null 2>&1 || true
+  if ! docker compose up -d postgres >/dev/null 2>&1; then
+    error "$svc: postgres failed to restart for the swap — live $db UNTOUCHED, temp $temp left. Bringing app back up."
+    _apprestart; return 1
+  fi
+  for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
+  if ! docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1; then
+    error "$svc: postgres not ready after restart — live $db UNTOUCHED, temp $temp left. Bringing app back up."
+    _apprestart; return 1
+  fi
+
+  # 4. Atomic swap. FENCE connections first (ALLOW_CONNECTIONS false) so an external
+  #    client outside this compose project can't reconnect between terminate and
+  #    rename — and the fence + terminate are CHECKED (a silent fence failure would
+  #    reopen that race: cage-match #140 r2, Carnot+Tesla+Wu). On any failure before
+  #    the live rename, live is still $db and UNTOUCHED — un-fence it and restart.
+  if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS false; ALTER DATABASE \"$temp\" WITH ALLOW_CONNECTIONS false;"; then
+    error "$svc: could not fence connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  if ! _pgx "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('$db','$temp') AND pid <> pg_backend_pid();"; then
+    error "$svc: could not terminate live connections — aborting, live $db UNTOUCHED, temp $temp left. Un-fencing + restarting app."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  # Rename live->rescue, then temp->live. If the second rename fails, roll rescue
+  # back so live is never lost.
+  if ! _pgx "ALTER DATABASE \"$db\" RENAME TO \"$rescue\";"; then
+    error "$svc: could not rename live $db -> rescue (connections still open?) — live UNTOUCHED, temp $temp left."
+    _unfence "$db"; _apprestart; return 1
+  fi
+  if ! _pgx "ALTER DATABASE \"$temp\" RENAME TO \"$db\";"; then
+    error "$svc: rename temp -> live FAILED after live moved to rescue — rolling back rescue -> live."
+    if _pgx "ALTER DATABASE \"$rescue\" RENAME TO \"$db\";"; then
+      _unfence "$db"
+      error "$svc: rolled back — live $db is the original; temp $temp left for inspection."
+    else
+      error "$svc: ROLLBACK ALSO FAILED — original live is under DB '$rescue' (run: ALTER DATABASE \"$rescue\" RENAME TO \"$db\"; ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;), candidate under '$temp'. Manual recovery needed; app NOT restarted."
+      return 1
+    fi
+    _apprestart; return 1
+  fi
+
+  # 5. Un-fence the new live DB — CHECKED. It inherited ALLOW_CONNECTIONS false from
+  #    the temp; if this fails, the app would come up against a DB that refuses
+  #    connections (a silent RC=0 false-success — Tesla). Keep the app STOPPED and
+  #    error loudly (starting it against a fenced DB just crash-loops — Carnot r3).
+  if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;"; then
+    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose up -d'. Previous live kept as '$rescue'."
+    return 1
+  fi
+  # Re-enable the rescue DB too so operators can inspect it without a manual ALTER
+  # (it inherited the fence when it was still the live $db — Carnot :207). Best-effort.
+  _unfence "$rescue"
+
+  # Success — previous live kept as $rescue (drop it manually once satisfied). Check
+  # the app restart: the data swap already succeeded, so a restart failure is a warn
+  # (not a data-loss error), but don't print "complete" as if the service is up.
+  if docker compose up -d >/dev/null 2>&1; then
+    log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). App restarted."
+    return 0
+  fi
+  warn "$svc: atomic swap complete and data is live, but 'docker compose up -d' failed to restart the app — run it manually. Previous live kept as '$rescue'."
+  return 0
+}
+
 restore_kanbn() {
   log "Restoring Kan.bn..."
 
@@ -129,32 +279,12 @@ restore_kanbn() {
     cleanup_backups
     exit 1
   fi
-  # Validate BEFORE the destructive drop — a corrupt/truncated dump must never
-  # reach dropdb (the old code dropped first, then blind-loaded).
+  # Validate the dump, then atomically swap it in via a temp DB (never drops the
+  # live DB before a fully-replayed candidate exists — #29 Phase 2). The old code
+  # dropped+recreated FIRST then loaded, so a dump that errored mid-replay left the
+  # DB empty.
   _validate_pg_dump kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-
-  # Ensure Kan.bn postgres is running
-  cd ~/apps/kanbn
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i kanbn_postgres bash -c "psql -U kanbn -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kanbn' AND pid <> pg_backend_pid();\" postgres && dropdb -U kanbn kanbn && createdb -U kanbn kanbn"
-
-  # Atomic load: --single-transaction + ON_ERROR_STOP so a replay error rolls the
-  # WHOLE load back instead of leaving a half-populated DB. (The DB was just
-  # dropped+recreated, so on failure it ends EMPTY — surfaced loudly below, not
-  # silently logged as success.)
-  log "Restoring database..."
-  if ! docker exec -i kanbn_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U kanbn kanbn < "$BACKUP_FILE"; then
-    error "Kan.bn psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
-    cleanup_backups; exit 1
-  fi
-
-  log "Restarting Kan.bn..."
-  docker compose restart
+  _restore_pg_atomic kanbn kanbn_postgres kanbn kanbn ~/apps/kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Kan.bn restore complete!"
@@ -171,28 +301,9 @@ restore_outline() {
     cleanup_backups
     exit 1
   fi
-  # Validate BEFORE the destructive drop (see restore_kanbn).
+  # Validate + atomic temp-DB swap (see restore_kanbn / _restore_pg_atomic).
   _validate_pg_dump outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-
-  # Ensure Outline postgres is running
-  cd ~/apps/outline
-  docker compose up -d postgres
-  log "Waiting for PostgreSQL to start..."
-  sleep 10
-
-  # Drop and recreate database
-  log "Dropping existing database..."
-  docker exec -i outline_postgres bash -c "psql -U outline -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'outline' AND pid <> pg_backend_pid();\" postgres && dropdb -U outline outline && createdb -U outline outline"
-
-  # Atomic load (see restore_kanbn): rolls back on any replay error.
-  log "Restoring database..."
-  if ! docker exec -i outline_postgres psql -v ON_ERROR_STOP=1 --single-transaction -U outline outline < "$BACKUP_FILE"; then
-    error "Outline psql restore FAILED and rolled back — DB is now EMPTY (dump passed syntactic validation but errored on replay). Investigate the dump before retrying; do NOT expect data after an app restart."
-    cleanup_backups; exit 1
-  fi
-
-  log "Restarting Outline..."
-  docker compose restart
+  _restore_pg_atomic outline outline_postgres outline outline ~/apps/outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Outline restore complete!"
@@ -452,8 +563,8 @@ restore_aiko_island() {
 # Restore matrix bridges + relay-bot SQLite DBs from latest SQL dumps in the
 # backup repo. Each .sql file is replayed against a fresh SQLite DB inside
 # the bridge's volume. Bridges must be stopped before the replay (writing
-# to a live DB while replaying would corrupt it). Continuwuity itself is
-# NOT touched here — see restore_continuwuity for the homeserver.
+# to a live DB while replaying would corrupt it). The continuwuity homeserver
+# is NOT backed up or restored (its signing key is saved separately — 2026-08-02).
 restore_matrix() {
   log "Restoring matrix bridges + relay-bots..."
 
@@ -560,90 +671,9 @@ restore_matrix() {
   log "Matrix restore complete!"
 }
 
-# Restore Continuwuity from the most recent encrypted tarball in the
-# backup repo. The tarball is a RocksDB BackupEngine directory (not a
-# direct database snapshot) — it has meta/, private/, shared_checksum/
-# subdirs and requires a BackupEngine restore step, NOT a simple replace
-# of the data dir.
-#
-# Since Continuwuity has no `restore-database` admin command (only
-# `backup-database` and `list-backups`), full restore needs RocksDB's
-# `ldb restore` tool. This script extracts the encrypted backup into the
-# continuwuity_backups volume and prints next-step guidance — full
-# automation pending Continuwuity adding a restore command OR us shipping
-# an ldb-based helper.
-#
-# CRITICAL: full restore REPLACES the live homeserver state — signing
-# keys, room state, all messages, user accounts. Only do this on a fresh
-# deployment or when the live state is confirmed unrecoverable.
-#
-# Requires the age private key at $AGE_IDENTITY_FILE (default:
-# ~/.config/sops/age/keys.txt — same file SOPS uses). age will iterate
-# all private keys in the file until one matches the encrypted recipient.
-restore_continuwuity() {
-  log "Restoring Continuwuity (partial — see notes at end)..."
-
-  if [ ! -f "$AGE_IDENTITY_FILE" ]; then
-    error "Age identity file not found at $AGE_IDENTITY_FILE"
-    error "Set AGE_IDENTITY_FILE to the path of your private key."
-    exit 1
-  fi
-  if ! command -v age &>/dev/null; then
-    error "age not installed (apt-get install -y age)"
-    exit 1
-  fi
-
-  fetch_backups
-
-  local enc_file="$BACKUP_CLONE_DIR/continuwuity.tar.gz.age"
-  if [ ! -f "$enc_file" ]; then
-    error "No continuwuity.tar.gz.age found in backup repo"
-    cleanup_backups
-    exit 1
-  fi
-
-  warn "Backup file: $enc_file (committed $(stat -c %y "$enc_file" 2>/dev/null || echo unknown))"
-  warn "This will extract the RocksDB BackupEngine backup into the"
-  warn "matrix_continuwuity_backups volume. To actually restore INTO the"
-  warn "live database, you'll need to run a BackupEngine restore step"
-  warn "manually (see notes printed at the end)."
-  read -r -p "Type 'extract-backup' to confirm: " confirm
-  if [ "$confirm" != "extract-backup" ]; then
-    log "Aborted"
-    cleanup_backups
-    exit 0
-  fi
-
-  # Decrypt + extract into the matrix_continuwuity_backups volume. This
-  # does NOT touch the live continuwuity_data volume; the operator must
-  # then run a BackupEngine restore as a separate manual step.
-  log "Decrypting and extracting backup into matrix_continuwuity_backups..."
-  if ! age -d -i "$AGE_IDENTITY_FILE" "$enc_file" \
-       | docker run --rm -i -v matrix_continuwuity_backups:/data alpine \
-         sh -c "rm -rf /data/* && tar xzf - -C /data"; then
-    error "Decrypt/extract failed"
-    cleanup_backups
-    exit 1
-  fi
-
-  cleanup_backups
-  log "Backup extracted to matrix_continuwuity_backups volume."
-  echo ""
-  warn "NEXT STEPS (manual): To restore the database from this backup, you"
-  warn "need RocksDB's ldb tool to do a BackupEngine restore. Outline:"
-  echo "  1. apt-get install -y rocksdb-tools  # provides 'ldb'"
-  echo "  2. cd ~/apps/matrix && docker compose stop continuwuity"
-  echo "  3. # Identify backup dir on host:"
-  echo "     ls /var/lib/docker/volumes/matrix_continuwuity_backups/_data"
-  echo "  4. # Restore into a temp dir then swap with continuwuity_data:"
-  echo "     ldb --db=/tmp/restored restore \\"
-  echo "         --backup_dir=/var/lib/docker/volumes/matrix_continuwuity_backups/_data"
-  echo "  5. # Replace the live data volume contents with /tmp/restored"
-  echo "  6. docker compose up -d continuwuity"
-  echo ""
-  echo "TODO: ship an ldb-based helper or wait for Continuwuity to add a"
-  echo "      'restore-database' admin command (file an issue upstream)."
-}
+# Continuwuity restore constants. The image is the exact prod version so the
+# validate-boot exercises the real RocksDB (no ldb version-skew).
+MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the
 # functions (_restore_island_core + the aiko_island_* lib) without running the
@@ -660,13 +690,12 @@ fi
 # Deferred from the top of the file so the harness can source cleanly.
 if [ -z "$SERVICE" ]; then
   echo "Usage: $0 <service>"
-  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+  echo "  service: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
   echo ""
   echo "Examples:"
   echo "  $0 kanbn         # Restore latest from GitHub backup"
   echo "  $0 outline       # Restore latest from GitHub backup"
   echo "  $0 matrix        # Restore all matrix bridges + relay-bots"
-  echo "  $0 continuwuity  # Restore homeserver (requires AGE_IDENTITY_FILE)"
   exit 1
 fi
 
@@ -695,12 +724,9 @@ case $SERVICE in
   matrix)
     restore_matrix
     ;;
-  continuwuity)
-    restore_continuwuity
-    ;;
   *)
     error "Unknown service: $SERVICE"
-    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix, continuwuity"
+    echo "Valid services: kanbn, outline, radicale, pm-bot, claudius, aiko-island, matrix"
     exit 1
     ;;
 esac

@@ -92,9 +92,28 @@ function runClaude({ system, prompt, model }) {
 
     // Empty cwd so there's no project CLAUDE.md / settings to auto-discover —
     // keeps the call closer to pure inference and trims startup work.
+    // stdio stdin MUST be 'ignore'.
+    //
+    // Not because of inheritance — spawn()'s default is 'pipe', NOT 'inherit'.
+    // The child therefore gets a FRESH pipe on fd 0 whose write end is held
+    // open by THIS process and never written to and never closed. So the child
+    // blocks on a read that can never produce data or EOF. (Verified: with
+    // default stdio the parent has a proc.stdin stream; with 'inherit' it is
+    // null.) Getting this backwards sends the next responder to the docker
+    // process boundary instead of to the pipe we ourselves created.
+    //
+    // The claude CLI waits 3s for stdin data, prints
+    //   "Warning: no stdin data received in 3s, proceeding without it"
+    // and then EXITS 1 — so a warning becomes a hard failure. Measured in the
+    // container log 2026-08-30: 11 of 50 /chat calls (22%) died exactly this
+    // way, in a tight 4.5-5.2s band. It is the single largest failure class,
+    // more than twice as common as the 180s timeouts everyone was looking at.
+    // 'ignore' maps fd 0 to /dev/null, so the read hits EOF immediately —
+    // which is exactly what the CLI's own message prescribes.
     const proc = spawn('claude', args, {
       cwd: '/tmp',
       env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';

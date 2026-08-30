@@ -1,0 +1,11 @@
+# Deploy alias for imagineering-cc/lyra-avatar (was embodied-lyra). The app src
+# remote clones via git@github-lyra: so the repo gets its own scoped deploy key
+# rather than the box identity. Added 2026-08-10 — the alias was referenced by
+# the src remote but never defined, so every fetch failed at name resolution and
+# the box src sat frozen at 2e3f109 (2026-07-14). Same defect class as the
+# github-dreamfinder block above.
+Host github-lyra
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/embodied-lyra-deploy
+  IdentitiesOnly yes

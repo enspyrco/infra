@@ -61,6 +61,9 @@ log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
 #   default — caller is responsible for escaping <, >, & in dynamic text.
 #   Set DRY_RUN=1 to log the message instead of POSTing — useful while
 #   developing/smoke-testing a watcher to avoid Telegram noise.
+#   Sends as bot=$TG_BOT (default "infra" → @enspyr_infra_bot). notify's own
+#   default is "dreams", so the fleet must pass "infra" explicitly to speak in
+#   the right voice; a watcher can override TG_BOT if it ever needs another.
 tg() {
     local msg="$1"
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -72,7 +75,8 @@ tg() {
         return 0
     fi
     local payload
-    payload=$(jq -n --arg m "$msg" '{message:$m, parse_mode:"HTML"}')
+    payload=$(jq -n --arg m "$msg" --arg b "${TG_BOT:-infra}" \
+        '{message:$m, parse_mode:"HTML", bot:$b}')
     local result
     if result=$(curl -sS --max-time 10 -X POST "${NOTIFY_URL}/send" \
             -H "Authorization: Bearer ${NOTIFY_API_KEY}" \

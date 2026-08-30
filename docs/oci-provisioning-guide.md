@@ -1,10 +1,19 @@
 # Free Cloud Servers with OCI Always Free Tier
 
-This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately capable machines (2 CPU cores, 12GB RAM) and they're **free** on Oracle's Always Free tier.
-
-> ⚠️ **Oracle halved the Ampere allowance on 15 June 2026**, from 4 OCPU / 24 GB to **2 OCPU / 12 GB**, with no announcement — just a docs edit. This guide reflects the post-halving numbers.
+This guide walks you through setting up an automated script that keeps trying to grab a free ARM server from Oracle Cloud until it works. These are legitimately powerful machines (up to 4 CPU cores, 24GB RAM) and they're **free forever** on Oracle's Always Free tier.
 
 The catch? Everyone wants one, so they're almost always "out of capacity." Hence the retry script — it tries every 5 minutes until one slips through.
+
+> **⚠️ Heads up — Oracle has been shrinking the free A1 grant.** Older tenancies
+> (e.g. our Sydney box) got the full **4 OCPU / 24 GB**. Some **newer** tenancies
+> are now capped at **2 OCPU / 12 GB**. You can't tell from the marketing page —
+> you have to ask the API. The retry script now **auto-detects the tenancy's real
+> A1 allotment** (`limits resource-availability get` on `standard-a1-core-count`)
+> and caps its resize target to whatever the account actually allows, logging a
+> warning when it's below 4. So you always get the biggest box the tenancy permits,
+> and the loop still self-completes instead of grinding forever trying to reach a 4
+> it can't have. Once at target it resizes online — so if Oracle later raises your
+> limit, bump `full_ocpus` and it grows with no rebuild.
 
 ## What You're Getting
 
@@ -12,7 +21,8 @@ The catch? Everyone wants one, so they're almost always "out of capacity." Hence
 ┌─────────────────────────────────────────┐
 │  Oracle Cloud Always Free ARM Instance  │
 │                                         │
-│  • 2 OCPU (ARM cores) / 12GB RAM        │
+│  • Up to 4 OCPU / 24GB RAM (2/12 on    │
+│    some newer tenancies — auto-detected)│
 │  • Up to 200GB disk                     │
 │  • Ubuntu 24.04                         │
 │  • Public IP address                    │
@@ -24,14 +34,14 @@ But the ARM instance is just the headliner. The Always Free tier comes with a lo
 
 ### The Full Always Free Inventory
 
-**Compute** — 2.25 CPUs and 14 GB RAM total, across two separate CPU budgets:
+**Compute** — 4.25 CPUs and 26 GB RAM total, across two separate CPU budgets:
 
 | Shape | CPUs | RAM | Max Instances | Notes |
 |-------|------|-----|---------------|-------|
-| VM.Standard.A1.Flex (Arm) | 2 OCPUs | 12 GB | 2 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances. **Halved from 4/24 on 15 Jun 2026** |
+| VM.Standard.A1.Flex (Arm) | 4 OCPUs* | 24 GB* | 4 | Ampere Altra 3 GHz. Split OCPUs and RAM however you want across instances. *Newer tenancies may be capped at 2 OCPU / 12 GB — the retry script auto-detects and adapts |
 | VM.Standard.E2.1.Micro (AMD x86) | 1/8 OCPU each | 1 GB each | 2 | **Independent CPU budget** — doesn't touch the Arm allocation. Burstable above baseline |
 
-The Arm allowance is metered as **1,500 OCPU-hours + 9,000 GB-hours per month**, which is what 2 OCPU / 12 GB running 24×7 works out to. Because it's hours rather than instances, splitting into 2 × 1 OCPU / 6 GB later costs a rebuild, not quota.
+The Arm allowance is metered in **OCPU-hours and GB-hours**, not instances — the monthly figure tracks whatever your tenancy's allotment is running 24×7. Because it's hours rather than instances, splitting into 2 × 1 OCPU / 6 GB later costs a rebuild, not quota.
 
 The Micro instances are the sleeper pick. They run on completely different x86 hardware, so you're getting extra compute on top of the 2 Arm cores. Each gets its own public IP and 50 Mbps internet bandwidth. Good for monitoring, cron runners, small proxies, or a Tailscale exit node. They also tend to *have* capacity when Arm doesn't — useful if you want an always-on host to run the retry loop itself.
 
@@ -348,12 +358,12 @@ When it finally works, you'll see:
 
 Then a few cycles later:
 ```
-🎉 Resize initiated! Instance will reboot with 2 OCPUs.
+🎉 Resize initiated! Instance will reboot with 4 OCPUs.
 ```
 
 And finally:
 ```
-✅ Full instance running (2 OCPUs) at 123.45.67.89 — nothing to do!
+✅ Full instance running (4 OCPUs) at 123.45.67.89 — nothing to do!
 All instances at full capacity! Disabling cron job. 🎊
 ```
 
@@ -368,7 +378,7 @@ Once the instance is running:
 ssh ubuntu@<your-instance-ip>
 ```
 
-Your 2-core ARM server with 12GB of RAM is ready to go.
+Docker is already installed (cloud-init did that). Your 4-core ARM server with 24GB of RAM is ready to go.
 
 **Verify cloud-init actually did its job — don't assume it:**
 
@@ -468,7 +478,7 @@ Then **update everything that referenced the old address** — DNS A-records, `~
 
 ### Small-First Strategy
 
-Oracle has limited ARM capacity. Requesting the full 2 OCPU/12GB often fails. But requesting 1 OCPU/6GB succeeds much more often. Once you have a small instance, resizing it is easier because you already have a placement — Oracle just needs to allocate more resources on the same host.
+Oracle has limited ARM capacity. Requesting the full 4 OCPU/24GB almost always fails. But requesting 1 OCPU/6GB succeeds much more often. Once you have a small instance, resizing it is easier because you already have a placement — Oracle just needs to allocate more resources on the same host.
 
 Don't "optimise" `SMALL_OCPUS` up to 2 to skip a step — asking for the full allocation up front is precisely the request that gets refused, and you lose the placement advantage.
 
@@ -510,7 +520,7 @@ Then install the ntfy app on your phone and subscribe to your topic. No account,
 Sprinkle `notify` calls after the success messages:
 ```bash
 notify "Instance Created!" "Small instance provisioned — resize coming next cycle"
-notify "Resize Complete!" "Full 2 OCPU / 12GB instance is running at $IP" "high"
+notify "Resize Complete!" "Full 4 OCPU / 24GB instance is running at $IP" "high"
 ```
 
 ---

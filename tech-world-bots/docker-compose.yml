@@ -26,20 +26,28 @@ services:
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
 
-  dreamfinder:
-    build:
-      context: ./src
-    container_name: tw-dreamfinder
-    restart: unless-stopped
-    environment:
-      - BOT_NAME=dreamfinder
-      - LIVEKIT_URL=${LIVEKIT_URL}
-      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
-      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # DF's voice tools talk to the Imagineering services on OCI
-      - KAN_BASE_URL=${KAN_BASE_URL:-https://kan.imagineering.cc/api/v1}
-      - KAN_API_KEY=${KAN_API_KEY:-}
-      - KAN_BOARD_ID=${KAN_BOARD_ID:-}
-      - OUTLINE_BASE_URL=${OUTLINE_BASE_URL:-https://outline.imagineering.cc/api}
-      - OUTLINE_API_KEY=${OUTLINE_API_KEY:-}
+  # DISABLED 2026-08-15: this tw-dreamfinder (tech_world_bot, OpenAI Realtime)
+  # registers as agent "dreamfinder" on the SAME LiveKit server as the live
+  # `dreamfinder-avatar` container (Deepgram+Opus). Two workers sharing one
+  # dispatch name split "dreamfinder" jobs ~50/50 and would even co-exist in a
+  # room and talk over each other. Per Nick (2026-08-15) "Dreamfinder has become
+  # a catchall" — there is no canonical DF. Re-enable ONLY after giving each
+  # worker a distinct agent-dispatch name so they stop colliding.
+  # See project memory: livekit-and-dreamfinder-topology.
+  # dreamfinder:
+  #   build:
+  #     context: ./src
+  #   container_name: tw-dreamfinder
+  #   restart: unless-stopped
+  #   environment:
+  #     - BOT_NAME=dreamfinder
+  #     - LIVEKIT_URL=${LIVEKIT_URL}
+  #     - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+  #     - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+  #     - OPENAI_API_KEY=${OPENAI_API_KEY}
+  #     # DF's voice tools talk to the Imagineering services on OCI
+  #     - KAN_BASE_URL=${KAN_BASE_URL:-https://kan.imagineering.cc/api/v1}
+  #     - KAN_API_KEY=${KAN_API_KEY:-}
+  #     - KAN_BOARD_ID=${KAN_BOARD_ID:-}
+  #     - OUTLINE_BASE_URL=${OUTLINE_BASE_URL:-https://outline.imagineering.cc/api}
+  #     - OUTLINE_API_KEY=${OUTLINE_API_KEY:-}

@@ -21,6 +21,126 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE="nick@$IP"
 
 # ---------------------------------------------------------------------------
+# DEPLOY PROVENANCE PREFLIGHT
+#
+# Every deploy path below rsyncs/scps out of $REPO_ROOT — the WORKING TREE, not
+# a git object. So what reaches production is whatever happens to be checked out
+# and saved, which nothing here previously checked. Two ways that goes wrong,
+# both live:
+#
+#   1. UNCOMMITTED changes ship. No commit can reproduce the bytes on the box,
+#      so a rollback has nothing to roll back to and `git log` describes a
+#      machine state that never existed.
+#   2. THE WRONG BRANCH ships. This repo's working tree is shared with peer
+#      Claude sessions, so it frequently sits on someone else's branch. On
+#      2026-08-26 it sat on `chore/reconcile-caddyfile-with-box` for a whole
+#      session while three production deploys ran — safe only because each was
+#      driven from a worktree hand-pinned to origin/main. Deploying `caddy` off
+#      the wrong ref is not abstract: the tracked Caddyfile has drifted from the
+#      box, and shipping the wrong one DROPS LIVE VHOSTS.
+#
+# A convention ("always deploy from a pinned worktree") is not enough — it was
+# written down and then broken within hours by its own author. So the check is
+# here, in the path that touches production, rather than in anyone's memory.
+#
+# Deliberately a PREFLIGHT and not a rewrite to `git archive <ref>`, which is
+# the real structural fix (it would make shipping non-git bytes impossible
+# rather than merely refused). This script is slated for retirement in favour of
+# a config-pull leg, so it gets the cheap guard that dies with it, not the
+# rebuild. If that retirement stalls, `git archive` is the upgrade.
+#
+# Overrides exist because deploying a feature branch to test it is legitimate.
+# They are loud and they name what is being shipped, so the unusual case is
+# visible in the log rather than silent.
+deploy_provenance_preflight() {
+    # Each check reports at the severity of its OUTCOME, not of its condition:
+    # a refused deploy says ERROR, an overridden one says WARN. Printing ERROR on
+    # a run that then proceeds trains a reader to skim past ERROR lines, which is
+    # the habit that lets a real one through.
+    local ok=1
+    _refuse() {  # <override-var-value> <stamp> <message...>
+        local ov=$1 stamp=$2; shift 2
+        if [ "$ov" = "1" ]; then
+            echo "  WARN: $*"
+            echo "  !! $stamp"
+        else
+            echo "ERROR: $*" >&2
+            ok=0
+        fi
+    }
+
+    if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        _refuse "${DEPLOY_ALLOW_UNVERIFIED:-0}" "DEPLOY_ALLOW_UNVERIFIED=1 — shipping bytes with NO git provenance" \
+            "$REPO_ROOT is not a git work tree, so deploy provenance cannot be verified. Set DEPLOY_ALLOW_UNVERIFIED=1 to override."
+        [ "$ok" = "1" ] || return 1
+        return 0
+    fi
+
+    local head_sha ref dirty status_out
+    # An empty repo (initialised, no commits) cannot answer "which commit is
+    # this?", so provenance is unestablishable — the same category as not being
+    # a git tree at all. Handled explicitly rather than letting git print a raw
+    # `fatal: ambiguous argument HEAD` at the operator.
+    if ! head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null); then
+        _refuse "${DEPLOY_ALLOW_UNVERIFIED:-0}" "DEPLOY_ALLOW_UNVERIFIED=1 — shipping from a repo with no commits" \
+            "$REPO_ROOT is a git repo with no commits, so there is no revision to attribute this deploy to. Set DEPLOY_ALLOW_UNVERIFIED=1 to override."
+        [ "$ok" = "1" ] || return 1
+        head_sha=0000000000
+    fi
+    ref=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo UNKNOWN)
+    # Best-effort refresh so the comparison is not against a stale origin/main.
+    # Offline must not block a deploy, so failure only downgrades the check.
+    if ! git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null; then
+        echo "  note: could not fetch origin/main — comparing against the local ref"
+    fi
+
+    # Capture the command, then count — NEVER pipe straight into `wc`. A pipeline
+    # returns its LAST command's status, so a `git status` that exits 128 (corrupt
+    # index, unreadable objects) is invisible: `wc` counts zero lines of nothing and
+    # the tree reads CLEAN. Measured 2026-08-26 — with a genuinely dirty tree and a
+    # corrupted .git/index the old form reported dirty=0 and the preflight ALLOWED
+    # the deploy, stamping a clean provenance line. A failed measurement must never
+    # be indistinguishable from a clean result (cage-match #162, Kelvin).
+    if ! status_out=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>&1); then
+        _refuse "${DEPLOY_ALLOW_DIRTY:-0}" "DEPLOY_ALLOW_DIRTY=1 — deploying without knowing if the tree is clean" \
+            "git status failed in $REPO_ROOT, so whether the tree is clean is UNKNOWN (not clean). Set DEPLOY_ALLOW_DIRTY=1 to override. git said: $(printf '%s' "$status_out" | head -1)"
+        [ "$ok" = "1" ] || return 1
+        status_out=""
+    fi
+    dirty=$(printf '%s' "$status_out" | grep -c . || true)
+    if [ "$dirty" != "0" ]; then
+        printf '%s\n' "$status_out" | sed "s/^/         /" >&2
+        _refuse "${DEPLOY_ALLOW_DIRTY:-0}" "DEPLOY_ALLOW_DIRTY=1 — shipping uncommitted changes" \
+            "working tree has $dirty uncommitted change(s) to tracked files; deploying now ships bytes no commit can reproduce. Commit them, or set DEPLOY_ALLOW_DIRTY=1 to override."
+    fi
+
+    # Contained-in-main, not equal-to-main: deploying an OLDER main commit is a
+    # legitimate rollback and must not need an override.
+    # `--is-ancestor` exits 0 = yes, 1 = no, >1 = ERROR (e.g. origin/main absent on
+    # a fresh clone or a repo with no such remote). Collapsing >1 into "not an
+    # ancestor" would be safe-by-accident here (both refuse) but would report a
+    # misleading reason, so the error case says what actually happened.
+    local mb_rc=0
+    git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null || mb_rc=$?
+    if [ "$mb_rc" -gt 1 ]; then
+        _refuse "${DEPLOY_FROM_BRANCH:-0}" "DEPLOY_FROM_BRANCH=1 — deploying without an origin/main to compare against" \
+            "cannot compare HEAD against origin/main (git exit $mb_rc) — the ref may not exist locally. Fetch it, or set DEPLOY_FROM_BRANCH=1 to override."
+    elif [ "$mb_rc" -eq 1 ]; then
+        _refuse "${DEPLOY_FROM_BRANCH:-0}" "DEPLOY_FROM_BRANCH=1 — shipping unmerged ref $ref" \
+            "HEAD ($ref @ ${head_sha:0:8}) is not contained in origin/main. This tree is shared with peer sessions; deploying an unmerged branch ships code main cannot reproduce. Set DEPLOY_FROM_BRANCH=1 to override."
+    fi
+
+    [ "$ok" = "1" ] || return 1
+    echo "  provenance: $ref @ ${head_sha:0:8}$([ "$dirty" != "0" ] && echo " +dirty")"
+    return 0
+}
+
+if ! deploy_provenance_preflight; then
+    echo "Aborting deploy of '$SERVICE' to $IP — see above." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Secret-safe value quoting helpers (defense-in-depth).
 #
 # Generated config files interpolate decrypted secrets. A secret containing
@@ -124,13 +244,66 @@ deploy_scripts() {
         echo "  Add telegram_bot_token, telegram_chat_id, telegram_thread_id to enable alerts"
     fi
 
+    # Install the notify-secrets envfile (root:nick 0640) — the credential
+    # lib/telegram.sh actually uses since alerts were rerouted through the
+    # local notify proxy (claude-tasks#441: gremlin_xdeca_bot is muted in
+    # its target group, so direct Telegram sends were silently dropped).
+    # telegram.env above is kept for now: xdeca's release-watch and other
+    # non-lib consumers still hold those creds; retiring it is a separate
+    # subtractive pass.
+    local NOTIFY_SECRETS="$REPO_ROOT/notify/secrets.yaml"
+    if [ -f "$NOTIFY_SECRETS" ] && sops -d "$NOTIFY_SECRETS" | yq -e '.notify_api_key' > /dev/null 2>&1; then
+        echo "Installing /etc/imagineering-secrets/notify.env..."
+        local NOTIFY_KEY
+        NOTIFY_KEY=$(sops -d "$NOTIFY_SECRETS" | yq -r '.notify_api_key')
+        # Build locally, scp, install with restrictive perms — same
+        # pattern as telegram.env above. The file is consumed by bash
+        # `source` (not docker compose's dotenv parser), so %q gives the
+        # correct shell-quoting even if the key ever contains
+        # shell-significant bytes.
+        local NOTIFY_TMP
+        NOTIFY_TMP=$(mktemp)
+        # Clean up the 0600 plaintext temp file on ANY exit (incl. set -e
+        # aborts mid-scp/ssh) — locally and best-effort on the remote /tmp —
+        # mirroring the telegram.env block above. Without this trap a failed
+        # scp/ssh leaves the plaintext NOTIFY_API_KEY on both disks. Save any
+        # pre-existing EXIT trap and restore it on success rather than clearing
+        # unconditionally. ConnectTimeout bounds the remote scavenger so the
+        # trap can't hang ~120s on an unreachable host.
+        local NOTIFY_PREV_TRAP
+        NOTIFY_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand NOTIFY_TMP now, intentional
+        trap "rm -f '$NOTIFY_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/notify.env' 2>/dev/null || true" EXIT
+        printf 'NOTIFY_API_KEY=%q\n' "$NOTIFY_KEY" > "$NOTIFY_TMP"
+        chmod 0600 "$NOTIFY_TMP"
+        scp -q "$NOTIFY_TMP" "$REMOTE":/tmp/notify.env
+        ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
+            sudo install -m 0640 -o root -g nick /tmp/notify.env /etc/imagineering-secrets/notify.env && \
+            rm -f /tmp/notify.env"
+        rm -f "$NOTIFY_TMP"
+        # Restore the prior EXIT trap (empty string clears, if none existed).
+        eval "${NOTIFY_PREV_TRAP:-trap - EXIT}"
+        echo "  Notify envfile installed (mode 0640 root:nick)"
+    else
+        echo "NOTE: No notify_api_key in notify/secrets.yaml — cron alerts disabled"
+        echo "  lib/telegram.sh will no-op until /etc/imagineering-secrets/notify.env exists"
+    fi
+
     # Set up health check cron. Tokens are NOT inlined here any more — the
-    # script reads /etc/imagineering-secrets/telegram.env via lib/telegram.sh.
+    # script reads /etc/imagineering-secrets/notify.env via lib/telegram.sh.
+    #
+    # MAILTO must be QUOTED. On Ubuntu 24.04 (cron 3.0pl1-184ubuntu2) a bare
+    # `MAILTO=` makes cron reject the whole file with "Error: bad username"
+    # whenever the hour and day-of-month fields are both `*` — which is exactly
+    # the hourly entry below. Cron logs that once, at the scan after the file is
+    # written, and never again, because it only re-parses a cron.d file when the
+    # mtime changes. The result is a health check that installs cleanly, looks
+    # correct in `cat`, runs fine by hand, and never executes.
     echo "Installing /etc/cron.d/health-check..."
     ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
         'SHELL=/bin/bash' \
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        'MAILTO=' \
+        'MAILTO=\"\"' \
         '0 * * * * nick /opt/scripts/health-check.sh >> /home/nick/logs/health-check.log 2>&1' \
         | sudo tee /etc/cron.d/health-check > /dev/null && \
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
@@ -308,6 +481,8 @@ deploy_notify() {
     {
         printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(dotenv_quote "$(notify_field '.telegram_bot_token')")"
         printf 'TELEGRAM_CHAT_ID=%s\n'   "$(dotenv_quote "$(notify_field '.telegram_chat_id')")"
+        printf 'INFRA_BOT_TOKEN=%s\n'    "$(dotenv_quote "$(notify_field '.infra_telegram_bot_token')")"
+        printf 'INFRA_CHAT_ID=%s\n'      "$(dotenv_quote "$(notify_field '.infra_telegram_chat_id')")"
         printf 'NOTIFY_API_KEY=%s\n'     "$(dotenv_quote "$(notify_field '.notify_api_key')")"
     } > "$REPO_ROOT/notify/.env"
 
@@ -441,7 +616,22 @@ deploy_backups() {
     # didn't stage — better no deploy than a half-deploy over a live cron path.
     # (Remote rsync is implicitly proven present: the staging rsync above would
     # have failed here, before any mutation, if it were missing.)
-    ssh "$REMOTE" "test -s '$rstage/lib/aiko-volume.sh' && test -s '$rstage/lib/telegram.sh'" \
+    # The required-lib contract is DERIVED from the repo, not hand-listed. It was
+    # `aiko-volume.sh && telegram.sh` — written when those were the only two — and
+    # every lib added since (resolve-container, release-assets, pg-dump-guard) rode
+    # in unasserted. A partial rsync can drop one without failing, and the `bash -n`
+    # sweep below globs what IS there, so it cannot see an ABSENT file. backup.sh has
+    # no `set -e`: a missing lib leaves its functions undefined, and an undefined
+    # function is silent and non-zero — pg_dump_is_complete would then judge every
+    # dump truncated and the caller would DELETE it. Deriving the list means a new
+    # helper is covered the moment it lands, with nothing to remember.
+    local libname libtests_stage="true" libtests_live="true"
+    for libname in "$REPO_ROOT"/scripts/lib/*.sh; do
+        libname=$(basename "$libname")
+        libtests_stage="$libtests_stage && test -s '$rstage/lib/$libname'"
+        libtests_live="$libtests_live && test -r '/opt/scripts/lib/$libname'"
+    done
+    ssh "$REMOTE" "$libtests_stage" \
         || { echo "ERROR: required libs missing from staging — aborting before install"; ssh "$REMOTE" "rm -rf '$rstage'"; return 1; }
     # Parse the STAGED payload BEFORE mutating /opt/scripts: a syntactically broken
     # script/lib must be caught while the live tree is still untouched (fail closed
@@ -462,10 +652,11 @@ deploy_backups() {
         || { echo "ERROR: remote install failed"; ssh "$REMOTE" "rm -rf '$rstage'" 2>/dev/null; return 1; }
     # Post-install falsifier: deploy exit 0 must mean "the cron won't abort on a
     # missing/broken source", not just "bytes moved". Two checks: (1) the REQUIRED
-    # runtime contract — aiko-volume.sh + telegram.sh must be present + readable
-    # (a glob can't catch a MISSING required file); (2) every installed script and
+    # runtime contract — EVERY lib the repo ships must be present + readable, the
+    # same derived list asserted at staging (a glob can't catch a MISSING required
+    # file, which is why this is not the bash -n sweep); (2) every installed script and
     # lib/*.sh must parse (bash -n — no execution, so no telegram side effects).
-    ssh "$REMOTE" "test -r /opt/scripts/lib/aiko-volume.sh && test -r /opt/scripts/lib/telegram.sh \
+    ssh "$REMOTE" "$libtests_live \
         && for f in /opt/scripts/backup.sh /opt/scripts/restore.sh /opt/scripts/lib/*.sh; do bash -n \"\$f\" || { echo \"bash -n failed: \$f\"; exit 1; }; done" \
         || { echo "ERROR: post-install source check FAILED — backup cron would break; investigate the box"; return 1; }
     echo "  backup scripts + lib installed and source-verified"
@@ -506,7 +697,22 @@ Host github-imagineering-backups
     IdentitiesOnly yes
 SSHEOF'
     # Ensure main SSH config includes config.d
-    ssh "$REMOTE" 'grep -q "Include config.d/\*" ~/.ssh/config 2>/dev/null || printf "Include config.d/*\n\n" | cat - ~/.ssh/config 2>/dev/null > /tmp/ssh_config_tmp && mv /tmp/ssh_config_tmp ~/.ssh/config || printf "Include config.d/*\n" > ~/.ssh/config'
+    # `||` and `&&` are LEFT-ASSOCIATIVE with EQUAL precedence, so the previous
+    # one-liner parsed as ((grep || build-tmp) && mv) || overwrite. On the
+    # ALREADY-CORRECT path — grep finds the Include — the first group is true,
+    # `mv` still runs, fails because no temp file was ever built, and the
+    # trailing `|| printf > ~/.ssh/config` TRUNCATES the operator's SSH config
+    # to a single line. It misfires only when nothing needed fixing, which is
+    # why a deploy reporting success has been quietly discarding any Host block
+    # kept in ~/.ssh/config (reproduced: 5 lines -> 1, 2026-08-26). The stderr
+    # `mv: cannot stat` was the only symptom. Spelled as an explicit if/else so
+    # no branch can fall through into the destructive one.
+    ssh "$REMOTE" 'if ! grep -q "Include config.d/\*" ~/.ssh/config 2>/dev/null; then
+        umask 077
+        tmp=$(mktemp) || exit 1
+        mkdir -p ~/.ssh
+        { printf "Include config.d/*\n\n"; cat ~/.ssh/config 2>/dev/null || true; } > "$tmp" && mv "$tmp" ~/.ssh/config || { rm -f "$tmp"; exit 1; }
+    fi'
     ssh "$REMOTE" "chmod 600 ~/.ssh/config ~/.ssh/config.d/imagineering-backups"
 
     # Ensure GitHub host key is trusted
@@ -521,9 +727,8 @@ SSHEOF'
     echo "============================================"
     echo ""
 
-    # --- Continuwuity backup prerequisites ---
-    # `backup_continuwuity` needs the `age` binary to encrypt the tarball
-    # before pushing. apt is idempotent; reinstall is a no-op if present.
+    # --- age binary (used by encrypted backups / restores) ---
+    # apt is idempotent; reinstall is a no-op if present.
     echo "Ensuring age is installed on $REMOTE..."
     ssh "$REMOTE" "command -v age >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq age"
 
@@ -580,16 +785,50 @@ SSHEOF'
         echo "  Add matrix_admin_token + backup_age_recipient to matrix/secrets.yaml to enable"
     fi
 
+    # Install the GitHub release token (root:nick 0640). Deploy keys cannot
+    # create releases — they authenticate git-over-SSH only — so the
+    # object-store tier needs an API token the tree-committed path doesn't.
+    # Same build-locally / scp / install-with-perms shape as the matrix block
+    # above, for the same reason: never put the token on a remote command line.
+    local RELEASE_SECRETS="$REPO_ROOT/backups/secrets.yaml"
+    if [ -f "$RELEASE_SECRETS" ] && sops -d "$RELEASE_SECRETS" | yq -e '.github_release_token' > /dev/null 2>&1; then
+        echo "Installing /etc/imagineering-secrets/github-release.env..."
+        local RELEASE_TOKEN RELEASE_TMP RELEASE_PREV_TRAP
+        RELEASE_TOKEN=$(sops -d "$RELEASE_SECRETS" | yq -r '.github_release_token')
+        RELEASE_TMP=$(mktemp)
+        RELEASE_PREV_TRAP=$(trap -p EXIT)
+        # shellcheck disable=SC2064  # expand RELEASE_TMP now, intentional
+        trap "rm -f '$RELEASE_TMP'; ssh -o ConnectTimeout=5 '$REMOTE' 'rm -f /tmp/github-release.env' 2>/dev/null || true" EXIT
+        shell_env_line GH_TOKEN "$RELEASE_TOKEN" > "$RELEASE_TMP"
+        chmod 0600 "$RELEASE_TMP"
+        scp -q "$RELEASE_TMP" "$REMOTE":/tmp/github-release.env
+        ssh "$REMOTE" "sudo mkdir -p /etc/imagineering-secrets && \
+            sudo install -m 0640 -o root -g nick /tmp/github-release.env /etc/imagineering-secrets/github-release.env && \
+            rm -f /tmp/github-release.env"
+        rm -f "$RELEASE_TMP"
+        eval "${RELEASE_PREV_TRAP:-trap - EXIT}"
+        echo "  GitHub release envfile installed (mode 0640 root:nick)"
+    else
+        echo "NOTE: No github_release_token in backups/secrets.yaml — object-store backups will FAIL loudly"
+        echo "  This is deliberate: a missing credential must not look like a successful smaller run"
+    fi
+
+    # `gh` drives the release-asset tier. backup_objects_to_releases fails
+    # loudly without it rather than skipping, so install it here rather than
+    # discovering the gap at 04:00.
+    echo "Ensuring gh (GitHub CLI) is installed on $REMOTE..."
+    ssh "$REMOTE" "command -v gh >/dev/null 2>&1 || (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh)"
+
     echo "Backup configuration complete!"
     echo "  - GitHub backup: imagineering-cc/imagineering-backups (private repo)"
     echo "  - Deploy key: ~/.ssh/imagineering-backups-deploy"
     echo "  - Scripts: /opt/scripts/backup.sh, /opt/scripts/restore.sh"
     echo "  - Matrix secrets: /etc/imagineering-secrets/matrix.env"
+    echo "  - Release token: /etc/imagineering-secrets/github-release.env"
     echo "  - Cron: Daily at 4 AM"
     echo ""
     echo "Test with: ssh $REMOTE '/opt/scripts/backup.sh all'"
     echo "Test individual: ssh $REMOTE '/opt/scripts/backup.sh matrix'"
-    echo "Test continuwuity: ssh $REMOTE '/opt/scripts/backup.sh continuwuity'"
 }
 
 deploy_outline() {
@@ -821,6 +1060,12 @@ deploy_embodied_dreamfinder() {
         printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n'     "$(dotenv_quote "$(edf_field '.claude_code_oauth_token')")"
         printf 'VOICE_MODE=%s\n'            "$(dotenv_quote "$(edf_field '.voice_mode' 'realtime')")"
         printf 'OUTLINE_API_KEY=%s\n'       "$(dotenv_quote "$(edf_field '.outline_api_key')")"
+        # KAN_BASE_URL also has a compose default, but KAN_API_KEY/KAN_BOARD_ID
+        # do not — without these the container gets empty strings and the voice
+        # Kan-board tool (/api/kan/board-summary) fails silently.
+        printf 'KAN_BASE_URL=%s\n'          "$(dotenv_quote "$(edf_field '.kan_base_url')")"
+        printf 'KAN_API_KEY=%s\n'           "$(dotenv_quote "$(edf_field '.kan_api_key')")"
+        printf 'KAN_BOARD_ID=%s\n'          "$(dotenv_quote "$(edf_field '.kan_board_id')")"
         printf 'RADICALE_CALENDAR_URL=%s\n' "$(dotenv_quote "$(edf_field '.radicale_calendar_url')")"
         printf 'RADICALE_USERNAME=%s\n'     "$(dotenv_quote "$(edf_field '.radicale_username')")"
         printf 'RADICALE_PASSWORD=%s\n'     "$(dotenv_quote "$(edf_field '.radicale_password')")"
