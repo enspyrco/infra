@@ -58,6 +58,12 @@ for row in "${rows[@]}"; do
 done
 
 remote_script=$(cat <<'REMOTE'
+# Passwordless sudo is a PRECONDITION, not a data point. Without it the hash
+# arm prints ABSENT for every privileged path and the target arm silently
+# collapses to the unprivileged subset — the script would then report drift, or
+# even a pass, for what is actually "could not look". Announce the failure so
+# the caller can exit 2.
+sudo -n true 2>/dev/null || { echo "---NOSUDO---"; exit 0; }
 echo "---HASHES---"
 while IFS= read -r p; do
     [ -n "$p" ] || continue
@@ -73,7 +79,14 @@ echo "---TARGETS---"
 {
     crontab -l 2>/dev/null
     sudo -n crontab -u ubuntu -l 2>/dev/null
-    sudo -n cat /etc/cron.d/* 2>/dev/null
+    # root's OWN crontab, which is separate from /etc/cron.d and was not read
+    # at all. Empty on this box today, verified — but "empty" and "never
+    # looked" must not be the same reading.
+    sudo -n crontab -u root -l 2>/dev/null
+    # ONE privileged shell so the glob expands as root, and /etc/crontab too,
+    # which was missing entirely. Expanded unprivileged, a permissions change
+    # on /etc/cron.d would silently shrink the corpus instead of erroring.
+    sudo -n sh -c 'cat /etc/cron.d/* /etc/crontab 2>/dev/null'
 
     # systemd, ONE UNIT AT A TIME. A single batched
     #   systemctl show -p ExecStart --value $(list of every enabled service)
@@ -85,8 +98,21 @@ echo "---TARGETS---"
     # production service the check reported as clean. 2>/dev/null hid the
     # error and the remote block has no `set -e`, so the short read flowed on
     # looking exactly like a complete one.
-    for u in $(systemctl list-unit-files --state=enabled --no-pager 2>/dev/null \
-               | awk '/\.service/{print $1}' | grep -v '@'); do
+    # Enabled services UNION the services enabled timers activate. A
+    # timer-driven service is `static`, never `enabled`, so --state=enabled
+    # cannot see it: 19 of 20 timer-activated units were invisible here,
+    # including downstream-cd-poll.service, which runs
+    # /home/nick/apps/downstream-server/cd-poll.sh — an absolute path the
+    # pattern below would have matched if the unit were ever enumerated. Same
+    # class as the getty@ truncation: a blind slice makes question 2 answer
+    # "none" for everything inside it.
+    for u in $( { systemctl list-unit-files --state=enabled --no-pager 2>/dev/null \
+                    | awk '/\.service/{print $1}'
+                  for t in $(systemctl list-unit-files --state=enabled --no-pager 2>/dev/null \
+                             | awk '/\.timer/{print $1}'); do
+                      systemctl show -p Unit --value "$t" 2>/dev/null
+                  done
+                } | grep -v '@' | sort -u); do
         es=$(sudo -n systemctl show -p ExecStart --value "$u" 2>/dev/null)
         [ -n "$es" ] || continue
         printf '%s\n' "$es"
@@ -114,12 +140,26 @@ echo "---TARGETS---"
     done
 # /home/[a-z0-9_-]+ not /home/[a-z]+: a username with a digit, underscore or
 # hyphen (deploy-bot, ubuntu2) would otherwise slip past unseen.
-} | grep -oE '(/home/[a-z0-9_-]+|/opt)(/[A-Za-z0-9._-]+)+\.(sh|mjs|js|py)' | sort -u
+# Drop WHOLE-LINE comments before extracting paths: a commented-out entry in
+# /etc/cron.d is not a scheduled target, and reporting it as untracked trains
+# the reader to ignore this section. Trailing `# tag` comments are left alone —
+# the cron entries here carry them by design.
+# KNOWN BOUNDARY, stated rather than papered over: this matches literal
+# absolute paths, so a target reached indirectly (bash -lc 'cd /opt/app &&
+# ./job.sh', run-parts, an extensionless wrapper) is still invisible. The check
+# narrows the blind spot; it does not close it.
+} | sed 's/^[[:space:]]*#.*$//' \
+  | grep -oE '(/home/[a-z0-9_-]+|/opt)(/[A-Za-z0-9._-]+)+\.(sh|mjs|js|py)' | sort -u
 REMOTE
 )
 
 if ! remote_out=$(printf '%s\n' "${run_paths[@]}" | ssh -o ConnectTimeout=25 "$HOST" "$remote_script" 2>/dev/null); then
     echo "FATAL: could not reach $HOST — this is NOT a pass" >&2
+    exit 2
+fi
+
+if grep -q '^---NOSUDO---$' <<<"$remote_out"; then
+    echo "FATAL: no passwordless sudo on $HOST — cannot read privileged paths. This is NOT a pass." >&2
     exit 2
 fi
 
@@ -176,6 +216,31 @@ for row in "${rows[@]}"; do
             "$RED" "$OFF" "$runpath" "$DIM" "$status" "${lhash:0:7}" "${rhash:0:7}" "$OFF"
         problems=$((problems + 1))
     fi
+done
+
+# ---------------------------------------------------------------------------
+# 1b. Executable tripwire for EXTERNAL:pending-* rows.
+#
+# `external` rows assert existence WITHOUT comparing content — correct for a
+# file another repo owns, and exactly wrong once we own it. A row parked as
+# EXTERNAL:pending-PR-163 becomes a lie the moment that PR merges, and the
+# watcher's drift would then go permanently unreported by the very check meant
+# to catch it. A TODO comment cannot be the guardrail for that; this can.
+# ---------------------------------------------------------------------------
+for row in "${rows[@]}"; do
+    IFS=$'\t' read -r repo runpath status <<<"$row"
+    case "$repo" in
+        EXTERNAL:pending-*)
+            base=$(basename "$runpath")
+            if found=$(find "$REPO_ROOT/scripts" -name "$base" -type f 2>/dev/null | head -1) \
+               && [ -n "$found" ]; then
+                printf '%s PENDING-RESOLVED%s %s\n' "$RED" "$OFF" "$runpath"
+                printf '   %s now exists in the repo, so this row must stop being external:\n' "${found#"$REPO_ROOT"/}"
+                printf '   replace with: %s\t%s\torphaned\n' "${found#"$REPO_ROOT"/}" "$runpath"
+                problems=$((problems + 1))
+            fi
+            ;;
+    esac
 done
 
 # ---------------------------------------------------------------------------

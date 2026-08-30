@@ -49,3 +49,4 @@ EXTERNAL:enspyrco/enspyrco-site	/home/nick/apps/scribe/run-breath.sh	external
 # would go permanently unreported by the one check meant to catch it. Replace
 # with: scripts/watchers/amanda-oci-watch.sh <TAB> /home/ubuntu/... <TAB> orphaned
 EXTERNAL:pending-PR-163	/home/ubuntu/amanda-oci-watch.sh	external
+EXTERNAL:nickmeinhold/downstream	/home/nick/apps/downstream-server/cd-poll.sh	external
