@@ -26,26 +26,8 @@
 
 set -euo pipefail
 
-# Two transports, ONE implementation. --local runs the collection block on the
-# machine it is invoked from (the box, via the watcher); the default ssh's it to
-# $HOST (a laptop). Writing a second box-side copy of the enumeration would
-# recreate the very parallel-tree defect this script exists to detect — inside
-# the detector. So the collection block below is shipped, never duplicated.
-MODE=ssh
-HOST=149.118.69.221
+HOST="${1:-149.118.69.221}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-while [ $# -gt 0 ]; do
-    case "$1" in
-        (--local)     MODE=local ;;
-        # On the box the "repo side" is the DEPLOYED tree: --repo-root /opt maps
-        # a manifest path like scripts/host/keep-alive.sh to
-        # /opt/scripts/host/keep-alive.sh, which is exactly the deployed copy.
-        (--repo-root) REPO_ROOT="$2"; shift ;;
-        (-*)          echo "unknown flag: $1" >&2; exit 2 ;;
-        (*)           HOST="$1" ;;
-    esac
-    shift
-done
 MANIFEST="$REPO_ROOT/scripts/host/run-paths.tsv"
 
 RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YEL=$'\033[0;33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
@@ -171,12 +153,7 @@ echo "---TARGETS---"
 REMOTE
 )
 
-if [ "$MODE" = "local" ]; then
-    if ! remote_out=$(printf '%s\n' "${run_paths[@]}" | bash -c "$remote_script" 2>/dev/null); then
-        echo "FATAL: local collection failed — this is NOT a pass" >&2
-        exit 2
-    fi
-elif ! remote_out=$(printf '%s\n' "${run_paths[@]}" | ssh -o ConnectTimeout=25 "$HOST" "$remote_script" 2>/dev/null); then
+if ! remote_out=$(printf '%s\n' "${run_paths[@]}" | ssh -o ConnectTimeout=25 "$HOST" "$remote_script" 2>/dev/null); then
     echo "FATAL: could not reach $HOST — this is NOT a pass" >&2
     exit 2
 fi
@@ -206,12 +183,6 @@ targets=$(awk '/^---TARGETS---$/{f=1;next} f' <<<"$remote_out")
 # ---------------------------------------------------------------------------
 # 1. Manifest rows: repo copy vs running copy
 # ---------------------------------------------------------------------------
-# HONEST LIMIT in --local mode: a `deployed` row compares the deployed file to
-# ITSELF (repo side /opt/scripts/backup.sh, running side the same path), so it
-# is vacuously in-sync and proves nothing. Local mode's real work is the
-# `orphaned` rows and, above all, the untracked enumeration below — the half
-# that found live-game, embodied-agent-brain and cd-poll.sh. Run the ssh mode
-# from a checkout to compare against actual git content.
 echo "== manifest rows =="
 for row in "${rows[@]}"; do
     IFS=$'\t' read -r repo runpath status <<<"$row"
