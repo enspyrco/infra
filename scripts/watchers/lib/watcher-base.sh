@@ -135,14 +135,25 @@ tg_confirmed() {
         log "tg_confirmed: curl failed: $body"
         return 1
     fi
-    case "$body" in
-        *'"message_id":'*)
-            log "tg_confirmed: delivery receipt received"
-            return 0 ;;
-        *)
-            log "tg_confirmed: NO delivery receipt (message_id) in response — silent drop or /health hit?: $body"
-            return 1 ;;
-    esac
+    # PARSE the receipt, do not substring-match it. A substring test says yes to
+    # any body that merely CONTAINS the text — an error description quoting the
+    # field name, a proxy/debug wrapper echoing the request. This function
+    # exists to gate an irreversible act (state advance + self-disable), so a
+    # false positive here is unrecoverable, and jq costs nothing.
+    #
+    # Non-JSON bodies make jq fail, which returns 1 — fails closed, same as a
+    # missing receipt. Raised independently by two model families across rounds
+    # (cage-match #163).
+    #
+    # NOTE: scripts/lib/telegram.sh still uses the substring form. It should
+    # adopt this too; tracked separately rather than changed from here, since
+    # that file gates the alert path and deserves its own verification.
+    if jq -e '(.result.message_id? // .message_id?) != null' >/dev/null 2>&1 <<<"$body"; then
+        log "tg_confirmed: delivery receipt received"
+        return 0
+    fi
+    log "tg_confirmed: NO delivery receipt (message_id) in response — silent drop, /health hit, or non-JSON body: $body"
+    return 1
 }
 
 # self_disable
@@ -153,16 +164,44 @@ self_disable() {
         log "self_disable [DRY_RUN]: would remove crontab entry tagged: $CRON_TAG"
         return 0
     fi
-    if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
-        # `|| true` is load-bearing: when this watcher's line is the LAST one in
-        # the crontab, grep -vF matches nothing and exits 1. Under the callers'
-        # `set -o pipefail` that kills the script AFTER `crontab -` has already
-        # installed the (correctly) empty crontab — so the disable succeeds but
-        # the success is never logged and cron reports a failure.
-        { crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true; } | crontab -
+
+    # ONE read, validated, and the write derived from THAT read.
+    #
+    # Reading twice — once to check the tag is present, once to build the
+    # replacement — leaves a window where the SECOND read can fail transiently
+    # while the first succeeded. Its empty output then goes straight to
+    # `crontab -`, which installs an empty crontab: a function whose job is to
+    # remove ONE line silently destroys every unrelated job on the account.
+    # RED-proven by the TOCTOU arm in scripts/watchers/test-self-disable.sh
+    # (cage-match #163). A failed read must never produce a destructive write.
+    local current rc=0
+    current=$(crontab -l 2>&1) || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        case "$current" in
+            *"no crontab for"*)
+                log "self_disable: no crontab for this user; nothing to remove"
+                return 0 ;;
+            *)
+                log "self_disable: REFUSING to write — cannot read crontab (rc=$rc): ${current//$'\n'/ }"
+                return 1 ;;
+        esac
+    fi
+
+    if ! grep -qF "$CRON_TAG" <<<"$current"; then
+        log "self_disable: no cron entry found for tag: $CRON_TAG (already removed?)"
+        return 0
+    fi
+
+    # `|| true` is safe HERE and only here: $current is a verified successful
+    # read, so an empty result means our line was the only one — which is a
+    # correct empty crontab, not a lost one.
+    local remaining
+    remaining=$(grep -vF "$CRON_TAG" <<<"$current" || true)
+    if printf '%s\n' "$remaining" | crontab -; then
         log "self-disabled cron entry tagged: $CRON_TAG"
     else
-        log "self_disable: no cron entry found for tag: $CRON_TAG (already removed?)"
+        log "self_disable: crontab write FAILED for tag: $CRON_TAG"
+        return 1
     fi
 }
 
