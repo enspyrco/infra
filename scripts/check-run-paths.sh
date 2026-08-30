@@ -74,8 +74,47 @@ echo "---TARGETS---"
     crontab -l 2>/dev/null
     sudo -n crontab -u ubuntu -l 2>/dev/null
     sudo -n cat /etc/cron.d/* 2>/dev/null
-    sudo -n systemctl show -p ExecStart --value $(systemctl list-unit-files --state=enabled --no-pager 2>/dev/null | awk '/\.service/{print $1}') 2>/dev/null
-} | grep -oE '(/home/[a-z]+|/opt)(/[A-Za-z0-9._-]+)+\.(sh|mjs|js)' | sort -u
+
+    # systemd, ONE UNIT AT A TIME. A single batched
+    #   systemctl show -p ExecStart --value $(list of every enabled service)
+    # dies on the first TEMPLATE unit in the list — `getty@.service` is not a
+    # loadable name, so systemctl prints "Unit name getty@.service is neither a
+    # valid invocation ID nor unit name", exits 1, and DROPS EVERY UNIT AFTER
+    # IT. On Sydney that truncated 58 enabled services to 30 and silently hid
+    # live-game.service (position 22, behind getty@ at 17) — an untracked
+    # production service the check reported as clean. 2>/dev/null hid the
+    # error and the remote block has no `set -e`, so the short read flowed on
+    # looking exactly like a complete one.
+    for u in $(systemctl list-unit-files --state=enabled --no-pager 2>/dev/null \
+               | awk '/\.service/{print $1}' | grep -v '@'); do
+        es=$(sudo -n systemctl show -p ExecStart --value "$u" 2>/dev/null)
+        [ -n "$es" ] || continue
+        printf '%s\n' "$es"
+
+        # ExecStart may name the script RELATIVE to WorkingDirectory:
+        # embodied-agent-brain.service runs `/usr/bin/node server.js` with
+        # WorkingDirectory=/home/nick/apps/embodied-agent-brain, so no absolute
+        # path appears anywhere in the unit and the pattern below can never
+        # match it. Re-absolutise those tokens so a relative ExecStart cannot
+        # buy a service invisibility.
+        wd=$(sudo -n systemctl show -p WorkingDirectory --value "$u" 2>/dev/null)
+        [ -n "$wd" ] || continue
+        argv=$(printf '%s' "$es" | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p')
+        # Case patterns are written in the BALANCED `( pat )` form on purpose.
+        # This heredoc sits inside $( ... ), and bash 3.2 (macOS) matches that
+        # substitution by counting parens without honouring the heredoc — a
+        # bare `/*)` closes it early and the whole script dies with a syntax
+        # error 40 lines away from the cause.
+        for tok in $argv; do
+            case "$tok" in
+                (/*) ;;  # already absolute — the pattern below picks it up
+                (*.sh|*.mjs|*.js|*.py) printf '%s/%s\n' "${wd%/}" "$tok" ;;
+            esac
+        done
+    done
+# /home/[a-z0-9_-]+ not /home/[a-z]+: a username with a digit, underscore or
+# hyphen (deploy-bot, ubuntu2) would otherwise slip past unseen.
+} | grep -oE '(/home/[a-z0-9_-]+|/opt)(/[A-Za-z0-9._-]+)+\.(sh|mjs|js|py)' | sort -u
 REMOTE
 )
 
@@ -91,6 +130,15 @@ targets=$(awk '/^---TARGETS---$/{f=1;next} f' <<<"$remote_out")
 # failed rather than finding nothing. Silence here would otherwise read as "all
 # clear", which is the exact failure mode this script exists to refuse.
 [ -n "$hashes" ] || { echo "FATAL: box returned no hashes — remote block failed" >&2; exit 2; }
+
+# The SAME control on the targets arm, which had none — and that gap is not
+# hypothetical: the getty@ truncation above emptied most of this list while the
+# check still printed "none — every scheduled target is claimed". Question 2 is
+# the half this script exists for, so an empty answer must mean the enumeration
+# broke, never "nothing is scheduled". A box with no scheduled work at all does
+# not exist here; if one ever does, it earns an explicit opt-out rather than a
+# silent pass.
+[ -n "$targets" ] || { echo "FATAL: box named no scheduled targets — enumeration failed, NOT a pass" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
 # 1. Manifest rows: repo copy vs running copy

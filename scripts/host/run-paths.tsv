@@ -27,10 +27,25 @@ scripts/watchers/oci-instance-watch.sh	/home/ubuntu/oci-instance-watch.sh	orphan
 scripts/host/docker-watchdog.sh	/opt/docker-watchdog.sh	orphaned
 scripts/host/keep-alive.sh	/opt/keep-alive.sh	orphaned
 scripts/host/self-healer-run.sh	/home/nick/apps/self-healer-run.sh	orphaned
+# release-watch is tracked but NOT SCHEDULED. #3512 recorded it as "cron 09:00
+# daily via /etc/cron.d/xdeca-release-watch"; that file does not exist. Verified
+# 2026-08-30 across root/nick/ubuntu crontabs, /etc/crontab, all of /etc/cron.d
+# and systemd timers — no reference, no state file, no log. The only thing on
+# the box naming it is deploy-to.sh. It is dead code kept under version control
+# because the box holds the sole copy; deleting it is a decision for #3512, and
+# the row exists so its drift stays visible until someone makes that call.
+scripts/host/release-watch.sh	/opt/scripts/release-watch.sh	orphaned
+scripts/host/release-watch.conf	/opt/scripts/release-watch.conf	orphaned
 scripts/lib/telegram.sh	/opt/scripts/lib/telegram.sh	deployed
 EXTERNAL:nickmeinhold/downstream	/opt/scripts/backup-downstream.sh	external
 EXTERNAL:nickmeinhold/downstream	/opt/scripts/health-check-downstream.sh	external
 EXTERNAL:nickmeinhold/downstream	/opt/scripts/reconcile-downstream.sh	external
 EXTERNAL:nickmeinhold/downstream	/home/nick/apps/downstream-server/cd-bus-subscribe.sh	external
 EXTERNAL:enspyrco/enspyrco-site	/home/nick/apps/scribe/run-breath.sh	external
+# WHEN PR #163 MERGES, CHANGE THIS ROW. #163 adds
+# scripts/watchers/amanda-oci-watch.sh, so this file stops being external and
+# becomes repo-owned. Left as `external` it would still pass — external rows
+# assert existence only and never compare content — so this watcher's drift
+# would go permanently unreported by the one check meant to catch it. Replace
+# with: scripts/watchers/amanda-oci-watch.sh <TAB> /home/ubuntu/... <TAB> orphaned
 EXTERNAL:pending-PR-163	/home/ubuntu/amanda-oci-watch.sh	external
