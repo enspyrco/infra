@@ -6,10 +6,7 @@
 LOG=/var/log/keep-alive.log
 
 # Generate CPU load for 2 minutes (enough to register on 15-min sampling)
-# `_` rather than `i`: the loop variable is genuinely unused, we just want N
-# parallel burners. nproc is quoted — unquoted it would word-split, which is
-# harmless for a bare integer but fails CI's shellcheck gate.
-for _ in $(seq 1 "$(nproc)"); do
+for i in $(seq 1 $(nproc)); do
     timeout 120 sha256sum /dev/urandom &>/dev/null &
 done
 
