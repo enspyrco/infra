@@ -1,3 +1,11 @@
+{
+    # Shape-B TURN-on-443: Caddy is pinned OFF the wildcard so LiveKit can own
+    # 10.0.0.22:443 for TURN/TLS. 127.0.0.1 is listed deliberately - pinning drops every
+    # address not named here, and local callers on loopback would otherwise break.
+    # See deploy/media/turn-443-shapeb/RUNBOOK.md (nickmeinhold/aiko-chat-island).
+    default_bind 10.0.0.21 127.0.0.1
+}
+
 outline.imagineering.cc {
     reverse_proxy localhost:3012
 }
@@ -87,10 +95,10 @@ df.imagineering.cc {
     reverse_proxy localhost:3015
 }
 
-# Lyra's live Q&A — same dreamfinder-avatar app; the app detects the "lyra."
+# Lyra's live Q&A — same embodied-dreamfinder app; the app detects the "lyra."
 # host and serves her persona, voice, and own face (no ?lyra param needed).
 lyra.imagineering.cc {
-    reverse_proxy localhost:3015
+    reverse_proxy localhost:3017
 }
 
 # --- LiveKit SFU (self-hosted WebRTC) ---
@@ -173,7 +181,7 @@ api.downstream-storage.cc {
 # --- Tech World (Flutter web + avatar via DF) ---
 
 world.imagineering.cc {
-    # Avatar renderer and its assets — proxy to dreamfinder-avatar (port 3015).
+    # Avatar renderer and its assets — proxy to embodied-dreamfinder (port 3015).
     # These paths match RENDERER_PATHS and RENDERER_PREFIXES in server.js.
     @df_renderer {
         path /avatar /avatar-renderer.js /sparks.js /avatars/* /headaudio/*
@@ -221,4 +229,33 @@ world.imagineering.cc {
 # API), so a container restart dropped it — now it's durable in the Caddyfile.
 quiz-game.imagineering.cc {
     reverse_proxy localhost:7373
+}
+
+# --- daemon (Enspyr recruitment terminal) ---
+daemon.imagineering.cc {
+    reverse_proxy localhost:8788
+}
+
+# --- realm-token-server (Realm credential exchange + LiveKit token mint) ---
+realm-token.imagineering.cc {
+    reverse_proxy localhost:8791
+}
+
+turn.imagineering.cc {
+    # Cert issuance ONLY - LiveKit serves this cert itself on 137.23.18.134:443, so a
+    # TLS-ALPN-01 challenge would arrive at LiveKit (not Caddy) and could never be solved.
+    # Force HTTP-01, answered by the http:// spine below on 10.0.0.22:80.
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
+    respond "turn" 200
+}
+
+# The ACME spine. `bind` takes HOSTS ONLY - the port comes from the site address - so this
+# yields :80 on 10.0.0.22 and never touches 10.0.0.22:443 (LiveKit owns that).
+http://turn.imagineering.cc {
+    bind 10.0.0.22
+    respond "acme-spine" 200
 }
