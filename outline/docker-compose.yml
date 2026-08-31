@@ -91,7 +91,7 @@ services:
   # One-time setup to create buckets for all services that use MinIO
   # (Kan.bn buckets are created here because MinIO only runs in the Outline stack)
   minio-setup:
-    # (was untagged)
+    # (was untagged); multi-arch manifest list
     image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     container_name: img-outline-minio_setup
     depends_on:

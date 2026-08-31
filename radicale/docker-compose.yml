@@ -1,6 +1,7 @@
 services:
   radicale:
     # image built 2026-06-24; upstream publishes no version label (was :latest).
+    # Multi-arch manifest list.
     # Digest confirmed served by Docker Hub 2026-08-31. This IS the live deploy
     # path, so if Hub ever GCs this untagged manifest a `deploy radicale` fails
     # closed (loud) rather than silently upgrading — the mautrix bridges in
