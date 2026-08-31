@@ -4,8 +4,10 @@ services:
     # Multi-arch manifest list.
     # Digest confirmed served by Docker Hub 2026-08-31. This IS the live deploy
     # path, so if Hub ever GCs this untagged manifest a `deploy radicale` fails
-    # closed (loud) rather than silently upgrading — the mautrix bridges in
-    # matrix/docker-compose.yml are the same class. claude-tasks#3728.
+    # closed (loud) rather than silently upgrading. NOT the same class as the
+    # mautrix bridges: this digest IS currently served, so the image stays
+    # restorable from the registry and a fresh host can rebuild it. The bridges
+    # are pinned to UNSERVED digests and cannot. Different failure, different fix.
     image: tomsquest/docker-radicale@sha256:65477ca10cec7434dbea25eb1847175d032a03b365748068b6ceaf5fab4e2c4e
     container_name: img-radicale
     restart: unless-stopped

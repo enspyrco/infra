@@ -903,8 +903,9 @@ deploy_outline() {
     # Start Outline
     ssh "$REMOTE" "cd ~/apps/outline && docker compose pull && docker compose up -d"
 
-    echo "Outline deployed!"
-    echo "  URL: https://outline.imagineering.cc"
+    echo "img-outline stack deployed (OVERRIDE)."
+    echo "  This is NOT the live tenant. outline.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-outline, which this deploy did not touch."
     echo "  Note: First user to sign in becomes admin"
 }
 
@@ -974,8 +975,9 @@ deploy_kanbn() {
     # Pull image from ghcr.io and start
     ssh "$REMOTE" "cd ~/apps/kanbn && docker compose pull && docker compose up -d"
 
-    echo "Kan.bn deployed!"
-    echo "  URL: https://kan.imagineering.cc"
+    echo "img-kanbn stack deployed (OVERRIDE)."
+    echo "  This is NOT the live tenant. kan.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-kanbn, which this deploy did not touch."
     echo "  Note: First user to sign up becomes admin"
 }
 

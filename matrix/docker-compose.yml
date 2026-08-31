@@ -38,22 +38,36 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Two separate mechanisms, both verified on the box before shipping:
-    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
-    #                          (An unguarded control service in the same file
-    #                          pulled, so the check can go red.)
-    #   local RepoDigests   -> the running image carries this exact digest, so
-    #                          `docker compose create` builds the container from
-    #                          the local layer without contacting the registry.
-    # The skip is the pull_policy; the resolve is the local store. Neither alone
-    # is sufficient.
+    # Mechanisms, measured — and only ONE is load-bearing:
+    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
+    #                          digest, so `docker compose create` builds the
+    #                          container from the local layer. This alone works:
+    #                          deploy_matrix passes --ignore-pull-failures, so the
+    #                          404 on the dead digest is swallowed and `up -d`
+    #                          proceeds on the local image.
+    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
+    #                          It stops the doomed pull attempt (Skipped, not 404)
+    #                          so the deploy log does not carry a red herring.
+    # An earlier version of this comment said "neither alone is sufficient". That
+    # overclaimed: the digest pin alone keeps the service running.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
     # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
     # de-authenticate a link. This form instead records exactly what is running.
-    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
-    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
+    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
+    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
+    # RepoDigests), NOTHING can recreate this exact container, even with the
+    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # and produced a WORKING but different-version bridge. So this trades a
+    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
+    # for a routine deploy and the WORSE one for disaster recovery.
+    # Pinning the currently-served index digest is NOT an escape: measured
+    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
+    # The only fix that is both immutable and recoverable is mirroring the running
+    # images into our own GHCR and pinning there — claude-tasks#3728, which is
+    # therefore a real DR gap and not a tidiness item.
     image: dock.mau.dev/mautrix/telegram@sha256:ddb42d9a943b390bea5a7e365b66b831c6749309e68048fae1e780abcb34aa03
     pull_policy: never
     restart: always
@@ -66,22 +80,36 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Two separate mechanisms, both verified on the box before shipping:
-    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
-    #                          (An unguarded control service in the same file
-    #                          pulled, so the check can go red.)
-    #   local RepoDigests   -> the running image carries this exact digest, so
-    #                          `docker compose create` builds the container from
-    #                          the local layer without contacting the registry.
-    # The skip is the pull_policy; the resolve is the local store. Neither alone
-    # is sufficient.
+    # Mechanisms, measured — and only ONE is load-bearing:
+    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
+    #                          digest, so `docker compose create` builds the
+    #                          container from the local layer. This alone works:
+    #                          deploy_matrix passes --ignore-pull-failures, so the
+    #                          404 on the dead digest is swallowed and `up -d`
+    #                          proceeds on the local image.
+    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
+    #                          It stops the doomed pull attempt (Skipped, not 404)
+    #                          so the deploy log does not carry a red herring.
+    # An earlier version of this comment said "neither alone is sufficient". That
+    # overclaimed: the digest pin alone keeps the service running.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
     # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
     # de-authenticate a link. This form instead records exactly what is running.
-    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
-    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
+    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
+    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
+    # RepoDigests), NOTHING can recreate this exact container, even with the
+    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # and produced a WORKING but different-version bridge. So this trades a
+    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
+    # for a routine deploy and the WORSE one for disaster recovery.
+    # Pinning the currently-served index digest is NOT an escape: measured
+    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
+    # The only fix that is both immutable and recoverable is mirroring the running
+    # images into our own GHCR and pinning there — claude-tasks#3728, which is
+    # therefore a real DR gap and not a tidiness item.
     image: dock.mau.dev/mautrix/discord@sha256:7716389dfb11dc7a44c8363348a48e91c1c463ded012f0fb08cdf266fcb20246
     pull_policy: never
     restart: always
@@ -111,22 +139,36 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Two separate mechanisms, both verified on the box before shipping:
-    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
-    #                          (An unguarded control service in the same file
-    #                          pulled, so the check can go red.)
-    #   local RepoDigests   -> the running image carries this exact digest, so
-    #                          `docker compose create` builds the container from
-    #                          the local layer without contacting the registry.
-    # The skip is the pull_policy; the resolve is the local store. Neither alone
-    # is sufficient.
+    # Mechanisms, measured — and only ONE is load-bearing:
+    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
+    #                          digest, so `docker compose create` builds the
+    #                          container from the local layer. This alone works:
+    #                          deploy_matrix passes --ignore-pull-failures, so the
+    #                          404 on the dead digest is swallowed and `up -d`
+    #                          proceeds on the local image.
+    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
+    #                          It stops the doomed pull attempt (Skipped, not 404)
+    #                          so the deploy log does not carry a red herring.
+    # An earlier version of this comment said "neither alone is sufficient". That
+    # overclaimed: the digest pin alone keeps the service running.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
     # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
     # de-authenticate a link. This form instead records exactly what is running.
-    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
-    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
+    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
+    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
+    # RepoDigests), NOTHING can recreate this exact container, even with the
+    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # and produced a WORKING but different-version bridge. So this trades a
+    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
+    # for a routine deploy and the WORSE one for disaster recovery.
+    # Pinning the currently-served index digest is NOT an escape: measured
+    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
+    # The only fix that is both immutable and recoverable is mirroring the running
+    # images into our own GHCR and pinning there — claude-tasks#3728, which is
+    # therefore a real DR gap and not a tidiness item.
     image: dock.mau.dev/mautrix/whatsapp@sha256:e768ff02a5006427e257bd6ddcee3831339ea6a3fa22f9c5aba80ce21d7d9a8f
     pull_policy: never
     restart: always
