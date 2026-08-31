@@ -92,9 +92,14 @@ services:
 
   mautrix-signal:
     # image built 2026-06-16 (was :latest); multi-arch manifest list. NOTE: dock.mau.dev prunes old index
-    # digests — three sibling bridges already lost theirs. If this one is collected,
-    # `deploy matrix` FAILS on this service (fail-closed, not a silent upgrade);
-    # the fix is to mirror it into our own GHCR. claude-tasks#3728.
+    # digests — three sibling bridges already lost theirs. Deliberately WITHOUT
+    # pull_policy: never, unlike those three: this digest is still served, so the
+    # image stays restorable from the registry, and removing that would trade a
+    # real capability for symmetry. If it is ever collected, deploy_matrix passes
+    # --ignore-pull-failures (scripts/deploy-to.sh), so the pull failure does not
+    # abort the stack and `up -d` keeps using the local image — it degrades, it
+    # does not break. The durable fix is mirroring into our own GHCR:
+    # claude-tasks#3728.
     image: dock.mau.dev/mautrix/signal@sha256:0adf4fc6ba9d7ae95a0904f8432cde637093948a615612058934a7a484221390
     restart: always
     volumes:
