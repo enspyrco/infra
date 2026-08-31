@@ -38,28 +38,39 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Mechanisms, measured — and only ONE is load-bearing:
-    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
-    #                          digest, so `docker compose create` builds the
-    #                          container from the local layer. This alone works:
-    #                          deploy_matrix passes --ignore-pull-failures, so the
-    #                          404 on the dead digest is swallowed and `up -d`
-    #                          proceeds on the local image.
-    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
-    #                          It stops the doomed pull attempt (Skipped, not 404)
-    #                          so the deploy log does not carry a red herring.
-    # An earlier version of this comment said "neither alone is sufficient". That
-    # overclaimed: the digest pin alone keeps the service running.
+    # Three mechanisms, each doing exactly one thing. Do not delete any of them
+    # as ornament:
+    #   the LOCAL LAYER  -> load-bearing. The running image carries this digest in
+    #                       its RepoDigests, so `docker compose create` creates the
+    #                       container from the image already in the local store.
+    #                       The pin is only the NAME this is looked up by; the layer
+    #                       is what keeps the service alive.
+    #   pull_policy: never-> stops THIS service's pull from becoming a 404 at all
+    #                       (reported Skipped). Load-bearing for every invocation
+    #                       that is not deploy_matrix — a bare `docker compose pull`
+    #                       on the box, or a future script that forgets the flag.
+    #   --ignore-pull-failures (in deploy_matrix, scripts/deploy-to.sh)
+    #                     -> keeps a SIBLING service's pull failure from aborting
+    #                       the whole stack. It is not what saves this service.
+    # None of the three can summon bytes the registry no longer has.
+    # Two earlier versions of this comment were both wrong: "neither alone is
+    # sufficient" overclaimed, and "the digest pin alone keeps the service running"
+    # was its inverted twin. The layer is load-bearing; the pin names it.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
-    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
-    # de-authenticate a link. This form instead records exactly what is running.
+    # These bridges hold live linked-account session state, so an unplanned jump can
+    # de-authenticate a link. (Each of these bridges holds its own live
+    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
     # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
-    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
-    # RepoDigests), NOTHING can recreate this exact container, even with the
-    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
+    # The layer is NOT evicted by `docker image prune -a` alone — a running
+    # container holds it. The real trigger is a teardown FIRST: `docker compose
+    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
+    # strips RepoDigests). After any of those, nothing in this file can recreate
+    # the container, even with the session volume intact — the one exception
+    # being a `docker save` tarball taken BEFORE the layer died, which is why
+    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
     # and produced a WORKING but different-version bridge. So this trades a
     # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
     # for a routine deploy and the WORSE one for disaster recovery.
@@ -82,8 +93,9 @@ services:
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
     # Mechanisms, measured — and only ONE is load-bearing:
     #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
-    #                          digest, so `docker compose create` builds the
-    #                          container from the local layer. This alone works:
+    #                          digest, so `docker compose create` creates the
+    #                          container from the image already in the local
+    #                          store. (It does not build anything.) This alone works:
     #                          deploy_matrix passes --ignore-pull-failures, so the
     #                          404 on the dead digest is swallowed and `up -d`
     #                          proceeds on the local image.
@@ -95,13 +107,18 @@ services:
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
-    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
-    # de-authenticate a link. This form instead records exactly what is running.
+    # These bridges hold live linked-account session state, so an unplanned jump can
+    # de-authenticate a link. (Each of these bridges holds its own live
+    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
     # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
-    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
-    # RepoDigests), NOTHING can recreate this exact container, even with the
-    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
+    # The layer is NOT evicted by `docker image prune -a` alone — a running
+    # container holds it. The real trigger is a teardown FIRST: `docker compose
+    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
+    # strips RepoDigests). After any of those, nothing in this file can recreate
+    # the container, even with the session volume intact — the one exception
+    # being a `docker save` tarball taken BEFORE the layer died, which is why
+    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
     # and produced a WORKING but different-version bridge. So this trades a
     # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
     # for a routine deploy and the WORSE one for disaster recovery.
@@ -124,9 +141,12 @@ services:
     # pull_policy: never, unlike those three: this digest is still served, so the
     # image stays restorable from the registry, and removing that would trade a
     # real capability for symmetry. If it is ever collected, deploy_matrix passes
-    # --ignore-pull-failures (scripts/deploy-to.sh), so the pull failure does not
-    # abort the stack and `up -d` keeps using the local image — it degrades, it
-    # does not break. The durable fix is mirroring into our own GHCR:
+    # --ignore-pull-failures (scripts/deploy-to.sh), so a DEPLOY on this box
+    # survives: the pull failure does not abort the stack and `up -d` keeps using
+    # the local image. But that saves the deploy, NOT the rebuild — the moment the
+    # local layer is gone, signal joins the three dead siblings and is equally
+    # unrecoverable. It is one GC pulse from their position, not a safer class.
+    # The durable fix is the same for all four: mirror into our own GHCR,
     # claude-tasks#3728.
     image: dock.mau.dev/mautrix/signal@sha256:0adf4fc6ba9d7ae95a0904f8432cde637093948a615612058934a7a484221390
     restart: always
@@ -141,8 +161,9 @@ services:
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
     # Mechanisms, measured — and only ONE is load-bearing:
     #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
-    #                          digest, so `docker compose create` builds the
-    #                          container from the local layer. This alone works:
+    #                          digest, so `docker compose create` creates the
+    #                          container from the image already in the local
+    #                          store. (It does not build anything.) This alone works:
     #                          deploy_matrix passes --ignore-pull-failures, so the
     #                          404 on the dead digest is swallowed and `up -d`
     #                          proceeds on the local image.
@@ -154,13 +175,18 @@ services:
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
-    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
-    # de-authenticate a link. This form instead records exactly what is running.
+    # These bridges hold live linked-account session state, so an unplanned jump can
+    # de-authenticate a link. (Each of these bridges holds its own live
+    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
     # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service. If the local layer is ever lost
-    # (`docker image prune -a`, a disk rebuild, a `docker load` — which strips
-    # RepoDigests), NOTHING can recreate this exact container, even with the
-    # session volume intact. Before this pin, a rebuild would have pulled :latest
+    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
+    # The layer is NOT evicted by `docker image prune -a` alone — a running
+    # container holds it. The real trigger is a teardown FIRST: `docker compose
+    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
+    # strips RepoDigests). After any of those, nothing in this file can recreate
+    # the container, even with the session volume intact — the one exception
+    # being a `docker save` tarball taken BEFORE the layer died, which is why
+    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
     # and produced a WORKING but different-version bridge. So this trades a
     # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
     # for a routine deploy and the WORSE one for disaster recovery.
@@ -220,6 +246,11 @@ services:
   # Config + registration + db live server-side in ./aiko-bridge-data (gitignored),
   # generated/registered once per the bridge README (like the other mautrix bridges).
   aiko-mosquitto:
+    # Deliberately NOT digest-pinned, and filed rather than silent: `:2` is a
+    # minor tag and therefore still mutable, so deploy_matrix's pull can move it.
+    # Pinning it is part of the tag-vs-digest decision in claude-tasks#3729 (which
+    # also covers postgres/redis/caddy) — mosquitto is stateless, so it is the
+    # easy half of that decision, but it should be decided with the rest.
     image: eclipse-mosquitto:2
     restart: always
     volumes:
@@ -228,10 +259,17 @@ services:
 
   aiko-registrar:
     build: ./aiko-chat-bridge
-    # Mutable by design, and OUT OF SCOPE for digest pinning: this image is built
-    # ON THE BOX from ./aiko-chat-bridge (see the aiko-registrar service's `build:`),
-    # so there is no registry digest to pin. Fixing this means moving it to GHCR —
-    # claude-tasks#2937 / #3143. Not a missed pin.
+    # Mutable by design, OUT OF SCOPE for digest pinning, and the same for ALL
+    # THREE services that name aiko-bridge:latest (aiko-chat, aiko-bridge,
+    # aiko-registrar) — only aiko-registrar carries the `build:` key; the other two
+    # consume the image it produces. There is no registry digest to pin because the
+    # image never comes from a registry.
+    # Compose DOES still try to pull this tag and fail — that is precisely why
+    # deploy_matrix passes --ignore-pull-failures (see the comment at
+    # scripts/deploy-to.sh, "aiko-chat and aiko-bridge declare image:
+    # aiko-bridge:latest with no build: key"). So the behaviour is known and
+    # handled at the deploy layer, not left to chance here.
+    # The fix is moving it to GHCR — claude-tasks#2937 / #3143. Not a missed pin.
     image: aiko-bridge:latest
     restart: always
     environment:

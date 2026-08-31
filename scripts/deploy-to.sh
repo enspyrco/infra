@@ -904,8 +904,10 @@ deploy_outline() {
     ssh "$REMOTE" "cd ~/apps/outline && docker compose pull && docker compose up -d"
 
     echo "img-outline stack deployed (OVERRIDE)."
-    echo "  This is NOT the live tenant. outline.imagineering.cc is served by"
-    echo "  ~/apps/imagineering-outline, which this deploy did not touch."
+    echo "  This is NOT the live tenant: outline.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-outline, a different directory."
+    echo "  This is NOT a sandbox either — it just rsynced and started a"
+    echo "  conflicting stack on the SAME host, contending for ports and names."
     echo "  Note: First user to sign in becomes admin"
 }
 
@@ -976,8 +978,10 @@ deploy_kanbn() {
     ssh "$REMOTE" "cd ~/apps/kanbn && docker compose pull && docker compose up -d"
 
     echo "img-kanbn stack deployed (OVERRIDE)."
-    echo "  This is NOT the live tenant. kan.imagineering.cc is served by"
-    echo "  ~/apps/imagineering-kanbn, which this deploy did not touch."
+    echo "  This is NOT the live tenant: kan.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-kanbn, a different directory."
+    echo "  This is NOT a sandbox either — it just rsynced and started a"
+    echo "  conflicting stack on the SAME host, contending for ports and names."
     echo "  Note: First user to sign up becomes admin"
 }
 
