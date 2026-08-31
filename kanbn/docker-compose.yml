@@ -3,10 +3,12 @@
 # (kan.imagineering.cc, containers imagineering-kanbn{,-migrate,-postgres}).
 # `~/apps/kanbn/` does not exist on the box, and this file still says
 # `container_name: img-kanbn`. Same drift class as outline/docker-compose.yml.
-# The digests below record what prod runs; they do not deploy it.
+# The digests below record what prod runs. This file is not the NORMAL deploy
+# path: scripts/deploy-to.sh now refuses it unless KANBN_DEPLOY_OVERRIDE=1,
+# so an override deploy is deliberate and exceptional, not impossible.
 services:
   migrate:
-    # kan 0.5.6 migrator (was :latest)
+    # kan 0.5.6 migrator (was :latest); multi-arch manifest list
     image: ghcr.io/kanbn/kan-migrate@sha256:3296fd28e037a93dda478981494a72c6905ecd4f0d0739e79139172844acbc4b
     container_name: img-kanbn-migrate
     restart: "no"
@@ -19,7 +21,7 @@ services:
       - kanbn
 
   kanbn:
-    # kan 0.5.6 (was :latest)
+    # kan 0.5.6 (was :latest); multi-arch manifest list
     image: ghcr.io/kanbn/kan@sha256:3509af72635922b8195fc08e052f6257f8a05c50c8afcadc636f78c717667673
     container_name: img-kanbn
     restart: unless-stopped

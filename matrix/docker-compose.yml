@@ -1,6 +1,6 @@
 services:
   continuwuity:
-    # v0.5.10-1 (was :latest)
+    # v0.5.10-1 (was :latest); multi-arch manifest list
     image: forgejo.ellis.link/continuwuation/continuwuity@sha256:81ea00ad377999586e2a2c4d18c485fb6582bb37d7b345081f49e48b8f5d17d9
     restart: always
     ports:
@@ -38,10 +38,15 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # The image itself is present locally and carries this digest in its
-    # RepoDigests, so compose resolves it from the local store: `compose pull`
-    # reports Skipped (not 404) and `compose create` builds the container.
-    # Verified on the box before shipping.
+    # Two separate mechanisms, both verified on the box before shipping:
+    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
+    #                          (An unguarded control service in the same file
+    #                          pulled, so the check can go red.)
+    #   local RepoDigests   -> the running image carries this exact digest, so
+    #                          `docker compose create` builds the container from
+    #                          the local layer without contacting the registry.
+    # The skip is the pull_policy; the resolve is the local store. Neither alone
+    # is sufficient.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
@@ -61,10 +66,15 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # The image itself is present locally and carries this digest in its
-    # RepoDigests, so compose resolves it from the local store: `compose pull`
-    # reports Skipped (not 404) and `compose create` builds the container.
-    # Verified on the box before shipping.
+    # Two separate mechanisms, both verified on the box before shipping:
+    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
+    #                          (An unguarded control service in the same file
+    #                          pulled, so the check can go red.)
+    #   local RepoDigests   -> the running image carries this exact digest, so
+    #                          `docker compose create` builds the container from
+    #                          the local layer without contacting the registry.
+    # The skip is the pull_policy; the resolve is the local store. Neither alone
+    # is sufficient.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
@@ -81,7 +91,7 @@ services:
       - continuwuity
 
   mautrix-signal:
-    # image built 2026-06-16 (was :latest). NOTE: dock.mau.dev prunes old index
+    # image built 2026-06-16 (was :latest); multi-arch manifest list. NOTE: dock.mau.dev prunes old index
     # digests — three sibling bridges already lost theirs. If this one is collected,
     # `deploy matrix` FAILS on this service (fail-closed, not a silent upgrade);
     # the fix is to mirror it into our own GHCR. claude-tasks#3728.
@@ -96,10 +106,15 @@ services:
     # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
     # dock.mau.dev has re-published :latest under a new index digest, so this
     # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # The image itself is present locally and carries this digest in its
-    # RepoDigests, so compose resolves it from the local store: `compose pull`
-    # reports Skipped (not 404) and `compose create` builds the container.
-    # Verified on the box before shipping.
+    # Two separate mechanisms, both verified on the box before shipping:
+    #   pull_policy: never  -> `docker compose pull` reports Skipped, not 404.
+    #                          (An unguarded control service in the same file
+    #                          pulled, so the check can go red.)
+    #   local RepoDigests   -> the running image carries this exact digest, so
+    #                          `docker compose create` builds the container from
+    #                          the local layer without contacting the registry.
+    # The skip is the pull_policy; the resolve is the local store. Neither alone
+    # is sufficient.
     # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
     # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
     # move the service to a new image and `up -d` would recreate the bridge on it.
@@ -166,6 +181,10 @@ services:
 
   aiko-registrar:
     build: ./aiko-chat-bridge
+    # Mutable by design, and OUT OF SCOPE for digest pinning: this image is built
+    # ON THE BOX from ./aiko-chat-bridge (see the aiko-registrar service's `build:`),
+    # so there is no registry digest to pin. Fixing this means moving it to GHCR —
+    # claude-tasks#2937 / #3143. Not a missed pin.
     image: aiko-bridge:latest
     restart: always
     environment:
