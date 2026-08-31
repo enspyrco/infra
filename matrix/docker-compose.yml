@@ -1,6 +1,7 @@
 services:
   continuwuity:
-    image: forgejo.ellis.link/continuwuation/continuwuity:latest
+    # v0.5.10-1 (was :latest)
+    image: forgejo.ellis.link/continuwuation/continuwuity@sha256:81ea00ad377999586e2a2c4d18c485fb6582bb37d7b345081f49e48b8f5d17d9
     restart: always
     ports:
       - "8008:6167"   # Client API
@@ -34,6 +35,9 @@ services:
         hard: 1048567
 
   mautrix-telegram:
+    # NOT PINNED — upstream registry no longer serves the digest of the image
+    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
+    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
     image: dock.mau.dev/mautrix/telegram:latest
     restart: always
     volumes:
@@ -42,6 +46,9 @@ services:
       - continuwuity
 
   mautrix-discord:
+    # NOT PINNED — upstream registry no longer serves the digest of the image
+    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
+    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
     image: dock.mau.dev/mautrix/discord:latest
     restart: always
     volumes:
@@ -50,7 +57,8 @@ services:
       - continuwuity
 
   mautrix-signal:
-    image: dock.mau.dev/mautrix/signal:latest
+    # image built 2026-06-16 (was :latest)
+    image: dock.mau.dev/mautrix/signal@sha256:0adf4fc6ba9d7ae95a0904f8432cde637093948a615612058934a7a484221390
     restart: always
     volumes:
       - signal_data:/data
@@ -58,6 +66,9 @@ services:
       - continuwuity
 
   mautrix-whatsapp:
+    # NOT PINNED — upstream registry no longer serves the digest of the image
+    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
+    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
     image: dock.mau.dev/mautrix/whatsapp:latest
     restart: always
     volumes:

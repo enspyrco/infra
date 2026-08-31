@@ -1,6 +1,7 @@
 services:
   radicale:
-    image: tomsquest/docker-radicale:latest
+    # image built 2026-06-24; upstream publishes no version label (was :latest)
+    image: tomsquest/docker-radicale@sha256:65477ca10cec7434dbea25eb1847175d032a03b365748068b6ceaf5fab4e2c4e
     container_name: img-radicale
     restart: unless-stopped
     ports:
