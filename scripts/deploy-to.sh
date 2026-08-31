@@ -832,6 +832,22 @@ SSHEOF'
 }
 
 deploy_outline() {
+    # REFUSE — outline/ is NOT the production deploy path.
+    # Prod runs hand-managed tenant stack(s): ~/apps/imagineering-outline (outline.imagineering.cc) and ~/apps/xdeca-outline.
+    # ~/apps/outline does not exist on the box, and outline/docker-compose.yml still
+    # declares container_name: img-outline, so deploying here would stand up a THIRD,
+    # CONFLICTING stack alongside the live tenants. The header comment in that
+    # compose file says so — a comment is not an invariant, so this is one.
+    # Reconciling the file with the tenant stacks is a tracked backlog item;
+    # until then, override deliberately with OUTLINE_DEPLOY_OVERRIDE=1.
+    if [ "${OUTLINE_DEPLOY_OVERRIDE:-0}" != "1" ]; then
+        echo "REFUSING: outline/ is not the production deploy path." >&2
+        echo "  Live: ~/apps/imagineering-outline (outline.imagineering.cc) and ~/apps/xdeca-outline" >&2
+        echo "  Deploying this would create a third, conflicting img-outline stack." >&2
+        echo "  See the header in outline/docker-compose.yml. Override: OUTLINE_DEPLOY_OVERRIDE=1" >&2
+        return 1
+    fi
+
     echo "Deploying Outline Wiki..."
 
     local OUTLINE_SECRETS="$REPO_ROOT/outline/secrets.yaml"
@@ -893,6 +909,22 @@ deploy_outline() {
 }
 
 deploy_kanbn() {
+    # REFUSE — kanbn/ is NOT the production deploy path.
+    # Prod runs hand-managed tenant stack(s): ~/apps/imagineering-kanbn (kan.imagineering.cc).
+    # ~/apps/kanbn does not exist on the box, and kanbn/docker-compose.yml still
+    # declares container_name: img-kanbn, so deploying here would stand up a THIRD,
+    # CONFLICTING stack alongside the live tenants. The header comment in that
+    # compose file says so — a comment is not an invariant, so this is one.
+    # Reconciling the file with the tenant stacks is a tracked backlog item;
+    # until then, override deliberately with KANBN_DEPLOY_OVERRIDE=1.
+    if [ "${KANBN_DEPLOY_OVERRIDE:-0}" != "1" ]; then
+        echo "REFUSING: kanbn/ is not the production deploy path." >&2
+        echo "  Live: ~/apps/imagineering-kanbn (kan.imagineering.cc)" >&2
+        echo "  Deploying this would create a third, conflicting img-kanbn stack." >&2
+        echo "  See the header in kanbn/docker-compose.yml. Override: KANBN_DEPLOY_OVERRIDE=1" >&2
+        return 1
+    fi
+
     echo "Deploying Kan.bn..."
 
     local KANBN_SECRETS="$REPO_ROOT/kanbn/secrets.yaml"

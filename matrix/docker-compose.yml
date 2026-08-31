@@ -35,10 +35,22 @@ services:
         hard: 1048567
 
   mautrix-telegram:
-    # NOT PINNED — upstream registry no longer serves the digest of the image
-    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
-    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
-    image: dock.mau.dev/mautrix/telegram:latest
+    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
+    # dock.mau.dev has re-published :latest under a new index digest, so this
+    # digest returns `no such manifest` from the registry (verified 2026-08-31).
+    # The image itself is present locally and carries this digest in its
+    # RepoDigests, so compose resolves it from the local store: `compose pull`
+    # reports Skipped (not 404) and `compose create` builds the container.
+    # Verified on the box before shipping.
+    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
+    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
+    # move the service to a new image and `up -d` would recreate the bridge on it.
+    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
+    # de-authenticate a link. This form instead records exactly what is running.
+    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
+    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    image: dock.mau.dev/mautrix/telegram@sha256:ddb42d9a943b390bea5a7e365b66b831c6749309e68048fae1e780abcb34aa03
+    pull_policy: never
     restart: always
     volumes:
       - telegram_data:/data
@@ -46,10 +58,22 @@ services:
       - continuwuity
 
   mautrix-discord:
-    # NOT PINNED — upstream registry no longer serves the digest of the image
-    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
-    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
-    image: dock.mau.dev/mautrix/discord:latest
+    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
+    # dock.mau.dev has re-published :latest under a new index digest, so this
+    # digest returns `no such manifest` from the registry (verified 2026-08-31).
+    # The image itself is present locally and carries this digest in its
+    # RepoDigests, so compose resolves it from the local store: `compose pull`
+    # reports Skipped (not 404) and `compose create` builds the container.
+    # Verified on the box before shipping.
+    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
+    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
+    # move the service to a new image and `up -d` would recreate the bridge on it.
+    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
+    # de-authenticate a link. This form instead records exactly what is running.
+    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
+    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    image: dock.mau.dev/mautrix/discord@sha256:7716389dfb11dc7a44c8363348a48e91c1c463ded012f0fb08cdf266fcb20246
+    pull_policy: never
     restart: always
     volumes:
       - discord_data:/data
@@ -57,7 +81,10 @@ services:
       - continuwuity
 
   mautrix-signal:
-    # image built 2026-06-16 (was :latest)
+    # image built 2026-06-16 (was :latest). NOTE: dock.mau.dev prunes old index
+    # digests — three sibling bridges already lost theirs. If this one is collected,
+    # `deploy matrix` FAILS on this service (fail-closed, not a silent upgrade);
+    # the fix is to mirror it into our own GHCR. claude-tasks#3728.
     image: dock.mau.dev/mautrix/signal@sha256:0adf4fc6ba9d7ae95a0904f8432cde637093948a615612058934a7a484221390
     restart: always
     volumes:
@@ -66,10 +93,22 @@ services:
       - continuwuity
 
   mautrix-whatsapp:
-    # NOT PINNED — upstream registry no longer serves the digest of the image
-    # actually running (`no such manifest`, verified 2026-08-31). dock.mau.dev
-    # prunes old digests. A `compose pull` here will UPGRADE, not restore.
-    image: dock.mau.dev/mautrix/whatsapp:latest
+    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
+    # dock.mau.dev has re-published :latest under a new index digest, so this
+    # digest returns `no such manifest` from the registry (verified 2026-08-31).
+    # The image itself is present locally and carries this digest in its
+    # RepoDigests, so compose resolves it from the local store: `compose pull`
+    # reports Skipped (not 404) and `compose create` builds the container.
+    # Verified on the box before shipping.
+    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
+    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
+    # move the service to a new image and `up -d` would recreate the bridge on it.
+    # Bridges hold Signal/WhatsApp/Telegram session state, so an unplanned jump can
+    # de-authenticate a link. This form instead records exactly what is running.
+    # TRADEOFF, deliberate: on a fresh host with no local layer this FAILS rather
+    # than silently starting a different version. Fail closed. See claude-tasks#3728.
+    image: dock.mau.dev/mautrix/whatsapp@sha256:e768ff02a5006427e257bd6ddcee3831339ea6a3fa22f9c5aba80ce21d7d9a8f
+    pull_policy: never
     restart: always
     volumes:
       - whatsapp_data:/data

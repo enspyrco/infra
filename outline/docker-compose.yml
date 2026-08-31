@@ -5,6 +5,8 @@
 # `~/apps/outline/` does not exist on the box. Running `deploy-to.sh <ip> outline`
 # would stand up a THIRD, conflicting `img-outline` stack — do not do it blindly.
 # The digests below therefore record what prod runs; they do not deploy it.
+# Both tenant stacks were checked and run the SAME image digests (outline
+# a750f764, minio 14cea493), so one set of pins records both.
 # Reconciling this file with the two tenant stacks is tracked in the backlog.
 services:
   outline:

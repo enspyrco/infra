@@ -1,6 +1,10 @@
 services:
   radicale:
-    # image built 2026-06-24; upstream publishes no version label (was :latest)
+    # image built 2026-06-24; upstream publishes no version label (was :latest).
+    # Digest confirmed served by Docker Hub 2026-08-31. This IS the live deploy
+    # path, so if Hub ever GCs this untagged manifest a `deploy radicale` fails
+    # closed (loud) rather than silently upgrading — the mautrix bridges in
+    # matrix/docker-compose.yml are the same class. claude-tasks#3728.
     image: tomsquest/docker-radicale@sha256:65477ca10cec7434dbea25eb1847175d032a03b365748068b6ceaf5fab4e2c4e
     container_name: img-radicale
     restart: unless-stopped
