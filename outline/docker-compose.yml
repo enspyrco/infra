@@ -1,6 +1,19 @@
+# ⚠ THIS FILE IS NOT THE DEPLOY PATH FOR PRODUCTION OUTLINE.
+# Prod runs TWO hand-managed tenant stacks the host owns, not this one:
+#   ~/apps/imagineering-outline/  (outline.imagineering.cc, container imagineering-outline)
+#   ~/apps/xdeca-outline/         (kb/wiki.xdeca.com)
+# `~/apps/outline/` does not exist on the box. Running `deploy-to.sh <ip> outline`
+# would stand up a THIRD, conflicting `img-outline` stack — do not do it blindly.
+# The digests below record what prod runs. This file is not the NORMAL deploy
+# path: scripts/deploy-to.sh now refuses it unless OUTLINE_DEPLOY_OVERRIDE=1,
+# so an override deploy is deliberate and exceptional, not impossible.
+# Both tenant stacks were checked and run the SAME image digests (outline
+# a750f764, minio 14cea493), so one set of pins records both.
+# Reconciling this file with the two tenant stacks is tracked in the backlog.
 services:
   outline:
-    image: docker.getoutline.com/outlinewiki/outline:latest
+    # outline v1.6.1 (was :latest); multi-arch manifest list
+    image: docker.getoutline.com/outlinewiki/outline@sha256:a750f764080ce28d4a7393176011c8e2e4170b41689a8f6d91327dadf4904eb6
     container_name: img-outline
     restart: unless-stopped
     depends_on:
@@ -60,7 +73,8 @@ services:
       - outline
 
   minio:
-    image: minio/minio
+    # image built 2025-09-07 (was untagged); multi-arch manifest list
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     container_name: img-outline-minio
     restart: unless-stopped
     environment:
@@ -77,7 +91,8 @@ services:
   # One-time setup to create buckets for all services that use MinIO
   # (Kan.bn buckets are created here because MinIO only runs in the Outline stack)
   minio-setup:
-    image: minio/mc
+    # (was untagged); multi-arch manifest list
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     container_name: img-outline-minio_setup
     depends_on:
       - minio
