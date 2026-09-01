@@ -78,8 +78,10 @@ services:
 
   mautrix-signal:
     # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
-    # Replaces a pin to an upstream digest the registry no longer served, which was
-    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # NOTE, and this differs from its three siblings: signal's upstream digest was
+    # STILL SERVED. It is mirrored not because it was already lost, but because it sat
+    # on a registry that had dropped three of four — one GC pulse from their position.
+    # The siblings' pins WERE unserved and fail-unrecoverable; this one was not.
     # Verified against the running container two independent ways: same-daemon image-ID
     # comparison on the box, AND pulled from the registry on a machine with NO local
     # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong

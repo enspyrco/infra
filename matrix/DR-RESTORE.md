@@ -94,8 +94,15 @@ docker compose up -d
 ```
 
 Verified: a tag-only local reference is sufficient for `docker compose create` to create
-the container from it. (`create` resolves and creates; it does not build.) **Restore the digest pin once the registry is reachable again** — the tag
-is mutable and the pin is the whole point.
+the container from it. (`create` resolves and creates; it does not build.) **Restore the digest pin once the registry is reachable again** — the tag is mutable and
+the pin is the whole point.
+
+> **The temporary edit is not durable.** `deploy-to.sh matrix` rsyncs this repo over
+> `~/apps/matrix`, so the next deploy restores the digest pins on top of your edit. If the
+> registry is still unreachable at that moment, that deploy will be looking for a digest
+> the loaded tarball never carried. Either finish the restore (get a working
+> `docker login ghcr.io` and pull) before the next deploy, or make the same edit in the
+> repo and land it, so what is deployed matches what the host can actually resolve.
 
 ## Architecture limitation — read before restoring onto a different host
 
