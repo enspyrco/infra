@@ -163,12 +163,18 @@ services:
   # Config + registration + db live server-side in ./aiko-bridge-data (gitignored),
   # generated/registered once per the bridge README (like the other mautrix bridges).
   aiko-mosquitto:
-    # Deliberately NOT digest-pinned, and filed rather than silent: `:2` is a
-    # minor tag and therefore still mutable, so deploy_matrix's pull can move it.
-    # Pinning it is part of the tag-vs-digest decision in claude-tasks#3729 (which
-    # also covers postgres/redis/caddy) — mosquitto is stateless, so it is the
-    # easy half of that decision, but it should be decided with the rest.
-    image: eclipse-mosquitto:2
+    # Pinned to the digest THIS STACK IS ACTUALLY RUNNING, not to `:2`.
+    # `:2` has already moved under us and this is the live proof, not a worry:
+    #   running here          eclipse-mosquitto@sha256:a908c65c…  built 2026-04-15
+    #   what `:2` resolves to eclipse-mosquitto@sha256:6f8d8a94…  built 2026-06-22
+    # Both are app version 2.1.2 — a base-image rebuild, not a mosquitto upgrade —
+    # so the jump is low-stakes. But deploy_matrix runs `docker compose pull`, so on
+    # `:2` the next deploy would have silently recreated this container on the June
+    # image. That is the exact class this file exists to close.
+    # The running image is UNTAGGED locally (no tag points at it), which is why it
+    # looked unpinnable; its RepoDigest is still served by Docker Hub as a multi-arch
+    # index, so it pins cleanly. Upgrading is now a deliberate edit, not a side effect.
+    image: eclipse-mosquitto@sha256:a908c65cc8e67ec9d292ef27c2c0360dbaaee7eb1b935cdd194e67697f15dea1
     restart: always
     volumes:
       - ./aiko-chat-bridge/deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
