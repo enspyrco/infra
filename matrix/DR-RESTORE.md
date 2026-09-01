@@ -36,8 +36,13 @@ is not, and `up -d` fails.
 ## Path 2 — registry-independent (tarballs)
 
 Tarballs live on the box at `/home/nick/backups/mautrix-images-20260901/` (680M, four
-`.tar` files plus `MANIFEST.txt` recording every tag and digest). **Copy them off-box —
-on-box only, they die with the disk they are insuring against.**
+`.tar` files plus `MANIFEST.txt` recording every tag and digest).
+
+> **KNOWN GAP, stated rather than implied: they are currently ON THE BOX ONLY.** A
+> backstop stored on the disk it is insuring against is not yet a backstop — it covers a
+> registry outage or a bad prune, and not the disk loss. Getting them off-box is tracked
+> in claude-tasks (the established pattern for large binaries here is GitHub Release
+> assets on the backups repo, see `reference_release_asset_backup_storage_tier.md`).
 
 ```sh
 docker load -i mautrix-discord.tar

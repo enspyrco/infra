@@ -162,18 +162,22 @@ services:
 
   aiko-registrar:
     build: ./aiko-chat-bridge
-    # Mutable by design, OUT OF SCOPE for digest pinning, and the same for ALL
-    # THREE services that name aiko-bridge:latest (aiko-chat, aiko-bridge,
-    # aiko-registrar) — only aiko-registrar carries the `build:` key; the other two
-    # consume the image it produces. There is no registry digest to pin because the
-    # image never comes from a registry.
-    # Compose DOES still try to pull this tag and fail — that is precisely why
-    # deploy_matrix passes --ignore-pull-failures (see the comment at
-    # scripts/deploy-to.sh, "aiko-chat and aiko-bridge declare image:
-    # aiko-bridge:latest with no build: key"). So the behaviour is known and
-    # handled at the deploy layer, not left to chance here.
-    # The fix is moving it to GHCR — claude-tasks#2937 / #3143. Not a missed pin.
+    # Built ON THE BOX by the aiko-registrar service's `build: ./aiko-chat-bridge`;
+    # all three services naming this tag consume that locally-built image. There is
+    # no registry digest to pin because the image never comes from a registry.
+    # `pull_policy: never` below is not cosmetic. An unqualified `aiko-bridge:latest`
+    # resolves to docker.io/library/aiko-bridge, so compose tries to pull it on every
+    # deploy. deploy_matrix's --ignore-pull-failures damps the 404 — but the failure
+    # that flag CANNOT damp is a 200: if that name ever resolves, the pull succeeds
+    # and `up -d` would recreate these services on someone else's layers. That is
+    # unlikely (library/ is Docker's own official-images namespace, currently 404 and
+    # not third-party claimable) so this is defence-in-depth, not an open hole — but
+    # it costs one line and it also stops a pointless failed pull each deploy.
+    # Moving this to GHCR is claude-tasks#2937 / #3143. Not a missed pin.
     image: aiko-bridge:latest
+    # `build`, not `never`: this service HAS a build: key, so it produces the
+    # image the other two consume. `never` would forbid obtaining it at all.
+    pull_policy: build
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
@@ -184,6 +188,7 @@ services:
 
   aiko-chat:
     image: aiko-bridge:latest
+    pull_policy: never
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
@@ -196,6 +201,7 @@ services:
 
   aiko-bridge:
     image: aiko-bridge:latest
+    pull_policy: never
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
