@@ -35,22 +35,16 @@ services:
         hard: 1048567
 
   mautrix-telegram:
-    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
-    # called for. Verified byte-identical to the image that was running: pulled
-    # back down by this digest, resulting image ID matched the live container
-    # exactly (2026-09-01, with a bogus-tag negative control).
-    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
-    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
-    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
-    # strips RepoDigests) left nothing able to recreate the container. This one is
-    # immutable AND restorable, so `pull_policy: never` is no longer needed.
-    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
-    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
-    # login `docker compose pull` fails for this service, deploy_matrix's
-    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
-    # Registry-independent backstop: raw tarballs in
-    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
-    # the bytes but NOT the digest name).
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified byte-identical to the running container: pulled from the registry on a
+    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
     image: ghcr.io/enspyrco/mautrix-telegram@sha256:0a8e6fddc0864b95bc02b0219ce5a3f18420a10bb6088d4aef9122d7554e2771  # upstream build 2026-06-17
     restart: always
     volumes:
@@ -59,22 +53,16 @@ services:
       - continuwuity
 
   mautrix-discord:
-    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
-    # called for. Verified byte-identical to the image that was running: pulled
-    # back down by this digest, resulting image ID matched the live container
-    # exactly (2026-09-01, with a bogus-tag negative control).
-    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
-    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
-    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
-    # strips RepoDigests) left nothing able to recreate the container. This one is
-    # immutable AND restorable, so `pull_policy: never` is no longer needed.
-    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
-    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
-    # login `docker compose pull` fails for this service, deploy_matrix's
-    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
-    # Registry-independent backstop: raw tarballs in
-    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
-    # the bytes but NOT the digest name).
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified byte-identical to the running container: pulled from the registry on a
+    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
     image: ghcr.io/enspyrco/mautrix-discord@sha256:9d9f9b5fa9da307bf66a362c8929a7073404440e5564a3c7f889bf2d7ffd25dc  # upstream build 2026-05-12
     restart: always
     volumes:
@@ -83,20 +71,16 @@ services:
       - continuwuity
 
   mautrix-signal:
-    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
-    # called for. Verified byte-identical to the image that was running: pulled
-    # back down by this digest, resulting image ID matched the live container
-    # exactly (2026-09-01, with a bogus-tag negative control).
-    # Signal's dock.mau.dev digest WAS still served, unlike its three siblings —
-    # but it sat on a registry that had already dropped three of four, so it was
-    # one GC pulse from the same position rather than a safer class.
-    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
-    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
-    # login `docker compose pull` fails for this service, deploy_matrix's
-    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
-    # Registry-independent backstop: raw tarballs in
-    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
-    # the bytes but NOT the digest name).
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified byte-identical to the running container: pulled from the registry on a
+    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
     image: ghcr.io/enspyrco/mautrix-signal@sha256:385668cbd80742fde6f0de51b5eb063e492fdfd8a1d6740143a166a5f2689bf9  # upstream build 2026-06-16
     restart: always
     volumes:
@@ -105,22 +89,16 @@ services:
       - continuwuity
 
   mautrix-whatsapp:
-    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
-    # called for. Verified byte-identical to the image that was running: pulled
-    # back down by this digest, resulting image ID matched the live container
-    # exactly (2026-09-01, with a bogus-tag negative control).
-    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
-    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
-    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
-    # strips RepoDigests) left nothing able to recreate the container. This one is
-    # immutable AND restorable, so `pull_policy: never` is no longer needed.
-    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
-    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
-    # login `docker compose pull` fails for this service, deploy_matrix's
-    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
-    # Registry-independent backstop: raw tarballs in
-    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
-    # the bytes but NOT the digest name).
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified byte-identical to the running container: pulled from the registry on a
+    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
     image: ghcr.io/enspyrco/mautrix-whatsapp@sha256:197f9c345f36337fdf80302a7315ffa72a248f277bd21efd051f8d50f960928e  # upstream build 2026-06-18
     restart: always
     volumes:
