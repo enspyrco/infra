@@ -35,52 +35,23 @@ services:
         hard: 1048567
 
   mautrix-telegram:
-    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
-    # dock.mau.dev has re-published :latest under a new index digest, so this
-    # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Three mechanisms, each doing exactly one thing. Do not delete any of them
-    # as ornament:
-    #   the LOCAL LAYER  -> load-bearing. The running image carries this digest in
-    #                       its RepoDigests, so `docker compose create` creates the
-    #                       container from the image already in the local store.
-    #                       The pin is only the NAME this is looked up by; the layer
-    #                       is what keeps the service alive.
-    #   pull_policy: never-> stops THIS service's pull from becoming a 404 at all
-    #                       (reported Skipped). Load-bearing for every invocation
-    #                       that is not deploy_matrix — a bare `docker compose pull`
-    #                       on the box, or a future script that forgets the flag.
-    #   --ignore-pull-failures (in deploy_matrix, scripts/deploy-to.sh)
-    #                     -> keeps a SIBLING service's pull failure from aborting
-    #                       the whole stack. It is not what saves this service.
-    # None of the three can summon bytes the registry no longer has.
-    # Two earlier versions of this comment were both wrong: "neither alone is
-    # sufficient" overclaimed, and "the digest pin alone keeps the service running"
-    # was its inverted twin. The layer is load-bearing; the pin names it.
-    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
-    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
-    # move the service to a new image and `up -d` would recreate the bridge on it.
-    # These bridges hold live linked-account session state, so an unplanned jump can
-    # de-authenticate a link. (Each of these bridges holds its own live
-    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
-    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
-    # The layer is NOT evicted by `docker image prune -a` alone — a running
-    # container holds it. The real trigger is a teardown FIRST: `docker compose
-    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
-    # strips RepoDigests). After any of those, nothing in this file can recreate
-    # the container, even with the session volume intact — the one exception
-    # being a `docker save` tarball taken BEFORE the layer died, which is why
-    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
-    # and produced a WORKING but different-version bridge. So this trades a
-    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
-    # for a routine deploy and the WORSE one for disaster recovery.
-    # Pinning the currently-served index digest is NOT an escape: measured
-    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
-    # The only fix that is both immutable and recoverable is mirroring the running
-    # images into our own GHCR and pinning there — claude-tasks#3728, which is
-    # therefore a real DR gap and not a tidiness item.
-    image: dock.mau.dev/mautrix/telegram@sha256:ddb42d9a943b390bea5a7e365b66b831c6749309e68048fae1e780abcb34aa03
-    pull_policy: never
+    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
+    # called for. Verified byte-identical to the image that was running: pulled
+    # back down by this digest, resulting image ID matched the live container
+    # exactly (2026-09-01, with a bogus-tag negative control).
+    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
+    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
+    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
+    # strips RepoDigests) left nothing able to recreate the container. This one is
+    # immutable AND restorable, so `pull_policy: never` is no longer needed.
+    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
+    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
+    # login `docker compose pull` fails for this service, deploy_matrix's
+    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
+    # Registry-independent backstop: raw tarballs in
+    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
+    # the bytes but NOT the digest name).
+    image: ghcr.io/enspyrco/mautrix-telegram@sha256:0a8e6fddc0864b95bc02b0219ce5a3f18420a10bb6088d4aef9122d7554e2771  # upstream build 2026-06-17
     restart: always
     volumes:
       - telegram_data:/data
@@ -88,47 +59,23 @@ services:
       - continuwuity
 
   mautrix-discord:
-    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
-    # dock.mau.dev has re-published :latest under a new index digest, so this
-    # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Mechanisms, measured — and only ONE is load-bearing:
-    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
-    #                          digest, so `docker compose create` creates the
-    #                          container from the image already in the local
-    #                          store. (It does not build anything.) This alone works:
-    #                          deploy_matrix passes --ignore-pull-failures, so the
-    #                          404 on the dead digest is swallowed and `up -d`
-    #                          proceeds on the local image.
-    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
-    #                          It stops the doomed pull attempt (Skipped, not 404)
-    #                          so the deploy log does not carry a red herring.
-    # An earlier version of this comment said "neither alone is sufficient". That
-    # overclaimed: the digest pin alone keeps the service running.
-    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
-    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
-    # move the service to a new image and `up -d` would recreate the bridge on it.
-    # These bridges hold live linked-account session state, so an unplanned jump can
-    # de-authenticate a link. (Each of these bridges holds its own live
-    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
-    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
-    # The layer is NOT evicted by `docker image prune -a` alone — a running
-    # container holds it. The real trigger is a teardown FIRST: `docker compose
-    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
-    # strips RepoDigests). After any of those, nothing in this file can recreate
-    # the container, even with the session volume intact — the one exception
-    # being a `docker save` tarball taken BEFORE the layer died, which is why
-    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
-    # and produced a WORKING but different-version bridge. So this trades a
-    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
-    # for a routine deploy and the WORSE one for disaster recovery.
-    # Pinning the currently-served index digest is NOT an escape: measured
-    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
-    # The only fix that is both immutable and recoverable is mirroring the running
-    # images into our own GHCR and pinning there — claude-tasks#3728, which is
-    # therefore a real DR gap and not a tidiness item.
-    image: dock.mau.dev/mautrix/discord@sha256:7716389dfb11dc7a44c8363348a48e91c1c463ded012f0fb08cdf266fcb20246
-    pull_policy: never
+    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
+    # called for. Verified byte-identical to the image that was running: pulled
+    # back down by this digest, resulting image ID matched the live container
+    # exactly (2026-09-01, with a bogus-tag negative control).
+    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
+    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
+    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
+    # strips RepoDigests) left nothing able to recreate the container. This one is
+    # immutable AND restorable, so `pull_policy: never` is no longer needed.
+    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
+    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
+    # login `docker compose pull` fails for this service, deploy_matrix's
+    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
+    # Registry-independent backstop: raw tarballs in
+    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
+    # the bytes but NOT the digest name).
+    image: ghcr.io/enspyrco/mautrix-discord@sha256:9d9f9b5fa9da307bf66a362c8929a7073404440e5564a3c7f889bf2d7ffd25dc  # upstream build 2026-05-12
     restart: always
     volumes:
       - discord_data:/data
@@ -136,19 +83,21 @@ services:
       - continuwuity
 
   mautrix-signal:
-    # image built 2026-06-16 (was :latest); multi-arch manifest list. NOTE: dock.mau.dev prunes old index
-    # digests — three sibling bridges already lost theirs. Deliberately WITHOUT
-    # pull_policy: never, unlike those three: this digest is still served, so the
-    # image stays restorable from the registry, and removing that would trade a
-    # real capability for symmetry. If it is ever collected, deploy_matrix passes
-    # --ignore-pull-failures (scripts/deploy-to.sh), so a DEPLOY on this box
-    # survives: the pull failure does not abort the stack and `up -d` keeps using
-    # the local image. But that saves the deploy, NOT the rebuild — the moment the
-    # local layer is gone, signal joins the three dead siblings and is equally
-    # unrecoverable. It is one GC pulse from their position, not a safer class.
-    # The durable fix is the same for all four: mirror into our own GHCR,
-    # claude-tasks#3728.
-    image: dock.mau.dev/mautrix/signal@sha256:0adf4fc6ba9d7ae95a0904f8432cde637093948a615612058934a7a484221390
+    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
+    # called for. Verified byte-identical to the image that was running: pulled
+    # back down by this digest, resulting image ID matched the live container
+    # exactly (2026-09-01, with a bogus-tag negative control).
+    # Signal's dock.mau.dev digest WAS still served, unlike its three siblings —
+    # but it sat on a registry that had already dropped three of four, so it was
+    # one GC pulse from the same position rather than a safer class.
+    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
+    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
+    # login `docker compose pull` fails for this service, deploy_matrix's
+    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
+    # Registry-independent backstop: raw tarballs in
+    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
+    # the bytes but NOT the digest name).
+    image: ghcr.io/enspyrco/mautrix-signal@sha256:385668cbd80742fde6f0de51b5eb063e492fdfd8a1d6740143a166a5f2689bf9  # upstream build 2026-06-16
     restart: always
     volumes:
       - signal_data:/data
@@ -156,47 +105,23 @@ services:
       - continuwuity
 
   mautrix-whatsapp:
-    # PINNED TO A DIGEST THE REGISTRY NO LONGER SERVES — deliberate, and it works.
-    # dock.mau.dev has re-published :latest under a new index digest, so this
-    # digest returns `no such manifest` from the registry (verified 2026-08-31).
-    # Mechanisms, measured — and only ONE is load-bearing:
-    #   local RepoDigests   -> LOAD-BEARING. The running image carries this exact
-    #                          digest, so `docker compose create` creates the
-    #                          container from the image already in the local
-    #                          store. (It does not build anything.) This alone works:
-    #                          deploy_matrix passes --ignore-pull-failures, so the
-    #                          404 on the dead digest is swallowed and `up -d`
-    #                          proceeds on the local image.
-    #   pull_policy: never  -> NOT load-bearing for keeping the container alive.
-    #                          It stops the doomed pull attempt (Skipped, not 404)
-    #                          so the deploy log does not carry a red herring.
-    # An earlier version of this comment said "neither alone is sufficient". That
-    # overclaimed: the digest pin alone keeps the service running.
-    # Why this rather than :latest — :latest fails OPEN. deploy_matrix runs
-    # `docker compose pull` on every deploy (scripts/deploy-to.sh), which would
-    # move the service to a new image and `up -d` would recreate the bridge on it.
-    # These bridges hold live linked-account session state, so an unplanned jump can
-    # de-authenticate a link. (Each of these bridges holds its own live
-    # session state — naming a fixed trio here was copy-paste imprecision.) This form instead records exactly what is running.
-    # THE REAL TRADEOFF, stated honestly — this is NOT merely "fail closed":
-    # it is FAIL-UNRECOVERABLE for this service once the local layer is gone.
-    # The layer is NOT evicted by `docker image prune -a` alone — a running
-    # container holds it. The real trigger is a teardown FIRST: `docker compose
-    # down` and THEN `prune -a`, or a disk rebuild, or a `docker load` (which
-    # strips RepoDigests). After any of those, nothing in this file can recreate
-    # the container, even with the session volume intact — the one exception
-    # being a `docker save` tarball taken BEFORE the layer died, which is why
-    # that stopgap is worth having and is named in claude-tasks#3728. Before this pin, a rebuild would have pulled :latest
-    # and produced a WORKING but different-version bridge. So this trades a
-    # silent-version-jump risk for a cannot-rebuild risk; it is the better trade
-    # for a routine deploy and the WORSE one for disaster recovery.
-    # Pinning the currently-served index digest is NOT an escape: measured
-    # 2026-08-31, it resolves to a DIFFERENT, newer image, not these bytes.
-    # The only fix that is both immutable and recoverable is mirroring the running
-    # images into our own GHCR and pinning there — claude-tasks#3728, which is
-    # therefore a real DR gap and not a tidiness item.
-    image: dock.mau.dev/mautrix/whatsapp@sha256:e768ff02a5006427e257bd6ddcee3831339ea6a3fa22f9c5aba80ce21d7d9a8f
-    pull_policy: never
+    # Mirrored into our own GHCR and pinned by digest — the fix claude-tasks#3728
+    # called for. Verified byte-identical to the image that was running: pulled
+    # back down by this digest, resulting image ID matched the live container
+    # exactly (2026-09-01, with a bogus-tag negative control).
+    # This replaces a pin to a dock.mau.dev digest the registry NO LONGER SERVED.
+    # That pin was FAIL-UNRECOVERABLE: it worked only while the local layer
+    # survived, so a teardown + prune, a disk rebuild, or a `docker load` (which
+    # strips RepoDigests) left nothing able to recreate the container. This one is
+    # immutable AND restorable, so `pull_policy: never` is no longer needed.
+    # The package is PRIVATE, so a fresh host needs `docker login ghcr.io` before
+    # its first pull (same as ghcr.io/enspyrco/realm-token-server). Without that
+    # login `docker compose pull` fails for this service, deploy_matrix's
+    # --ignore-pull-failures swallows it, and `up -d` runs from the local image.
+    # Registry-independent backstop: raw tarballs in
+    # /home/nick/backups/mautrix-images-20260901/ (note `docker load` restores
+    # the bytes but NOT the digest name).
+    image: ghcr.io/enspyrco/mautrix-whatsapp@sha256:197f9c345f36337fdf80302a7315ffa72a248f277bd21efd051f8d50f960928e  # upstream build 2026-06-18
     restart: always
     volumes:
       - whatsapp_data:/data
