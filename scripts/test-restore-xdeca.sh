@@ -48,6 +48,20 @@
 # REQUIRE_ALL=1 (set by CI) turns a missing docker/gh into a hard failure rather
 # than a vacuous skip, so CI cannot go green with the test silently not running.
 #
+# THIS SCRIPT DOES NOT TEAR ITSELF DOWN — deliberately.
+# Two reasons. A restore test whose container evaporates on exit cannot be
+# INSPECTED: "24 passed" is the summary, and the whole value of a restore is
+# being able to open the thing and look at it, especially the run where an
+# assertion failed and you need the state that produced it. And an unattended
+# `docker rm -f` inside a test is a destructive action running on a schedule
+# nobody is watching; the restore is safe to automate, the destruction is not.
+# The container name is printed on exit along with the exact removal command.
+# Tear it down by hand when you are done looking.
+#
+# Re-running is safe: fixtures are suffixed per-run, so a second run never
+# touches the first one's container. If the exact name somehow exists already,
+# the script ABORTS rather than force-removing it — see the pre-flight below.
+#
 # Exit non-zero on any failure.
 
 set -uo pipefail
@@ -79,16 +93,30 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   skip_or_fail "docker unavailable"
 fi
 
-# --- Unique, self-cleaning fixtures -----------------------------------------
+# --- Per-run fixtures; NOT auto-removed (see header) -------------------------
 SUFFIX="$$-$(date +%s)"
 CTR="xdeca-resttest-$SUFFIX"
 WORK="$(mktemp -d)"
 
-cleanup() {
-  docker rm -f "$CTR" >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+# Fail closed. If this exact name exists, something is wrong with our
+# assumptions — never force-remove a container we did not just create.
+if docker inspect "$CTR" >/dev/null 2>&1; then
+  echo "  FAIL - container $CTR already exists; refusing to touch it"
+  exit 1
+fi
+
+# Print the teardown instructions no matter how we exit, including on an early
+# abort, so a container is never left behind silently.
+announce_teardown() {
+  echo ""
+  echo "  LEFT RUNNING FOR INSPECTION (not torn down — by design):"
+  echo "    container : $CTR"
+  echo "    workdir   : $WORK"
+  echo "    inspect   : docker exec -it $CTR psql -U outline -d outline"
+  echo "                docker exec -it $CTR psql -U kanbn   -d kanbn"
+  echo "    TEAR DOWN : docker rm -f $CTR && rm -rf $WORK"
 }
-trap cleanup EXIT
+trap announce_teardown EXIT
 
 # --- Obtain the backup ------------------------------------------------------
 FETCH="$WORK/backup"
