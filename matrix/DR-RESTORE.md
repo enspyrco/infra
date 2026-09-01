@@ -16,6 +16,20 @@ layer survived. A teardown + `docker image prune -a`, a disk rebuild, or a `dock
 would have left nothing able to recreate the containers, even with the session volumes
 intact. See claude-tasks#3728.
 
+## Why the first deploy after the switch does not break
+
+Changing a pin from `dock.mau.dev/...@sha256:` to `ghcr.io/enspyrco/...@sha256:` is a
+change of *reference*, and an image satisfying the old reference does not automatically
+satisfy the new one. That would normally mean the first deploy after the switch depends on
+the operator having pulled the new refs out of band.
+
+Here it is already discharged, and checked rather than assumed: the mirror was pushed
+**from this box**, so its local store carries the GHCR repo-digests, and each was pulled
+back by digest afterwards. Verified 2026-09-01 — all 4/4 new refs resolve locally
+(`docker image inspect ghcr.io/enspyrco/mautrix-<bridge>@sha256:…`).
+
+**On any other host this does not hold** and Path 1 or Path 2 below is required first.
+
 ## Path 1 — normal (the registry has them)
 
 ```sh
@@ -60,19 +74,27 @@ The compose file pins by **digest**, so a loaded image will **not** satisfy it. 
 by reading the tarball's own `manifest.json`: an image saved by ID has `RepoTags: null`
 and carries no repo digest at all. (These were re-saved by tag for exactly this reason.)
 
-So Path 2 requires one temporary edit:
+So Path 2 requires one temporary edit per bridge. **The full mapping is here so nothing
+has to be reconstructed from prose during an outage:**
+
+| service | replace this digest pin | with this tag |
+|---|---|---|
+| `mautrix-telegram` | `ghcr.io/enspyrco/mautrix-telegram@sha256:0a8e6fdd…` | `ghcr.io/enspyrco/mautrix-telegram:2026-06-17` |
+| `mautrix-discord` | `ghcr.io/enspyrco/mautrix-discord@sha256:9d9f9b5f…` | `ghcr.io/enspyrco/mautrix-discord:2026-05-12` |
+| `mautrix-whatsapp` | `ghcr.io/enspyrco/mautrix-whatsapp@sha256:197f9c34…` | `ghcr.io/enspyrco/mautrix-whatsapp:2026-06-18` |
+| `mautrix-signal` | `ghcr.io/enspyrco/mautrix-signal@sha256:385668cb…` | `ghcr.io/enspyrco/mautrix-signal:2026-06-16` |
+
+The same mapping, with full digests, is in `MANIFEST.txt` beside the tarballs.
 
 ```sh
-docker load -i mautrix-<bridge>.tar
-# in matrix/docker-compose.yml, swap the digest pin for the tag it restored:
-#   image: ghcr.io/enspyrco/mautrix-discord@sha256:9d9f…
-#   ->
-#   image: ghcr.io/enspyrco/mautrix-discord:2026-05-12
+cd ~/apps/matrix
+for b in telegram discord whatsapp signal; do docker load -i "mautrix-$b.tar"; done
+# edit matrix/docker-compose.yml per the table above, then:
 docker compose up -d
 ```
 
-Verified: a tag-only local reference is sufficient for `docker compose create` to build
-the container. **Restore the digest pin once the registry is reachable again** — the tag
+Verified: a tag-only local reference is sufficient for `docker compose create` to create
+the container from it. (`create` resolves and creates; it does not build.) **Restore the digest pin once the registry is reachable again** — the tag
 is mutable and the pin is the whole point.
 
 ## Architecture limitation — read before restoring onto a different host

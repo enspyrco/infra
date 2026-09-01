@@ -38,8 +38,11 @@ services:
     # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
     # Replaces a pin to an upstream digest the registry no longer served, which was
     # FAIL-UNRECOVERABLE (it held only while the local layer survived).
-    # Verified byte-identical to the running container: pulled from the registry on a
-    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
     # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
     # box, so it is precise for this host and unusable on x86_64. The upstream images
     # it replaces WERE indexes; that property was deliberately traded, not lost.
@@ -56,8 +59,11 @@ services:
     # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
     # Replaces a pin to an upstream digest the registry no longer served, which was
     # FAIL-UNRECOVERABLE (it held only while the local layer survived).
-    # Verified byte-identical to the running container: pulled from the registry on a
-    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
     # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
     # box, so it is precise for this host and unusable on x86_64. The upstream images
     # it replaces WERE indexes; that property was deliberately traded, not lost.
@@ -74,8 +80,11 @@ services:
     # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
     # Replaces a pin to an upstream digest the registry no longer served, which was
     # FAIL-UNRECOVERABLE (it held only while the local layer survived).
-    # Verified byte-identical to the running container: pulled from the registry on a
-    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
     # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
     # box, so it is precise for this host and unusable on x86_64. The upstream images
     # it replaces WERE indexes; that property was deliberately traded, not lost.
@@ -92,8 +101,11 @@ services:
     # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
     # Replaces a pin to an upstream digest the registry no longer served, which was
     # FAIL-UNRECOVERABLE (it held only while the local layer survived).
-    # Verified byte-identical to the running container: pulled from the registry on a
-    # machine with NO local cache and the layer DiffID sets matched exactly.
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
     # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
     # box, so it is precise for this host and unusable on x86_64. The upstream images
     # it replaces WERE indexes; that property was deliberately traded, not lost.
