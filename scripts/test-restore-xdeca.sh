@@ -108,6 +108,16 @@ fi
 # Print the teardown instructions no matter how we exit, including on an early
 # abort, so a container is never left behind silently.
 announce_teardown() {
+  # Only claim something was left running if it actually exists. On an early
+  # abort the container was never created, and telling someone to tear down a
+  # container that is not there is a small lie that trains people to ignore
+  # this banner.
+  if ! docker inspect "$CTR" >/dev/null 2>&1; then
+    echo ""
+    echo "  (no container was created — nothing to tear down)"
+    rm -rf "$WORK"
+    return
+  fi
   echo ""
   echo "  LEFT RUNNING FOR INSPECTION (not torn down — by design):"
   echo "    container : $CTR"
@@ -153,8 +163,23 @@ fi
 # =============================================================================
 echo ""
 echo "[1] structural completeness"
+# The guard MUST load. If it does not, `pg_dump_is_complete` becomes
+# "command not found" -> non-zero -> assertion [2] reads that as "the guard
+# rejected the bad dump" and reports ok. A missing guard would then LOOK like a
+# working one. Found the hard way running this script from a directory without
+# lib/ alongside it: [2] printed two ok lines with no guard loaded at all.
+# So: assert the file exists AND the function is defined, and abort if not.
+GUARD="$SCRIPT_DIR/lib/pg-dump-guard.sh"
+if [ ! -r "$GUARD" ]; then
+  echo "  FAIL - cannot read $GUARD — run this script from its place in the repo"
+  exit 1
+fi
 # shellcheck source=lib/pg-dump-guard.sh
-. "$SCRIPT_DIR/lib/pg-dump-guard.sh"
+. "$GUARD"
+if ! declare -F pg_dump_is_complete >/dev/null; then
+  echo "  FAIL - $GUARD sourced but pg_dump_is_complete is not defined"
+  exit 1
+fi
 
 for f in outline.sql kanbn.sql; do
   if pg_dump_is_complete "$FETCH/$f"; then
