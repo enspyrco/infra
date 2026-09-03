@@ -128,7 +128,7 @@ from GitHub and restore-tested from that fetched copy (24/24). Config dirs inclu
 |---------|------|-----|-------------|
 | ~~watchtower~~ | - | - | **NOT RUNNING** — absent from `docker ps -a` (verified 2026-08-31). This table claimed it auto-pulled images for an unknown period while nothing did, which means every `:latest` on the box is frozen at whatever was pulled on an unrecorded day. That is the finding behind the digest-pinning work; see `feedback_versioned_containers_not_latest.md`. |
 | lugh | - | - | Auxiliary worker |
-| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project). **Its vhost `n8n.callonclare.com.au` has NO DNS record** and the apex `callonclare.com.au` points at 35.213.149.172, not this box — so the Caddy vhost is dangling. Container is up. See claude-tasks (dangling-vhost issue). |
+| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project). **Its vhost `n8n.callonclare.com.au` has NO DNS record** and the apex `callonclare.com.au` points at 35.213.149.172, not this box — so the Caddy vhost is dangling. Container is up. See claude-tasks#3845. |
 
 ## Container Architecture
 
