@@ -1,6 +1,8 @@
 # enspyrco/infra
 
-Monorepo for self-hosted infrastructure — imagineering.cc services, co-located xdeca, and enspyr.
+Monorepo for self-hosted infrastructure — imagineering.cc services and enspyr.
+(xdeca was co-located here until 2026-09-02; it is decommissioned. See
+`project_xdeca_decommissioned_2026_09_02.md` in memory for what was preserved and where.)
 (Formerly `imagineering-cc/imagineering-infra`; renamed 2026-07-28. The `imagineering.cc` domain
 and its live services are unchanged — only the GitHub repo moved.)
 
@@ -70,9 +72,9 @@ lives in another repo), and **tooling**.
 
 ## Services
 
-Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) and co-located **xdeca** services (bare names, original 30xx/9000). Caddy routes by hostname.
+Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). Caddy routes by hostname. A second tenant, **xdeca**, was co-located here on bare names (30xx/9000) until it was decommissioned 2026-09-02 — its containers, networks, volumes and app dirs are gone.
 
-> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule — the tenant-collision this creates is exactly what `scripts/lib/resolve-container.sh` exists to resolve, and a bare `docker exec radicale` reaches xdeca's container, not ours.
+> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule. **Historical note:** a bare `docker exec radicale` used to reach *xdeca's* container rather than ours, which is why `scripts/lib/resolve-container.sh` exists. With xdeca decommissioned that collision can no longer occur, and whether the helper should now be deleted is an open keep-or-kill question (claude-tasks#3844) — do not assume either way from this line.
 
 ### Imagineering (public)
 
@@ -82,7 +84,7 @@ Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) a
 | imagineering-outline | 3012 | outline.imagineering.cc | Team wiki (Notion-like). Container is `imagineering-outline`, NOT `img-outline` — verified live 2026-08-26. Its postgres/redis are `imagineering-outline-postgres` / `-redis`. |
 | (imagineering-outline-minio) | 9010 | storage.imagineering.cc | S3-compatible file storage for outline + kanbn |
 | imagineering-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative). Container is `imagineering-kanbn`, NOT `img-kanbn`. Its DB is `imagineering-kanbn-postgres`. |
-| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` hits xdeca's tenant instead — that collision is real and is why `scripts/lib/resolve-container.sh` exists. Use it, not a bare name. |
+| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` used to hit xdeca's tenant; xdeca is gone as of 2026-09-02, so that collision is historical. `scripts/lib/resolve-container.sh` exists because of it — see claude-tasks#3844. |
 | matrix-continuwuity-1 | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork). Compose appends the `-1` suffix; the whole matrix stack does. |
 | (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot + relay-bot-hf |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
@@ -109,23 +111,24 @@ Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) a
 |---------|------|-----|-------------|
 | tw-clawd, tw-gremlin | 8080 (internal) | world.imagineering.cc | Tech-World bots (Discord/Matrix/Telegram facades). **`tw-dreamfinder` is DISABLED** (commented out in `tech-world-bots/docker-compose.yml`, c2b86aa — it collided with the main dreamfinder); only two run. |
 
-### Co-located xdeca services
+### Co-located xdeca services — REMOVED 2026-09-02
 
-| Service | Port | URL | Description |
-|---------|------|-----|-------------|
-| outline (xdeca) | 3002 | kb.xdeca.com / wiki.xdeca.com | Team wiki for xdeca |
-| outline_minio | 9000 | storage.xdeca.com | S3-compatible storage for xdeca outline |
-| kanbn | 3003 | tasks.xdeca.com | Kanban for xdeca (also fronts kan.imagineering.cc) |
-| radicale (xdeca) | 5233 | dav.xdeca.com | xdeca CalDAV/CardDAV |
-| Gremlin | - | gremlin.xdeca.com | xdeca Telegram bot (webhook mode) |
+xdeca is decommissioned. It formerly ran outline (3002, kb/wiki.xdeca.com), its MinIO
+(9000, storage.xdeca.com), kanbn (3003, tasks.xdeca.com), radicale (5233, dav.xdeca.com)
+and the Gremlin Telegram bot (gremlin.xdeca.com) on this box.
+
+Teardown was gated on a final snapshot pushed to `10xdeca/xdeca-backups`, fetched back
+from GitHub and restore-tested from that fetched copy (24/24). Config dirs including
+`.env` secrets are archived on the box at
+`~/xdeca-decommissioned-20260902-appdirs.tar.gz`, deliberately not in git.
 
 ### Operational
 
 | Service | Port | URL | Description |
 |---------|------|-----|-------------|
-| watchtower | - | - | Auto-pulls new container images |
+| ~~watchtower~~ | - | - | **NOT RUNNING** — absent from `docker ps -a` (verified 2026-08-31). This table claimed it auto-pulled images for an unknown period while nothing did, which means every `:latest` on the box is frozen at whatever was pulled on an unrecorded day. That is the finding behind the digest-pinning work; see `feedback_versioned_containers_not_latest.md`. |
 | lugh | - | - | Auxiliary worker |
-| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project) |
+| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project). **Its vhost `n8n.callonclare.com.au` has NO DNS record** and the apex `callonclare.com.au` points at 35.213.149.172, not this box — so the Caddy vhost is dangling. Container is up. See claude-tasks#3845. |
 
 ## Container Architecture
 

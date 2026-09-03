@@ -118,38 +118,10 @@ rag-api.imagineering.cc {
     reverse_proxy localhost:8010
 }
 
-# --- xdeca (colocated on the same OCI instance) ---
-
-kb.xdeca.com {
-    reverse_proxy localhost:3002
-}
-
-wiki.xdeca.com {
-    redir https://kb.xdeca.com{uri} permanent
-}
-
-storage.xdeca.com {
-    reverse_proxy localhost:9000
-}
-
-tasks.xdeca.com {
-    reverse_proxy localhost:3003
-}
-
-dav.xdeca.com {
-    reverse_proxy localhost:5233
-}
-
 # --- Call on Clare (colocated on OCI) ---
 
 n8n.callonclare.com.au {
     reverse_proxy localhost:5678
-}
-
-# --- Gremlin (Telegram bot webhook) ---
-
-gremlin.xdeca.com {
-    reverse_proxy localhost:8080
 }
 
 # --- Symposium (historical debate system) ---
