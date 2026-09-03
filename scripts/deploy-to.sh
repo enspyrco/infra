@@ -189,8 +189,19 @@ deploy_scripts() {
     ssh "$REMOTE" "sudo mkdir -p /opt/scripts /opt/scripts/lib"
     rsync -avz "$REPO_ROOT/scripts/" "$REMOTE":/tmp/scripts/
     # Move scripts into place. `cp -r` first so the lib/ subdir lands too,
-    # then chmod +x only the top-level *.sh (the lib is sourced, not run).
-    ssh "$REMOTE" "sudo cp -r /tmp/scripts/. /opt/scripts/ && sudo chmod +x /opt/scripts/*.sh && rm -rf /tmp/scripts"
+    # then chmod +x the top-level *.sh AND watchers/*.sh — both are invoked
+    # directly by cron. The lib/ dirs are deliberately excluded: they are
+    # sourced, not run. Without the watchers/ glob the exec bit survives only
+    # by rsync mode-preservation, so a watcher committed without +x deploys
+    # unrunnable and cron fails silently (oci-instance-watch-melbourne.sh
+    # landed 0644 on the box exactly this way).
+    # The chmod globs expand INSIDE the sudo'd shell, not in the remote login
+    # shell. Expanded as the unprivileged deploy user, an unreadable or
+    # unlistable /opt/scripts/watchers would leave the literal `*` as the
+    # argument, chmod would fail, the && chain would break, and the telegram/
+    # notify env installs further down would silently never run. Expanding as
+    # root removes that dependency on the deploy user's traversal rights.
+    ssh "$REMOTE" "sudo cp -r /tmp/scripts/. /opt/scripts/ && sudo sh -c 'chmod +x /opt/scripts/*.sh /opt/scripts/watchers/*.sh' && rm -rf /tmp/scripts"
 
     # Install the Telegram-secrets envfile (root:nick 0640) so cron scripts
     # running as `nick` can read it but the world cannot. This replaces the

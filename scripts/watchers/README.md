@@ -81,10 +81,43 @@ Each watcher sources `lib/watcher-base.sh`, which provides `log()`, `tg()`,
 watcher itself defines only `WATCHER_NAME`, `CRON_TAG`, `phase_a_check`,
 and `phase_b_check`. Typical watcher size: 50-80 lines.
 
-On Sydney, the lib is deployed once at `/home/ubuntu/lib/watcher-base.sh`
-and watchers source it via `"$(dirname "$0")/lib/watcher-base.sh"` (or
-`$HOME/lib/watcher-base.sh` as fallback). Updating the lib is a single
-file change that all watchers pick up on next cron tick.
+### Where watchers run on Sydney — ONE location
+
+**`/opt/scripts/watchers/` is the only place a watcher may run from.** That is
+where `deploy-to.sh scripts` installs them, so it is the only path the repo can
+reach, and every cron entry must invoke them there by absolute path.
+
+> **TODAY IT DOES NOT.** As of 2026-08-26 `ubuntu`'s crontab still executes five
+> watchers from `/home/ubuntu/`. The cutover is a separate, deliberate step
+> (#3482) and is NOT done. Until it is, this section describes the target, not
+> the box — do not read it as a description of what is running. Stating this
+> plainly matters: a confident present-tense claim in this very file is what let
+> the split survive for months of spot-checks.
+
+This was not always true, and the failure is worth knowing because it was
+invisible for months: watchers used to run from a hand-maintained copy in
+`/home/ubuntu/`, while deploys landed in `/opt/scripts/watchers/`. Two complete
+parallel installs, drifting in *both* directions — the run tree had a newer
+`lib/`, the deploy tree had newer watcher scripts. Three of five were
+byte-identical, which is what made spot-checks pass. PR #94 merged 2026-08-13
+and never executed once.
+
+Path resolution supports the single location: a watcher sources
+`"$(dirname "$0")/lib/watcher-base.sh"`, so the lib always comes from beside
+the script that is actually running. Everything *stateful* — `CONFIG_DIR`,
+`STATE_FILE`, `LOG_FILE`, `CRED_FILE` — resolves under `$HOME` instead, so
+state, credentials and logs stay in `/home/ubuntu/` regardless of where the
+code lives. That separation is deliberate: **code is repo-owned and
+deploy-replaced; state is host-owned and must survive a deploy.**
+
+Updating the lib is still a single file change that all watchers pick up on
+the next cron tick — it just has to go through a deploy now.
+
+> **Known remaining gap:** the *schedule* is still `ubuntu`'s user crontab,
+> hand-edited and invisible to this repo. Only the *code* is repo-authoritative.
+> Moving the schedule into a deployed `/etc/cron.d/` entry is blocked on
+> `self_disable()`, which works by rewriting the user crontab and would fail
+> silently against a `cron.d` file. See the self-disable section below.
 
 ## Spawn a new watcher
 
@@ -96,11 +129,11 @@ $EDITOR /tmp/cert-expiry-watch.sh
 #    - Implement phase_a_check + phase_b_check.
 
 # 2. Ship the watcher (and the lib if Sydney doesn't have it yet) to Sydney.
-ssh 149.118.69.221 'mkdir -p /home/ubuntu/lib'
+ssh 149.118.69.221 'sudo mkdir -p /opt/scripts/watchers/lib'
 scp scripts/watchers/lib/watcher-base.sh 149.118.69.221:/tmp/   # one-time
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/watcher-base.sh /home/ubuntu/lib/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/watcher-base.sh /opt/scripts/watchers/lib/'
 scp /tmp/cert-expiry-watch.sh 149.118.69.221:/tmp/
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/cert-expiry-watch.sh /home/ubuntu/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/cert-expiry-watch.sh /opt/scripts/watchers/'
 
 # 3. Confirm notify creds exist on the box (one-time, already in place
 #    if any other watcher has run there):
@@ -110,7 +143,7 @@ ssh 149.118.69.221 'ls -la ~/.config/imagineering/notify-credentials'
 #    `chmod 0600`.
 
 # 4. Install the cron entry. Tag it with the same name as CRON_TAG.
-ssh 149.118.69.221 'crontab -l | { cat; echo "*/15 * * * * /home/ubuntu/cert-expiry-watch.sh  # cert-expiry-watch"; } | crontab -'
+ssh 149.118.69.221 'sudo -u ubuntu crontab -l | { cat; echo "*/15 * * * * /opt/scripts/watchers/cert-expiry-watch.sh  # cert-expiry-watch"; } | sudo -u ubuntu crontab -'
 #    Note the trailing comment — self_disable() greps for it. The literal
 #    string after the # must match $CRON_TAG exactly.
 
@@ -121,8 +154,14 @@ ssh 149.118.69.221 'tail -f ~/cert-expiry-watch.log'
 ## The self-disable mechanic
 
 ```bash
-crontab -l | grep -vF "$CRON_TAG" | crontab -
+{ crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true; } | crontab -
 ```
+
+The `|| true` is not decoration. When this watcher's line is the LAST one in
+the crontab, `grep -vF` matches nothing and exits 1; under the caller's
+`set -o pipefail` that kills the script AFTER `crontab -` has already installed
+the (correctly) empty crontab. The disable succeeds, the success is never
+logged, and cron reports a failure for a step that worked.
 
 Three things to know:
 
@@ -197,7 +236,7 @@ notify.imagineering.cc. Use this while iterating on a new watcher to
 avoid Telegram noise:
 
 ```bash
-DRY_RUN=1 sudo -u ubuntu /home/ubuntu/.smoketest-foo.sh
+DRY_RUN=1 sudo -u ubuntu /opt/scripts/watchers/.smoketest-foo.sh
 tail /home/ubuntu/foo-watch.log
 # [<ts>] tg [DRY_RUN]: 🚨 ... (your alert text, newlines flattened)
 ```
@@ -294,9 +333,9 @@ footprint is just the lib + the script.
 ```bash
 # 1. Lib + script (lib likely already present from other watchers).
 scp scripts/watchers/lib/watcher-base.sh 149.118.69.221:/tmp/   # if not already there
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/watcher-base.sh /home/ubuntu/lib/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/watcher-base.sh /opt/scripts/watchers/lib/'
 scp scripts/watchers/email-health-watch.sh 149.118.69.221:/tmp/
-ssh 149.118.69.221 'sudo install -m 0755 -o ubuntu -g ubuntu /tmp/email-health-watch.sh /home/ubuntu/'
+ssh 149.118.69.221 'sudo install -m 0755 -o root -g root /tmp/email-health-watch.sh /opt/scripts/watchers/'
 
 # 2. Install the Brevo credential file (mode 0600, mirrors notify-credentials).
 #    The key lives in notify/secrets.yaml under brevo_api_key. Build the
@@ -317,10 +356,10 @@ rm -f /tmp/brevo-credentials; unset BREVO_KEY
 # 3. Install the cron entry (every 4 hours, off the hour). Tag MUST match
 #    CRON_TAG. Idempotent: strips any existing email-health-watch line first so
 #    re-running this step never creates duplicate entries / duplicate alerts.
-ssh 149.118.69.221 'crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /home/ubuntu/email-health-watch.sh  # email-health-watch"; } | crontab -'
+ssh 149.118.69.221 'sudo -u ubuntu crontab -l 2>/dev/null | grep -vF "# email-health-watch" | { cat; echo "23 */4 * * * /opt/scripts/watchers/email-health-watch.sh  # email-health-watch"; } | sudo -u ubuntu crontab -'
 
 # 4. Confirm first cycle (force a run, watch the log).
-ssh 149.118.69.221 '/home/ubuntu/email-health-watch.sh; tail ~/email-health-watch.log'
+ssh 149.118.69.221 '/opt/scripts/watchers/email-health-watch.sh; tail ~/email-health-watch.log'
 ```
 
 ## Built: notify-canary-melbourne
@@ -414,7 +453,7 @@ ssh nick-mel 'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@149.118.69.221 "e
 #    user ubuntu — offset to :47, clear of the oci-watcher's :17). Tag MUST
 #    match CRON_TAG. Idempotent: strips any existing line first.
 ssh nick-mel 'DRY_RUN=1 ~/notify-canary-melbourne.sh; tail ~/notify-canary-melbourne.log'
-ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * /home/ubuntu/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
+ssh nick-mel 'crontab -l 2>/dev/null | grep -vF "# notify-canary-melbourne" | { cat; echo "47 */2 * * * ~/notify-canary-melbourne.sh  # notify-canary-melbourne"; } | crontab -'
 ```
 
 ## See also
