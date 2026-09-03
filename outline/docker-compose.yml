@@ -1,15 +1,19 @@
 # ⚠ THIS FILE IS NOT THE DEPLOY PATH FOR PRODUCTION OUTLINE.
-# Prod runs TWO hand-managed tenant stacks the host owns, not this one:
+# Prod runs hand-managed tenant stacks the host owns, not this one:
 #   ~/apps/imagineering-outline/  (outline.imagineering.cc, container imagineering-outline)
-#   ~/apps/xdeca-outline/         (kb/wiki.xdeca.com)
+# (~/apps/xdeca-outline/ was the other until xdeca was decommissioned 2026-09-02.)
 # `~/apps/outline/` does not exist on the box. Running `deploy-to.sh <ip> outline`
-# would stand up a THIRD, conflicting `img-outline` stack — do not do it blindly.
+# would stand up an ADDITIONAL, conflicting `img-outline` stack — do not do it blindly.
 # The digests below record what prod runs. This file is not the NORMAL deploy
 # path: scripts/deploy-to.sh now refuses it unless OUTLINE_DEPLOY_OVERRIDE=1,
 # so an override deploy is deliberate and exceptional, not impossible.
-# Both tenant stacks were checked and run the SAME image digests (outline
-# a750f764, minio 14cea493), so one set of pins records both.
-# Reconciling this file with the two tenant stacks is tracked in the backlog.
+# The digests here were taken from the live imagineering tenant. When they were
+# recorded (2026-08-31) a second tenant, xdeca, ran the SAME digests — that tenant
+# was decommissioned 2026-09-02, so this now records the only one there is.
+# Stated without a count deliberately: an earlier version said "BOTH tenant stacks",
+# accurate the day it was written and false two days later without anyone editing it.
+# Reconciling this file with the live tenant stack is tracked in the backlog
+# (claude-tasks#3842) — now a one-tenant job, which xdeca's removal made simpler.
 services:
   outline:
     # outline v1.6.1 (was :latest); multi-arch manifest list

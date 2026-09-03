@@ -833,20 +833,23 @@ SSHEOF'
 
 deploy_outline() {
     # REFUSE — outline/ is NOT the production deploy path.
-    # Prod runs a hand-managed tenant stack: ~/apps/imagineering-outline
-    # (outline.imagineering.cc). It used to be two — ~/apps/xdeca-outline was the
-    # other — but xdeca was decommissioned 2026-09-02, so deploying here now adds a
-    # SECOND conflicting stack, not a third.
-    # ~/apps/outline does not exist on the box, and outline/docker-compose.yml still
-    # declares container_name: img-outline, so deploying here would stand up a SECOND,
-    # CONFLICTING stack alongside the live tenant. The header comment in that
+    # Prod runs hand-managed tenant stacks under ~/apps/imagineering-*; this file is
+    # not one of them. ~/apps/outline does not exist on the box, and
+    # outline/docker-compose.yml still declares container_name: img-outline, so
+    # deploying here would stand up an ADDITIONAL, CONFLICTING stack alongside
+    # whatever tenants are live.
+    # Deliberately states no COUNT. An earlier version said "a THIRD conflicting
+    # stack", which was accurate when written and silently wrong the day xdeca was
+    # decommissioned — nobody edited it; the world moved under it. A comment that
+    # counts live things has a dependency a comment that states a fact does not, and
+    # the number bought nothing. The header comment in that
     # compose file says so — a comment is not an invariant, so this is one.
     # Reconciling the file with the tenant stacks is a tracked backlog item;
     # until then, override deliberately with OUTLINE_DEPLOY_OVERRIDE=1.
     if [ "${OUTLINE_DEPLOY_OVERRIDE:-0}" != "1" ]; then
         echo "REFUSING: outline/ is not the production deploy path." >&2
         echo "  Live: ~/apps/imagineering-outline (outline.imagineering.cc)" >&2
-        echo "  Deploying this would create a second, conflicting img-outline stack." >&2
+        echo "  Deploying this would create an additional, conflicting img-outline stack." >&2
         echo "  See the header in outline/docker-compose.yml. Override: OUTLINE_DEPLOY_OVERRIDE=1" >&2
         return 1
     fi
@@ -918,16 +921,16 @@ deploy_kanbn() {
     # REFUSE — kanbn/ is NOT the production deploy path.
     # Prod runs hand-managed tenant stack(s): ~/apps/imagineering-kanbn (kan.imagineering.cc).
     # ~/apps/kanbn does not exist on the box, and kanbn/docker-compose.yml still
-    # declares container_name: img-kanbn, so deploying here would stand up a
-    # SECOND, CONFLICTING stack alongside the single live tenant. (Outline has two
-    # tenants and so would gain a third; Kan.bn has one. Counted, not copy-pasted.) The header comment in that
+    # declares container_name: img-kanbn, so deploying here would stand up an
+    # ADDITIONAL, CONFLICTING stack alongside whatever tenants are live.
+    # No COUNT here either — see the note in deploy_outline. The header comment in that
     # compose file says so — a comment is not an invariant, so this is one.
     # Reconciling the file with the tenant stacks is a tracked backlog item;
     # until then, override deliberately with KANBN_DEPLOY_OVERRIDE=1.
     if [ "${KANBN_DEPLOY_OVERRIDE:-0}" != "1" ]; then
         echo "REFUSING: kanbn/ is not the production deploy path." >&2
         echo "  Live: ~/apps/imagineering-kanbn (kan.imagineering.cc)" >&2
-        echo "  Deploying this would create a second, conflicting img-kanbn stack." >&2
+        echo "  Deploying this would create an additional, conflicting img-kanbn stack." >&2
         echo "  See the header in kanbn/docker-compose.yml. Override: KANBN_DEPLOY_OVERRIDE=1" >&2
         return 1
     fi
