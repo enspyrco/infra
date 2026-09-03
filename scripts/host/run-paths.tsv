@@ -1,0 +1,52 @@
+# Manifest: which repo file is the source for which running path on Sydney.
+#
+# repo-relative-path <TAB> absolute-path-on-box <TAB> status
+#
+# status is the HONEST current state, not the intent:
+#   deployed  — deploy-to.sh installs to the running path; repo IS authoritative
+#   orphaned  — the repo holds the source, but nothing deploys it to the running
+#               path. Editing the repo copy changes NOTHING on the box until a
+#               human cuts the schedule over. Tracked so the drift is visible.
+#   external  — deliberately owned by ANOTHER repo. There is no source here to
+#               compare, so the checker only asserts the file still EXISTS: its
+#               disappearance is a finding, its content is not ours. Naming the
+#               owner is the point — an unexplained running path and a path
+#               owned elsewhere look identical until someone writes it down.
+#
+# Any cron/systemd target on the box that is absent from this file is reported
+# as UNTRACKED by scripts/check-run-paths.sh — that is the check's real job.
+# Adding a row is a claim; the checker verifies it against the box.
+scripts/backup.sh	/opt/scripts/backup.sh	deployed
+scripts/restore.sh	/opt/scripts/restore.sh	deployed
+scripts/health-check.sh	/opt/scripts/health-check.sh	deployed
+scripts/watchers/backup-recency-watch.sh	/home/ubuntu/backup-recency-watch.sh	orphaned
+scripts/watchers/cert-expiry-watch.sh	/home/ubuntu/cert-expiry-watch.sh	orphaned
+scripts/watchers/disk-usage-watch.sh	/home/ubuntu/disk-usage-watch.sh	orphaned
+scripts/watchers/email-health-watch.sh	/home/ubuntu/email-health-watch.sh	orphaned
+scripts/watchers/oci-instance-watch.sh	/home/ubuntu/oci-instance-watch.sh	orphaned
+scripts/host/docker-watchdog.sh	/opt/docker-watchdog.sh	orphaned
+scripts/host/keep-alive.sh	/opt/keep-alive.sh	orphaned
+scripts/host/self-healer-run.sh	/home/nick/apps/self-healer-run.sh	orphaned
+# release-watch is tracked but NOT SCHEDULED. #3512 recorded it as "cron 09:00
+# daily via /etc/cron.d/xdeca-release-watch"; that file does not exist. Verified
+# 2026-08-30 across root/nick/ubuntu crontabs, /etc/crontab, all of /etc/cron.d
+# and systemd timers — no reference, no state file, no log. The only thing on
+# the box naming it is deploy-to.sh. It is dead code kept under version control
+# because the box holds the sole copy; deleting it is a decision for #3512, and
+# the row exists so its drift stays visible until someone makes that call.
+scripts/host/release-watch.sh	/opt/scripts/release-watch.sh	orphaned
+scripts/host/release-watch.conf	/opt/scripts/release-watch.conf	orphaned
+scripts/lib/telegram.sh	/opt/scripts/lib/telegram.sh	deployed
+EXTERNAL:nickmeinhold/downstream	/opt/scripts/backup-downstream.sh	external
+EXTERNAL:nickmeinhold/downstream	/opt/scripts/health-check-downstream.sh	external
+EXTERNAL:nickmeinhold/downstream	/opt/scripts/reconcile-downstream.sh	external
+EXTERNAL:nickmeinhold/downstream	/home/nick/apps/downstream-server/cd-bus-subscribe.sh	external
+EXTERNAL:enspyrco/enspyrco-site	/home/nick/apps/scribe/run-breath.sh	external
+# WHEN PR #163 MERGES, CHANGE THIS ROW. #163 adds
+# scripts/watchers/amanda-oci-watch.sh, so this file stops being external and
+# becomes repo-owned. Left as `external` it would still pass — external rows
+# assert existence only and never compare content — so this watcher's drift
+# would go permanently unreported by the one check meant to catch it. Replace
+# with: scripts/watchers/amanda-oci-watch.sh <TAB> /home/ubuntu/... <TAB> orphaned
+EXTERNAL:pending-PR-163	/home/ubuntu/amanda-oci-watch.sh	external
+EXTERNAL:nickmeinhold/downstream	/home/nick/apps/downstream-server/cd-poll.sh	external

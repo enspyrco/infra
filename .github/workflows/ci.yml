@@ -13,12 +13,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # WHAT THIS GATE IS AND IS NOT (settled 2026-08-30, after an audit).
+      #
+      # Measured: 40 of the last 40 CI runs green, zero failures in 60. Over the
+      # same period 11 real production defects were found in this repo — a
+      # backup guard one line from failing, a deploy truncating the box's SSH
+      # config, a merged PR that never executed for 13 days, 22% of shim calls
+      # dying on a warning. CI caught NONE of them, and would not have at any
+      # severity: they are behavioural (does it run? does it fire? does the
+      # enumeration cover?), not syntactic. Tightening to `info` surfaces 85
+      # findings, 55 of them SC2015 noise, and still catches none of the eleven.
+      #
+      # So this gate is a cheap floor on AUTHORED shell, not a readiness signal.
+      # Do not report "CI green" as evidence that anything works. The question
+      # that matters here — does the repo describe what actually runs? — cannot
+      # be asked from CI at all, because it needs ssh to production. That is
+      # scripts/check-run-paths.sh, and it runs nowhere yet.
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # v2.0.0
         with:
           scandir: './scripts'
           additional_files: '.githooks/pre-commit'
           severity: warning
+          # scripts/host/ is EXEMPT by design. Its contract is to be a
+          # byte-faithful record of code that runs on the box and exists in no
+          # repo — so "must satisfy our linter" and "must match the artifact"
+          # are in direct conflict, and the linter loses. Enforcing it here
+          # already cost us once: two cosmetic fixes to keep-alive.sh made the
+          # tracked copy differ from the running one, manufacturing drift in
+          # the one file whose entire value was fidelity. The gate damaged the
+          # thing it was gating.
+          ignore_paths: scripts/host
 
       # The deploy-bus fleet template (cd-bus/fleet/) ships its own shell
       # scripts; scandir above only covers ./scripts, so lint cd-bus/ too —
