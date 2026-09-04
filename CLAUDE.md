@@ -86,7 +86,7 @@ Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). C
 | imagineering-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative). Container is `imagineering-kanbn`, NOT `img-kanbn`. Its DB is `imagineering-kanbn-postgres`. |
 | img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` used to hit xdeca's tenant; xdeca is gone as of 2026-09-02, so that collision is historical. `scripts/lib/resolve-container.sh` exists because of it — see claude-tasks#3844. |
 | matrix-continuwuity-1 | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork). Compose appends the `-1` suffix; the whole matrix stack does. |
-| (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot + relay-bot-hf |
+| (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
 | dreamfinder-avatar | 3015 | df.imagineering.cc | 3D avatar voice frontend |
 | symposium | 3016 | symposium.imagineering.cc | Discussion/event space |

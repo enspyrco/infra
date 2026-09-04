@@ -576,7 +576,6 @@ restore_matrix() {
     "matrix-telegram:matrix_telegram_data:mautrix-telegram.db"
     "matrix-whatsapp:matrix_whatsapp_data:whatsapp.db"
     "matrix-relay:matrix_relay_data:relay.db"
-    "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
   # Build the sqlite helper if absent — restore may run on a box where the backup

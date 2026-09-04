@@ -335,7 +335,6 @@ backup_matrix() {
     "matrix-telegram:matrix_telegram_data:mautrix-telegram.db"
     "matrix-whatsapp:matrix_whatsapp_data:whatsapp.db"
     "matrix-relay:matrix_relay_data:relay.db"
-    "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
   local any_failed=0
@@ -732,7 +731,7 @@ case $SERVICE in
     # the backups of the others from the commit.
     backup_matrix || error "matrix backup had partial failures"
     for matrix_svc in matrix-discord matrix-signal matrix-telegram \
-                      matrix-whatsapp matrix-relay matrix-relay-hf; do
+                      matrix-whatsapp matrix-relay; do
       if find "$BACKUP_DIR" -name "${matrix_svc}-${DATE}.*" -type f 2>/dev/null | grep -q .; then
         SUCCEEDED+=("$matrix_svc")
       else
@@ -787,7 +786,7 @@ case $SERVICE in
   matrix)
     if backup_matrix; then
       backup_to_github matrix-discord matrix-signal matrix-telegram \
-                       matrix-whatsapp matrix-relay matrix-relay-hf \
+                       matrix-whatsapp matrix-relay \
         || FAILED_SERVICES+=("github-upload")
     else
       FAILED_SERVICES+=(matrix)

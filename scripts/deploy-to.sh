@@ -1365,10 +1365,6 @@ deploy_matrix() {
         printf 'HUB_ROOM_ID=%s\n'          "$(dotenv_quote "$(matrix_field '.hub_room_id')")"
         printf 'RELAY_DOUBLE_PUPPETS=%s\n' "$(dotenv_quote "$(matrix_field '.relay_double_puppets')")"
         printf 'RELAY_LOG_LEVEL=%s\n'      "$(dotenv_quote "$(matrix_field '.relay_log_level')")"
-        printf 'HF_RELAY_AS_TOKEN=%s\n'    "$(dotenv_quote "$(matrix_field '.hf_relay_as_token')")"
-        printf 'HF_RELAY_HS_TOKEN=%s\n'    "$(dotenv_quote "$(matrix_field '.hf_relay_hs_token')")"
-        printf 'HF_PORTAL_ROOMS=%s\n'      "$(dotenv_quote "$(matrix_field '.hf_portal_rooms')")"
-        printf 'HF_HUB_ROOM_ID=%s\n'       "$(dotenv_quote "$(matrix_field '.hf_hub_room_id')")"
     } > "$REPO_ROOT/matrix/.env"
 
     # Deploy files.
@@ -1406,9 +1402,9 @@ deploy_matrix() {
     #   so compose tries to PULL that locally-built image from a registry and
     #   fails ("authorization failed"); without the flag that aborts the whole
     #   chain. The image is produced by the build step below, not a registry.
-    # build --pull: must build EVERY `build:` service, not just the relay bots --
+    # build --pull: must build EVERY `build:` service, not just the relay bot --
     #   aiko-registrar builds `./aiko-chat-bridge` -> aiko-bridge:latest, which
-    #   aiko-chat/aiko-bridge consume. Naming only relay-bot/relay-bot-hf meant
+    #   aiko-chat/aiko-bridge consume. Naming only the relay bot meant
     #   `up -d` reused the stale pre-existing aiko-bridge:latest and silently
     #   skipped the renamed build context. Mirrors the other deploys (deploy_pm_bot).
     # up -d: recreates any container whose image changed.
