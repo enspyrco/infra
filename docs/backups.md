@@ -17,7 +17,7 @@ All services backup to **GitHub** (imagineering-cc/imagineering-backups).
 > **Two islands, one repo.** Each island backs up its own DB under a
 > distinct slug so they never clobber one file: Sydney → `aiko-island.sql`
 > (fleet `backup.sh` on the imagineering box), Melbourne → `aiko-island-enspyr.sql`
-> (standalone `backup-aiko-island-standalone.sh` on nick-mel, own on-box deploy
+> (standalone `backup-aiko-island-standalone.sh` on `enspyr`, own on-box deploy
 > key, root cron 4:20 AM staggered from Sydney's 4 AM to avoid a push race).
 > Both auto-detect the live island volume from the running container — a
 > hardcoded name silently backs up an orphaned volume after an island cutover
