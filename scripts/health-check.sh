@@ -66,7 +66,7 @@ fi
 
 # Containers: exited (non-allowlisted) or restarting. Known one-shot helpers
 # (compose migrate/setup jobs) exit 0 by design and are skipped by name.
-ONESHOT_HELPERS_RE='^(imagineering|xdeca|img)-(kanbn-migrate|outline-minio-setup)$'
+ONESHOT_HELPERS_RE='^(imagineering|img)-(kanbn-migrate|outline-minio-setup)$'
 while read -r name status; do
     [ -n "$name" ] || continue
     if [[ "$status" == "Exited (0)"* ]] && [[ "$name" =~ $ONESHOT_HELPERS_RE ]]; then

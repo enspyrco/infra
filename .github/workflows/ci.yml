@@ -158,7 +158,7 @@ jobs:
 
       # Validate caddy/Caddyfile with the SAME image the box runs (caddy:2-alpine),
       # so a syntax error or bad directive is caught HERE — before a deploy reloads
-      # it into the live proxy and takes every domain (*.imagineering.cc, xdeca.com,
+      # it into the live proxy and takes every domain (*.imagineering.cc,
       # callonclare.com.au) down. `caddy validate` only parses + adapts the config;
       # it does NOT dial upstreams, so the localhost:PORT backends that don't exist
       # in CI are fine. Fails the build (non-zero) on an invalid Caddyfile.

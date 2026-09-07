@@ -271,7 +271,7 @@ and clears that sentinel on recovery.
 Three checks against the Brevo REST API (`https://api.brevo.com/v3`):
 
 1. **Domain auth** — `GET /senders/domains`: each required domain
-   (`imagineering.cc`, `xdeca.com`) must be present with `authenticated:true`
+   (`imagineering.cc`) must be present with `authenticated:true`
    **and** `verified:true`. This is the check that would have caught the
    incident. Tunable: `REQUIRED_DOMAINS`.
 2. **Daily volume** — `GET /smtp/statistics/aggregatedReport?days=1` `.requests`

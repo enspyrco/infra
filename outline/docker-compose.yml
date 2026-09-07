@@ -1,7 +1,7 @@
 # ⚠ THIS FILE IS NOT THE DEPLOY PATH FOR PRODUCTION OUTLINE.
-# Prod runs TWO hand-managed tenant stacks the host owns, not this one:
+# Prod runs a hand-managed tenant stack the host owns, not this one:
 #   ~/apps/imagineering-outline/  (outline.imagineering.cc, container imagineering-outline)
-#   ~/apps/xdeca-outline/         (kb/wiki.xdeca.com)
+# (~/apps/xdeca-outline/ ran here too until xdeca was decommissioned 2026-09-02.)
 # `~/apps/outline/` does not exist on the box. Running `deploy-to.sh <ip> outline`
 # would stand up a THIRD, conflicting `img-outline` stack — do not do it blindly.
 # The digests below record what prod runs. This file is not the NORMAL deploy

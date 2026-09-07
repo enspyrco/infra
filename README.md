@@ -1,6 +1,7 @@
 # enspyrco/infra
 
-Infrastructure monorepo for self-hosted services (imagineering.cc, co-located xdeca, and enspyr).
+Infrastructure monorepo for self-hosted services (imagineering.cc and enspyr).
+xdeca was co-located here until it was decommissioned 2026-09-02.
 
 > Formerly `imagineering-cc/imagineering-infra` — renamed 2026-07-28. The `imagineering.cc`
 > domain and its services are unchanged; only the GitHub repo moved.
