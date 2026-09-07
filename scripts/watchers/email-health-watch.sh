@@ -69,7 +69,7 @@ html_escape() {
 BREVO_API="${BREVO_API:-https://api.brevo.com/v3}"
 # Required sending domains — each must be authenticated + verified in Brevo.
 # Space-separated so it can be overridden from the environment if needed.
-REQUIRED_DOMAINS="${REQUIRED_DOMAINS:-imagineering.cc xdeca.com}"
+REQUIRED_DOMAINS="${REQUIRED_DOMAINS:-imagineering.cc}"
 CAP="${CAP:-300}"                       # Brevo free-plan daily send cap
 WARN_PCT="${WARN_PCT:-70}"              # alert when daily requests >= this % of CAP
 ERROR_THRESHOLD="${ERROR_THRESHOLD:-25}" # alert when daily .error exceeds this
@@ -234,7 +234,7 @@ check_volume_and_errors() {
     # CHECK 2: volume vs cap.
     if [[ "$requests" -ge "$warn_at" ]]; then
         if ! alerted_today volume; then
-            tg "$(printf '🚨 <b>Brevo daily send volume high: %s / %s</b> (&ge;%s%% of cap)\n\nThe daily send cap is shared across imagineering + xdeca. Exhausting it starves password-reset / magic-link email. Check for a flood (scanner bot, runaway loop) before the cap is hit.' \
+            tg "$(printf '🚨 <b>Brevo daily send volume high: %s / %s</b> (&ge;%s%% of cap)\n\nThe daily send cap is shared across every sender on the Brevo account. Exhausting it starves password-reset / magic-link email. Check for a flood (scanner bot, runaway loop) before the cap is hit.' \
             "$requests" "$CAP" "$WARN_PCT")"
             mark_alerted volume
         fi
