@@ -249,6 +249,29 @@ do
 done
 eval "$_real_docker_stub"   # restore the fleet stub for any later test
 
+
+echo "== the two postgres resolvers share ONE pattern (no second copy to drift) =="
+# This file's whole reason for existing is that two correct copies of a name drifted
+# and the unexercised half was the disaster path. The resolvers had grown two copies
+# of the ERE -- one against `docker ps`, one against `docker ps -a` -- so a prefix
+# change would have retuned backup's resolver and left the dead-box anchor behind.
+# Assert they agree on acceptance AND rejection, so a reintroduced second copy fails.
+for name_svc in "imagineering-outline-postgres:outline:accept" \
+                "img-outline-postgres:outline:accept" \
+                "xdeca-outline-postgres:outline:reject" \
+                "imagineering-outline-postgres-replica:outline:reject" \
+                "outline_postgres:outline:reject"
+do
+  IFS=: read -r name svc want <<< "$name_svc"
+  pat=$(_pg_container_pattern "$svc")
+  got=$(printf '%s\n' "$name" | grep -cE "$pat" || true)
+  if { [ "$want" = accept ] && [ "$got" = 1 ]; } || { [ "$want" = reject ] && [ "$got" = 0 ]; }; then
+    ok "pattern ${want}s $name"
+  else
+    no "pattern ${want}s $name" "matched=$got"
+  fi
+done
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

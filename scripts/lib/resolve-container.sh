@@ -125,16 +125,27 @@ resolve_container_by_compose() {
 #
 # Usage:
 #   cid=$(resolve_pg_container outline) || return 1
+# The one place the postgres container name pattern is written. Both resolvers below
+# call this. THIS FILE EXISTS because two correct copies of a name drifted apart and
+# the unexercised half was the disaster path -- and it had grown two copies of its
+# own ERE, one against `docker ps` and one against `docker ps -a`, so the next prefix
+# change would have retuned backup's resolver and left the dead-box anchor on the old
+# note. Same defect, one level in. (Tesla, cage-match round 2/3.)
+#
+# Both historical prefixes, because the deployed app dirs say `imagineering-` and this
+# repo's compose files say `img-`. Anchored so `-postgres` cannot also match a future
+# `-postgres-replica`.
+_pg_container_pattern() {
+  printf '^(imagineering|img)-%s-postgres$' "${1:-}"
+}
+
 resolve_pg_container() {
   local svc=${1:-}
   if [ -z "$svc" ]; then
     echo "resolve-container: a service name is required (outline|kanbn)" >&2
     return 1
   fi
-  # Both historical prefixes, because the deployed app dirs say `imagineering-`
-  # and this repo's compose files say `img-`. Anchored so `-kanbn-postgres`
-  # cannot also match a future `-kanbn-postgres-replica`.
-  resolve_container "^(imagineering|img)-${svc}-postgres\$" "$svc"
+  resolve_container "$(_pg_container_pattern "$svc")" "$svc"
 }
 
 # Print the single container for an app stack's Postgres WHETHER OR NOT IT IS RUNNING.
@@ -171,7 +182,7 @@ resolve_pg_container_any() {
     echo "resolve-container: 'docker ps -a' failed for $label -- is the Docker daemon running?" >&2
     return 1
   fi
-  matches=$(printf '%s\n' "$ps_out" | grep -E "^(imagineering|img)-${svc}-postgres\$" || true)
+  matches=$(printf '%s\n' "$ps_out" | grep -E "$(_pg_container_pattern "$svc")" || true)
   # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
   # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
   # under set -e would die here, before the fail-closed diagnostic below could print.

@@ -375,7 +375,8 @@ restore_pm_bot() {
   docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
-  docker compose --project-directory ~/apps/dreamfinder restart
+  docker compose --project-directory ~/apps/dreamfinder restart \
+    || { error "dreamfinder: restore wrote the DB but the restart failed — run 'docker compose --project-directory ~/apps/dreamfinder up -d'"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Dreamfinder restore complete!"
@@ -418,7 +419,8 @@ restore_radicale() {
 
   # Stop Radicale
   log "Stopping Radicale..."
-  docker compose --project-directory ~/apps/radicale stop radicale
+  docker compose --project-directory ~/apps/radicale stop radicale \
+    || { error "radicale: could not stop the container — collections untouched"; cleanup_backups; return 1; }
 
   # Restore collections into the volume. Content-validated above (readable tar with
   # real collections members), so the rm won't wipe live data with nothing to
@@ -472,7 +474,8 @@ restore_claudius() {
   docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar"
 
   log "Restarting Claudius..."
-  docker compose --project-directory ~/apps/claudius restart
+  docker compose --project-directory ~/apps/claudius restart \
+    || { error "claudius: restore extracted the archive but the restart failed — run 'docker compose --project-directory ~/apps/claudius up -d'"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Claudius restore complete!"
@@ -622,7 +625,12 @@ restore_matrix() {
 
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
-  docker compose --project-directory ~/apps/matrix stop
+  # Guarded, because removing the `cd` removed its error handling with it: the old
+  # line was `cd ~/apps/matrix || { error ...; cleanup_backups; return 1; }` and the
+  # bare replacement dies under `set -e` with no diagnostic and no cleanup, leaving
+  # the /tmp/restore clone behind. A DR path must not fail silently.
+  docker compose --project-directory ~/apps/matrix stop \
+    || { error "matrix: could not stop the stack (missing ~/apps/matrix, or compose refused) — nothing was written"; cleanup_backups; return 1; }
 
   local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
