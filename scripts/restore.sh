@@ -43,6 +43,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # spelling them out would put them back into every future grep for a live name.
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
+# shellcheck source=lib/sqlite-dumper.sh
+. "$SCRIPT_DIR/lib/sqlite-dumper.sh"
 
 # Usage check + dispatch are deferred to the guarded tail so the test harness
 # can source this file (RESTORE_LIB_ONLY=1) without triggering the arg check.
@@ -100,13 +102,12 @@ _validate_pg_dump() {
 # still validate a SQLite candidate. Shared single door for _restore_island_core
 # and _validate_sqlite_db so both paths validate identically. Returns non-zero on
 # build failure so the caller can abort with live state intact.
+# Thin wrapper over lib/sqlite-dumper.sh so this script's callers keep their name
+# and get this script's `error` formatting. The RECIPE is not duplicated here: it
+# had drifted across five copies, and the copy this half carried was not the one
+# backup.sh needed, which is how a pruned image cost seven nights of backups.
 _ensure_sqlite_dumper() {
-  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
-    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-      | docker build -q -t sqlite-dumper:latest - >/dev/null \
-      || { error "failed to build sqlite-dumper:latest"; return 1; }
-  fi
+  ensure_sqlite_dumper || { error "failed to build sqlite-dumper:latest"; return 1; }
   return 0
 }
 

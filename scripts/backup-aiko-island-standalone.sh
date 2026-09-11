@@ -34,6 +34,8 @@ fail()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aiko-volume.sh
 . "$SCRIPT_DIR/lib/aiko-volume.sh"
+# shellcheck source=lib/sqlite-dumper.sh
+. "$SCRIPT_DIR/lib/sqlite-dumper.sh"
 
 # --- Locate the LIVE island volume from the running container -----------------
 # Hardcoding the volume name silently backs up a ghost after a compose/project
@@ -45,11 +47,7 @@ log "live island volume: $GW_VOL (container $GW_CID)"
 # --- Dump (online-safe: read-only mount, .dump reads a consistent snapshot) ----
 # The island image ships no sqlite3, so mount the volume read-only into a small
 # alpine+sqlite image. Build it once if absent (idempotent).
-if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-  log "building sqlite-dumper:latest (alpine + sqlite3)"
-  printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-    | docker build -q -t sqlite-dumper:latest - >/dev/null
-fi
+ensure_sqlite_dumper || { log "ERROR: sqlite-dumper image unavailable"; exit 1; }
 
 TMP="$BACKUP_DIR/${SLUG}-${DATE}.sql"
 ERR="$BACKUP_DIR/${SLUG}-${DATE}.err"

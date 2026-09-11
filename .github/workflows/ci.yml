@@ -126,6 +126,13 @@ jobs:
       - name: Run restore pg-ordering test
         run: ./scripts/test-restore-pg-ordering.sh
 
+      # Guards the invariant behind a 7-night backup outage: every script that RUNS
+      # the sqlite-dumper image must also ENSURE it exists. backup.sh used it and
+      # never built it, so a pruned 11MB image cost seven nights of aiko-island and
+      # matrix-bridge backups while the run still reported partial success.
+      - name: Run sqlite-dumper tests
+        run: ./scripts/test-sqlite-dumper.sh
+
       # Guards deploy-to.sh's provenance preflight. The preflight decides whether
       # production may receive the working tree, and its failure mode is silent:
       # a check that always passes is indistinguishable from a clean deploy. The
