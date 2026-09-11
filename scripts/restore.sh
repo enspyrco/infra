@@ -375,8 +375,7 @@ restore_pm_bot() {
   docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
 
   log "Restarting Dreamfinder..."
-  cd ~/apps/dreamfinder
-  docker compose restart
+  docker compose --project-directory ~/apps/dreamfinder restart
 
   cleanup_backups
   log "Dreamfinder restore complete!"
@@ -419,20 +418,19 @@ restore_radicale() {
 
   # Stop Radicale
   log "Stopping Radicale..."
-  cd ~/apps/radicale
-  docker compose stop radicale
+  docker compose --project-directory ~/apps/radicale stop radicale
 
   # Restore collections into the volume. Content-validated above (readable tar with
   # real collections members), so the rm won't wipe live data with nothing to
   # restore. NOTE: the in-container extract itself is not yet atomic (a mid-extract
   # failure after the rm leaves a partial tree) — stage-to-temp-then-swap is Phase 2.
   log "Restoring collections..."
-  docker compose run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
+  docker compose --project-directory ~/apps/radicale run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
     -c "rm -rf /data/collections && tar xf /restore.tar -C /"
 
   # Start Radicale
   log "Starting Radicale..."
-  docker compose up -d
+  docker compose --project-directory ~/apps/radicale up -d
 
   cleanup_backups
   log "Radicale restore complete!"
@@ -474,8 +472,7 @@ restore_claudius() {
   docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar"
 
   log "Restarting Claudius..."
-  cd ~/apps/claudius
-  docker compose restart
+  docker compose --project-directory ~/apps/claudius restart
 
   cleanup_backups
   log "Claudius restore complete!"
@@ -625,8 +622,7 @@ restore_matrix() {
 
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
-  cd ~/apps/matrix || { error "cannot cd ~/apps/matrix"; cleanup_backups; return 1; }
-  docker compose stop
+  docker compose --project-directory ~/apps/matrix stop
 
   local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
@@ -696,7 +692,7 @@ restore_matrix() {
   done
 
   log "Restarting matrix stack..."
-  docker compose up -d
+  docker compose --project-directory ~/apps/matrix up -d
 
   cleanup_backups
   if [ "$any_failed" -eq 1 ]; then

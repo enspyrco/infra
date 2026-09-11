@@ -45,7 +45,10 @@ resolve_container() {
     return 1
   fi
   matches=$(printf '%s\n' "$ps_out" | grep -E "$pattern" || true)
-  count=$(printf '%s' "$matches" | grep -c .)
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
   if [ "$count" -eq 0 ]; then
     echo "resolve-container: no running container matches /$pattern/ for $label" >&2
     return 1
@@ -85,7 +88,10 @@ resolve_container_by_compose() {
     --filter "label=com.docker.compose.project=$project" \
     --filter "label=com.docker.compose.service=$service" \
     --format '{{.Names}}' || true)
-  count=$(printf '%s' "$matches" | grep -c .)
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
   # Fail closed on both edges, same as resolve_container: zero matches must
   # never degrade to "back up nothing and report success", and an ambiguous
   # match must never be resolved by picking arbitrarily between tenants.
@@ -160,7 +166,10 @@ resolve_pg_container_any() {
     return 1
   fi
   matches=$(printf '%s\n' "$ps_out" | grep -E "^(imagineering|img)-${svc}-postgres\$" || true)
-  count=$(printf '%s' "$matches" | grep -c .)
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
   if [ "$count" -eq 0 ]; then
     echo "resolve-container: no container (running or stopped) matches ${svc}-postgres for $label -- if the stack was removed with 'docker compose down', no label records its directory; bring it up once, or run the restore from the stack's directory" >&2
     return 1
@@ -187,10 +196,16 @@ resolve_compose_workdir() {
     echo "resolve-container: a container name is required" >&2
     return 1
   fi
-  dir=$(docker inspect "$container" \
-    --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+  # Split the daemon failure from the absent label, same as resolve_container: a
+  # bare `|| true` reported "no working_dir label" when dockerd was simply down,
+  # which names the wrong absence at the worst possible moment.
+  if ! dir=$(docker inspect "$container" \
+    --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null); then
+    echo "resolve-container: 'docker inspect $container' failed ($label) -- is the Docker daemon running, or was the container removed?" >&2
+    return 1
+  fi
   if [ -z "$dir" ]; then
-    echo "resolve-container: container '$container' carries no compose working_dir label ($label)" >&2
+    echo "resolve-container: container '$container' carries no compose working_dir label ($label) -- it was not created by docker compose" >&2
     return 1
   fi
   if [ ! -d "$dir" ]; then

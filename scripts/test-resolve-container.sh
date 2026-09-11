@@ -193,6 +193,33 @@ assert_eq "imagineering-kanbn-postgres" "$(resolve_pg_container kanbn 2>/dev/nul
   "once running, the running-only resolver finds it (the order the fix establishes)"
 STUB_KANBN_RUNNING=0
 
+
+echo "== the success path returns ONLY the name (no stderr bleed) =="
+# Tesla flagged that call sites capture with `2>&1`, so anything a resolver writes to
+# stderr on a SUCCESSFUL call would be concatenated into the container name and then
+# handed to `docker exec`. The resolvers now redirect docker's own stderr to
+# /dev/null and write diagnostics only on paths that return 1 -- assert that rather
+# than reasoning about it, since the call sites depend on it.
+out=$(resolve_pg_container outline 2>&1)
+assert_eq "imagineering-outline-postgres" "$out" \
+  "resolve_pg_container success output is clean under 2>&1 (what the call site actually does)"
+out=$(resolve_pg_container_any outline 2>&1)
+assert_eq "imagineering-outline-postgres" "$out" \
+  "resolve_pg_container_any success output is clean under 2>&1"
+out=$(resolve_compose_workdir imagineering-outline-postgres 2>&1)
+assert_eq "$STUB_WORKDIR_OUTLINE" "$out" \
+  "resolve_compose_workdir success output is clean under 2>&1"
+
+echo "== a bare assignment under set -e survives long enough to diagnose =="
+# grep -c exits 1 on zero matches. Without the `|| true` on the count line, a caller
+# that does NOT wrap the resolver in `if !` dies before the fail-closed message.
+out=$( set -e; resolve_pg_container nosuchsvc 2>&1; echo "RC=$?" )
+if printf '%s' "$out" | grep -q "no running container"; then
+  ok "zero-match diagnostic still prints under set -e (count line does not abort first)"
+else
+  no "set -e zero-match diagnostic" "got [$out]"
+fi
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]
