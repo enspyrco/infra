@@ -156,6 +156,11 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           yq --version
 
+      # secret-quoting and restore-aiko-island run BOTH here and in their own
+      # dedicated jobs above. That duplication is deliberate, not an oversight:
+      # the dedicated jobs give branch protection a stable check NAME to require,
+      # which a single discovery job cannot. Both surfaces now set REQUIRE_ALL=1
+      # so the same test name means the same assertion in both places.
       - name: Run shell test suite (discovered, not listed)
         # REQUIRE_ALL=1 matches what the dedicated secret-quoting and
         # restore-aiko-island jobs set. Without it the same test name would mean a
@@ -205,22 +210,6 @@ jobs:
           done
           echo "ran $(( ${#tests[@]} - skipped )) / ${#tests[@]} discovered tests (${skipped} declared ci-skip)"
           exit "$failed"
-
-      # Guards deploy-to.sh's provenance preflight. The preflight decides whether
-      # production may receive the working tree, and its failure mode is silent:
-      # a check that always passes is indistinguishable from a clean deploy. The
-      # suite is RED-proven — neutering the preflight to `return 0` turns 5
-      # assertions red and the suite exits 1, so this step cannot go green on a
-      # dead guard. It opens no connections (TEST-NET-3 + an unknown service that
-      # exits before dispatch).
-
-
-      # Guards the pg_dump completion-marker check. The old inline `tail -n5`
-      # passed by exactly one line on pg_dump 15.17; one more trailer would have
-      # failed EVERY postgres backup and deleted the dump. The guard is now
-      # structural (footer shape, no line count) — the suite pins the real
-      # fixture shape, the footer-forgery class, and write/read symmetry.
-
 
   caddy-validate:
     name: Caddyfile Validate
