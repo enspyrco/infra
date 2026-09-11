@@ -117,10 +117,10 @@ out=$(resolve_container 'radicale' radicale 2>&1); rc=$?
 assert_eq "1" "$rc" "unanchored pattern matching both tenants is refused"
 
 echo "== resolve_pg_container: the shared resolver backup.sh AND restore.sh call =="
-# The regression this whole change exists to prevent. `outline_postgres` and
-# `kanbn_postgres` were restore.sh's hardcoded names from 2026-03-29 until
-# 2026-09-11; they appear in the stub's container list NOWHERE, which is exactly
-# the point — they had not named anything real for months and nothing noticed.
+# The regression this whole change exists to prevent. restore.sh carried hardcoded
+# postgres container names from 2026-03-29 until 2026-09-11, and the stub's list
+# below deliberately contains nothing matching them — which is the point: they had
+# not named anything real for months and nothing noticed.
 assert_eq "imagineering-outline-postgres" "$(resolve_pg_container outline 2>/dev/null)" \
   "resolve_pg_container outline -> imagineering-outline-postgres"
 assert_eq "imagineering-kanbn-postgres" "$(resolve_pg_container kanbn 2>/dev/null)" \

@@ -37,9 +37,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/pg-dump-guard.sh"
 # Container resolution — the SAME resolver backup.sh uses, for the same reason the
 # dump guard is shared. backup.sh was moved off hardcoded container names on
-# 2026-08-07 after they caused 40 nights of silent empty dumps; restore.sh kept the
-# original `outline_postgres` / `kanbn_postgres` literals until 2026-09-11, so the
-# repaired half and the unrepaired half of one pair sat side by side for a month.
+# 2026-08-07 after they caused 40 nights of silent empty dumps; restore.sh was not,
+# and the repaired half and the unrepaired half of one pair sat side by side for a
+# month. The retired literals are named in the commit that removed them, not here:
+# spelling them out would put them back into every future grep for a live name.
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
 
@@ -156,10 +157,9 @@ _validate_sqlite_db() {
 # Requires the dump to have already passed _validate_pg_dump.
 #
 # The container and the compose directory are DERIVED, not passed. They used to be
-# two hand-fed constants and both had rotted: the names `outline_postgres` /
-# `kanbn_postgres` died in the 2026-03-29 colocation rename and the dirs
-# `~/apps/outline` / `~/apps/kanbn` died in the 2026-06-26 one. Neither ever
-# errored, because nothing runs restore on a good day.
+# two hand-fed constants, and both had rotted — killed by two separate renames a
+# quarter apart. Neither ever errored, because nothing runs restore on a good day,
+# so the first caller to notice would have been someone mid-recovery.
 _restore_pg_atomic() {
   local svc="$1" user="$2" db="$3" dumpfile="$4"
   local ts temp rescue container composedir
