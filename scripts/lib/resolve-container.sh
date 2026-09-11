@@ -84,10 +84,17 @@ resolve_container_by_compose() {
     echo "resolve-container: both a compose project and service are required" >&2
     return 1
   fi
-  matches=$(docker ps \
+  # Last site in the class: a bare `|| true` here reported "no running container for
+  # compose project X" when dockerd was simply down. Every docker call in this file
+  # now distinguishes a daemon failure from an empty result -- swept as a class after
+  # a reviewer named the third instance, rather than patched one per round.
+  if ! matches=$(docker ps \
     --filter "label=com.docker.compose.project=$project" \
     --filter "label=com.docker.compose.service=$service" \
-    --format '{{.Names}}' || true)
+    --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps' failed for compose project '$project' ($label) -- is the Docker daemon running?" >&2
+    return 1
+  fi
   # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
   # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
   # under set -e would die here, before the fail-closed diagnostic below could print.

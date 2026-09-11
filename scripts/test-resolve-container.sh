@@ -220,6 +220,35 @@ else
   no "set -e zero-match diagnostic" "got [$out]"
 fi
 
+
+echo "== CLASS INVARIANT: a daemon failure is never reported as an empty result =="
+# Three reviewer rounds each named one more instance of this class. Rather than a
+# fourth patch, the invariant is asserted here for EVERY resolver: with docker
+# failing outright, each one must say the daemon failed -- not "no container
+# matches", which sends an operator hunting for a renamed container mid-recovery.
+_real_docker_stub=$(declare -f docker)
+docker() { return 1; }   # daemon down: every invocation fails
+
+for probe in \
+  "resolve_container ^img-radicale\$ radicale" \
+  "resolve_container_by_compose radicale radicale" \
+  "resolve_pg_container outline" \
+  "resolve_pg_container_any outline" \
+  "resolve_compose_workdir imagineering-outline-postgres"
+do
+  # shellcheck disable=SC2086
+  out=$(eval $probe 2>&1); rc=$?
+  name=${probe%% *}
+  if [ $rc -eq 0 ]; then
+    no "$name under a dead daemon" "returned 0 -- a daemon failure must never succeed"
+  elif printf '%s' "$out" | grep -qi "daemon"; then
+    ok "$name names the daemon, not a phantom empty result"
+  else
+    no "$name under a dead daemon" "fails closed but blames the wrong thing: [$out]"
+  fi
+done
+eval "$_real_docker_stub"   # restore the fleet stub for any later test
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]
