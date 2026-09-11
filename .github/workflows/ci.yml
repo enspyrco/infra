@@ -133,6 +133,16 @@ jobs:
       - name: Run sqlite-dumper tests
         run: ./scripts/test-sqlite-dumper.sh
 
+      # The backup-freshness pair. test-backup-services keeps the expected-service
+      # list from drifting behind backup.sh's own dispatch; test-backup-recency-watch
+      # replays the 2026-09-05..09-11 outage shape and fails if the watcher does not
+      # alert on it — the predecessor would have reported healthy on all seven nights.
+      - name: Run backup-services tests
+        run: ./scripts/test-backup-services.sh
+
+      - name: Run backup-recency-watch tests
+        run: ./scripts/test-backup-recency-watch.sh
+
       # Guards deploy-to.sh's provenance preflight. The preflight decides whether
       # production may receive the working tree, and its failure mode is silent:
       # a check that always passes is indistinguishable from a clean deploy. The

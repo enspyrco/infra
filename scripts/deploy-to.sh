@@ -309,6 +309,26 @@ deploy_scripts() {
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
     echo "Health check cron installed (hourly)"
 
+    # --- Backup-freshness watcher ---
+    # Installed HERE, from the repo, rather than hand-added to a crontab. The
+    # previous backup watcher existed in the repo for months and never ran once —
+    # no cron entry, no state file, no log, on either box account — because
+    # scheduling it was a manual step nobody performed. A safety check whose
+    # installation depends on someone remembering is not installed.
+    #
+    # MAILTO="" and the explicit PATH for the same reason as health-check above;
+    # 08:00 is four hours after the 04:00 backup window so a slow run is not read
+    # as a failed one.
+    echo "Installing /etc/cron.d/backup-recency-watch..."
+    ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
+        'SHELL=/bin/bash' \
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+        'MAILTO=\"\"' \
+        '0 8 * * * nick /opt/scripts/watchers/backup-recency-watch.sh >> /home/nick/logs/backup-recency-watch.log 2>&1' \
+        | sudo tee /etc/cron.d/backup-recency-watch > /dev/null && \
+        sudo chmod 0644 /etc/cron.d/backup-recency-watch && sudo chown root:root /etc/cron.d/backup-recency-watch"
+    echo "Backup-freshness watcher cron installed (08:00 daily)"
+
     echo "Scripts deployed to /opt/scripts/"
 }
 

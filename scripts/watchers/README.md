@@ -23,6 +23,26 @@ The decision tree (recorded in auto-memory under
 
 If the answer is "cron on Sydney," start from `template.sh`.
 
+### Standing assertions are the exception, and they do NOT use this shape
+
+The A→B→DONE machine below is an **incident** pattern: chase one problem, confirm
+it cleared, then delete your own cron line. That is right for "the cert is about to
+expire" and wrong for "are the backups still happening", which must still be asking
+a year from now. A backup check that removes itself after its first recovery is a
+fire alarm that unhooks itself after the first fire.
+
+`backup-recency-watch.sh` is therefore deliberately NOT built on `run_watcher`. It
+sources `watcher-base.sh` for `tg`/`log`/`STATE_FILE` and drives its own
+edge-triggered loop: alert when the failing SET changes, announce recovery when it
+empties, never self-disable. If you add another standing check, copy that one
+rather than `template.sh`, and do not "fix" it to use `run_watcher`.
+
+Its cron entry is installed by `deploy-to.sh` into `/etc/cron.d/`, not by hand.
+The watcher it replaced sat in this directory for months and **never ran once** —
+no cron entry, no state file, no log — because scheduling was a manual step nobody
+performed. A safety check whose installation depends on someone remembering is not
+installed.
+
 ## The shape
 
 ```
