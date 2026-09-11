@@ -116,6 +116,34 @@ _logical_lines() {
   ' "$1"
 }
 
+# WRAPPER VERIFICATION RUNS FIRST, and the consumer check below trusts the
+# underscore alias ONLY if a wrapper was actually found AND verified here.
+#
+# restore.sh wraps the lib function to get its own `error` formatting, so the
+# detector has to accept `_ensure_sqlite_dumper` — but acceptance by NAME is not a
+# contract. The previous version verified wrappers declared as `_ensure_...()` and
+# trusted the name regardless, so a wrapper written `function _ensure_... {` would
+# be trusted and never checked (Carnot, #186 round 5).
+#
+# Enumerating bash's declaration forms would just move the arms race along one
+# step. Instead the TRUST IS DERIVED: no verified wrapper found, no underscore
+# acceptance. A wrapper in an unrecognised form is therefore not silently trusted
+# — it makes the consumer that calls it fail, which is the safe direction.
+WRAPPER_OK=0
+while IFS= read -r wrapper_file; do
+  wname=$(basename "$wrapper_file")
+  body=$(awk '/_ensure_sqlite_dumper[[:space:]]*(\(\))?[[:space:]]*\{/,/^}/' "$wrapper_file")
+  if printf '%s\n' "$body" | grep -qE '^[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*ensure_sqlite_dumper([[:space:]]|$|;|\||&)'; then
+    ok "$wname's _ensure_sqlite_dumper wrapper actually delegates to the lib function"
+    WRAPPER_OK=1
+  else
+    no "$wname's _ensure_sqlite_dumper does not delegate" "the corpus check would trust this name; it must earn it"
+  fi
+done < <(grep -rlE '^[[:space:]]*(function[[:space:]]+)?_ensure_sqlite_dumper[[:space:]]*(\(\))?[[:space:]]*\{' "$SCRIPT_DIR" 2>/dev/null)
+
+# Accept the underscore alias only if the line above earned it.
+if [ "$WRAPPER_OK" -eq 1 ]; then ENSURE_NAMES='_?ensure_sqlite_dumper'; else ENSURE_NAMES='ensure_sqlite_dumper'; fi
+
 scanned=0
 while IFS= read -r f; do
   scanned=$((scanned + 1))
@@ -142,7 +170,7 @@ while IFS= read -r f; do
   # not a regex, and the trade is not worth it for a five-file corpus -- but a reader
   # should know the boundary rather than infer a stronger guarantee than this gives.
   ensure_line=$(printf '%s\n' "$norm" \
-    | grep -E '^[0-9]+:[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*_?ensure_sqlite_dumper([[:space:]]|$|;|\||&)' \
+    | grep -E "^[0-9]+:[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*${ENSURE_NAMES}([[:space:]]|$|;|\||&)" \
     | grep -vE '_?ensure_sqlite_dumper[[:space:]]*\(\)' \
     | head -1 | cut -d: -f1)
 
@@ -154,22 +182,6 @@ while IFS= read -r f; do
     no "$base ensures the image AFTER using it" "ensure at line $ensure_line, use at line $use_line"
   fi
 done < <(find "$SCRIPT_DIR" -name '*.sh' -type f)
-
-# The detector accepts `_ensure_sqlite_dumper` as well as `ensure_sqlite_dumper`,
-# because restore.sh wraps the lib function to get its own `error` formatting. That
-# acceptance is by NAME, and a name is not a contract: a wrapper that did not
-# actually delegate would satisfy the check while ensuring nothing. Carnot raised
-# exactly this on #186. Rather than drop the underscore and break the real wrapper,
-# verify the wrapper does what its name claims.
-while IFS= read -r wrapper_file; do
-  wname=$(basename "$wrapper_file")
-  body=$(awk '/^_ensure_sqlite_dumper\(\)/,/^}/' "$wrapper_file")
-  if printf '%s\n' "$body" | grep -qE '^[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*ensure_sqlite_dumper([[:space:]]|$|;|\||&)'; then
-    ok "$wname's _ensure_sqlite_dumper wrapper actually delegates to the lib function"
-  else
-    no "$wname's _ensure_sqlite_dumper does not delegate" "the corpus check trusts this name; it must earn it"
-  fi
-done < <(grep -rl '^_ensure_sqlite_dumper()' "$SCRIPT_DIR" 2>/dev/null)
 
 # A scan that silently covered nothing would pass every assertion above by
 # vacuum. Assert the instrument saw the corpus it claims to check.
