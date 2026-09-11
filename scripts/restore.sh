@@ -372,7 +372,8 @@ restore_pm_bot() {
   # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
   # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
   # silently wrote a file the app ignores (a no-op restore).
-  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
+  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db \
+    || { error "dreamfinder: could not copy the DB into the container — live bot.db untouched"; cleanup_backups; return 1; }
 
   log "Restarting Dreamfinder..."
   docker compose --project-directory ~/apps/dreamfinder restart \
@@ -428,11 +429,13 @@ restore_radicale() {
   # failure after the rm leaves a partial tree) — stage-to-temp-then-swap is Phase 2.
   log "Restoring collections..."
   docker compose --project-directory ~/apps/radicale run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
-    -c "rm -rf /data/collections && tar xf /restore.tar -C /"
+    -c "rm -rf /data/collections && tar xf /restore.tar -C /" \
+    || { error "radicale: the extract FAILED after the rm — collections may be MISSING OR PARTIAL in the volume, and the container is still stopped. Inspect the volume before restarting; the validated archive is still in $BACKUP_CLONE_DIR until cleanup."; cleanup_backups; return 1; }
 
   # Start Radicale
   log "Starting Radicale..."
-  docker compose --project-directory ~/apps/radicale up -d
+  docker compose --project-directory ~/apps/radicale up -d \
+    || { error "radicale: collections were restored but the container FAILED to start — data is in place, the service is down"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Radicale restore complete!"
@@ -470,8 +473,10 @@ restore_claudius() {
 
   # Restore state files into container
   log "Restoring state..."
-  docker cp "$BACKUP_FILE" claudius:/tmp/restore.tar
-  docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar"
+  docker cp "$BACKUP_FILE" claudius:/tmp/restore.tar \
+    || { error "claudius: could not copy the archive into the container — nothing was extracted"; cleanup_backups; return 1; }
+  docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar" \
+    || { error "claudius: the extract FAILED — state may be PARTIAL in the container, and /tmp/restore.tar may remain. Inspect before restarting."; cleanup_backups; return 1; }
 
   log "Restarting Claudius..."
   docker compose --project-directory ~/apps/claudius restart \
@@ -700,7 +705,11 @@ restore_matrix() {
   done
 
   log "Restarting matrix stack..."
-  docker compose --project-directory ~/apps/matrix up -d
+  # Guarded not only for the restart itself: an unguarded failure here exits before
+  # the any_failed/skipped summary below, which is the operator's only record of
+  # WHICH bridges restored and which were skipped.
+  docker compose --project-directory ~/apps/matrix up -d \
+    || { error "matrix: bridge DBs were processed but the stack FAILED to restart — see the per-bridge results above; run 'docker compose --project-directory ~/apps/matrix up -d' once the cause is fixed"; cleanup_backups; return 1; }
 
   cleanup_backups
   if [ "$any_failed" -eq 1 ]; then
