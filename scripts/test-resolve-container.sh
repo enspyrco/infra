@@ -45,9 +45,27 @@ docker() {
     esac
     return 0
   fi
+  # `docker inspect <name> --format ...` for resolve_compose_workdir.
+  if [ "${1:-}" = "inspect" ]; then
+    case "${2:-}" in
+      imagineering-outline-postgres) echo "$STUB_WORKDIR_OUTLINE" ;;
+      imagineering-kanbn-postgres)   echo "$STUB_WORKDIR_KANBN" ;;
+      no-labels)                     echo "" ;;
+      *)                             return 1 ;;
+    esac
+    return 0
+  fi
   # Plain `docker ps --format '{{.Names}}'` for the name-pattern resolver.
-  printf 'img-radicale\nradicale\nimagineering-outline-postgres\nxdeca-outline-postgres\n'
+  printf 'img-radicale\nradicale\nimagineering-outline-postgres\nxdeca-outline-postgres\nimagineering-kanbn-postgres\n'
 }
+
+# Real directories so resolve_compose_workdir's -d check is exercised for real
+# rather than stubbed away; the missing-dir arm points at one deliberately absent.
+STUB_ROOT=$(mktemp -d)
+STUB_WORKDIR_OUTLINE="$STUB_ROOT/imagineering-outline"
+STUB_WORKDIR_KANBN="$STUB_ROOT/imagineering-kanbn"
+mkdir -p "$STUB_WORKDIR_OUTLINE" "$STUB_WORKDIR_KANBN"
+trap 'rm -rf "$STUB_ROOT"' EXIT
 
 echo "== resolve_container_by_compose: picks the right tenant =="
 assert_eq "img-radicale" "$(resolve_container_by_compose radicale radicale 2>/dev/null)" \
@@ -87,6 +105,49 @@ assert_eq "img-radicale" "$(resolve_container '^img-radicale$' radicale 2>/dev/n
   "anchored name pattern still works"
 out=$(resolve_container 'radicale' radicale 2>&1); rc=$?
 assert_eq "1" "$rc" "unanchored pattern matching both tenants is refused"
+
+echo "== resolve_pg_container: the shared resolver backup.sh AND restore.sh call =="
+# The regression this whole change exists to prevent. `outline_postgres` and
+# `kanbn_postgres` were restore.sh's hardcoded names from 2026-03-29 until
+# 2026-09-11; they appear in the stub's container list NOWHERE, which is exactly
+# the point — they had not named anything real for months and nothing noticed.
+assert_eq "imagineering-outline-postgres" "$(resolve_pg_container outline 2>/dev/null)" \
+  "resolve_pg_container outline -> imagineering-outline-postgres"
+assert_eq "imagineering-kanbn-postgres" "$(resolve_pg_container kanbn 2>/dev/null)" \
+  "resolve_pg_container kanbn -> imagineering-kanbn-postgres"
+
+# MUST-FAIL arm: the anchored prefix must not let the OTHER tenant's postgres in.
+# Without `^(imagineering|img)-` this would match xdeca-outline-postgres too and
+# resolve_container would refuse on ambiguity -- so a pass here proves the anchor
+# is doing work, not that the stub is quiet.
+out=$(resolve_pg_container outline 2>&1); rc=$?
+if [ $rc -eq 0 ] && [ "$out" = "imagineering-outline-postgres" ]; then
+  ok "xdeca-outline-postgres is excluded by the anchored prefix (not merely absent)"
+else
+  no "xdeca-outline-postgres exclusion" "rc=$rc out=[$out]"
+fi
+
+out=$(resolve_pg_container "" 2>&1); rc=$?
+if [ $rc -ne 0 ]; then ok "empty service name fails closed"; else no "empty service name" "rc=0 out=[$out]"; fi
+
+echo "== resolve_compose_workdir: the dir is read from compose's own label =="
+assert_eq "$STUB_WORKDIR_OUTLINE" "$(resolve_compose_workdir imagineering-outline-postgres 2>/dev/null)" \
+  "workdir derived for outline"
+assert_eq "$STUB_WORKDIR_KANBN" "$(resolve_compose_workdir imagineering-kanbn-postgres 2>/dev/null)" \
+  "workdir derived for kanbn"
+
+out=$(resolve_compose_workdir no-labels 2>&1); rc=$?
+if [ $rc -ne 0 ]; then ok "empty working_dir label fails closed"; else no "empty label" "rc=0 out=[$out]"; fi
+
+# A label that names a directory which is not there must ABORT, not cd nowhere and
+# then run `docker compose up -d postgres` against whatever $PWD happens to be.
+rmdir "$STUB_WORKDIR_KANBN"
+out=$(resolve_compose_workdir imagineering-kanbn-postgres 2>&1); rc=$?
+if [ $rc -ne 0 ]; then ok "nonexistent working_dir fails closed"; else no "missing dir" "rc=0 out=[$out]"; fi
+mkdir -p "$STUB_WORKDIR_KANBN"
+
+out=$(resolve_compose_workdir "" 2>&1); rc=$?
+if [ $rc -ne 0 ]; then ok "empty container name fails closed"; else no "empty container" "rc=0 out=[$out]"; fi
 
 echo
 echo "passed: $PASS   failed: $FAIL"

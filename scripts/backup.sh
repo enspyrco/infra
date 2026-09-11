@@ -130,7 +130,7 @@ backup_kanbn() {
   # to gzip masks it behind gzip's status, silently committing a truncated/empty
   # backup over the good one. Then require pg_dump's end-marker before gzip.
   local container
-  if ! container=$(resolve_container '^(imagineering|img)-kanbn-postgres$' kanbn 2>&1); then
+  if ! container=$(resolve_pg_container kanbn 2>&1); then
     error "Kan.bn container not resolved: $container"
     return 1
   fi
@@ -188,7 +188,7 @@ backup_outline() {
   # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
   # then require the completion marker before gzip.
   local container
-  if ! container=$(resolve_container '^(imagineering|img)-outline-postgres$' outline 2>&1); then
+  if ! container=$(resolve_pg_container outline 2>&1); then
     error "Outline container not resolved: $container"
     return 1
   fi

@@ -88,3 +88,56 @@ resolve_container_by_compose() {
   fi
   printf '%s\n' "$matches"
 }
+
+# Print the single running Postgres container for one of this box's app stacks,
+# and (via resolve_compose_workdir below) the compose dir that drives it.
+#
+# WHY A THIRD FUNCTION: the two above fixed backup.sh in 2026-08-07 and
+# restore.sh was left holding the ORIGINAL hardcoded `outline_postgres` /
+# `kanbn_postgres` — the exact two strings whose staleness caused the 40 silent
+# empty backups this file's header describes. One half of a backup/restore pair
+# was repaired and the other was not, so the same defect stayed live on the
+# side nobody exercises. A single definition both halves call cannot drift that
+# way again; two correct copies can.
+#
+# Usage:
+#   cid=$(resolve_pg_container outline) || return 1
+resolve_pg_container() {
+  local svc=${1:-}
+  if [ -z "$svc" ]; then
+    echo "resolve-container: a service name is required (outline|kanbn)" >&2
+    return 1
+  fi
+  # Both historical prefixes, because the deployed app dirs say `imagineering-`
+  # and this repo's compose files say `img-`. Anchored so `-kanbn-postgres`
+  # cannot also match a future `-kanbn-postgres-replica`.
+  resolve_container "^(imagineering|img)-${svc}-postgres\$" "$svc"
+}
+
+# Print the compose working directory that owns $1 (a container name), read from
+# the label docker compose itself writes. The caller needs a dir to `cd` into for
+# `docker compose up -d postgres`, and a hardcoded one is the same hand-fed
+# constant this file exists to delete: restore.sh's `~/apps/outline` and
+# `~/apps/kanbn` had not existed since the 2026-06-26 rename to
+# `~/apps/imagineering-outline` / `-kanbn`.
+#
+# Fails closed on an empty label or a dir that is not there, so a restore aborts
+# before the swap rather than cd-ing nowhere and running compose against $PWD.
+resolve_compose_workdir() {
+  local container=${1:-} label=${2:-$1} dir
+  if [ -z "$container" ]; then
+    echo "resolve-container: a container name is required" >&2
+    return 1
+  fi
+  dir=$(docker inspect "$container" \
+    --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+  if [ -z "$dir" ]; then
+    echo "resolve-container: container '$container' carries no compose working_dir label ($label)" >&2
+    return 1
+  fi
+  if [ ! -d "$dir" ]; then
+    echo "resolve-container: compose working_dir '$dir' for '$container' does not exist ($label)" >&2
+    return 1
+  fi
+  printf '%s\n' "$dir"
+}
