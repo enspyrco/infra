@@ -137,6 +137,25 @@ jobs:
       - name: Install test prerequisites (gawk = the box's awk; mawk defensive)
         run: sudo apt-get install -y --no-install-recommends mawk gawk
 
+      # Pinned mikefarah yq — the SAME install the secret-quoting job does, because
+      # discovery runs that job's test too and REQUIRE_ALL=1 turns a wrong or absent
+      # yq into a hard failure rather than a skip. There are two unrelated tools
+      # called `yq` with incompatible syntax, so "the runner has a yq" is not the
+      # same claim as "the runner has THIS yq"; the discovered run passed on
+      # whatever the image happened to ship, which is luck, not a guarantee.
+      #
+      # I missed this on the first pass because I mapped prerequisites by grepping
+      # for `apt-get install` and `REQUIRE_ALL` and never looked at `run:` blocks
+      # that install by curl. The map had a blind spot exactly where the tool was.
+      - name: Install yq (mikefarah) — same pin as the secret-quoting job
+        run: |
+          YQ_VERSION=v4.44.3
+          sudo curl -fsSL \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
       - name: Run shell test suite (discovered, not listed)
         # REQUIRE_ALL=1 matches what the dedicated secret-quoting and
         # restore-aiko-island jobs set. Without it the same test name would mean a
