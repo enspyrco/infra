@@ -55,8 +55,18 @@ docker() {
     esac
     return 0
   fi
+  # `docker ps` (RUNNING) vs `docker ps -a` (ALL). The distinction is the whole
+  # point of the anchor resolver: on a box being recovered the stack is DOWN, so a
+  # container is present to `ps -a` and absent from `ps`. STUB_KANBN_RUNNING=0
+  # simulates exactly that for imagineering-kanbn-postgres.
+  if [ "${1:-}" = "ps" ] && [ "${2:-}" = "-a" ]; then
+    printf 'img-radicale\nradicale\nimagineering-outline-postgres\nxdeca-outline-postgres\nimagineering-kanbn-postgres\n'
+    return 0
+  fi
   # Plain `docker ps --format '{{.Names}}'` for the name-pattern resolver.
-  printf 'img-radicale\nradicale\nimagineering-outline-postgres\nxdeca-outline-postgres\nimagineering-kanbn-postgres\n'
+  printf 'img-radicale\nradicale\nimagineering-outline-postgres\nxdeca-outline-postgres\n'
+  [ "${STUB_KANBN_RUNNING:-1}" = "1" ] && printf 'imagineering-kanbn-postgres\n'
+  return 0
 }
 
 # Real directories so resolve_compose_workdir's -d check is exercised for real
@@ -148,6 +158,40 @@ mkdir -p "$STUB_WORKDIR_KANBN"
 
 out=$(resolve_compose_workdir "" 2>&1); rc=$?
 if [ $rc -ne 0 ]; then ok "empty container name fails closed"; else no "empty container" "rc=0 out=[$out]"; fi
+
+
+echo "== resolve_pg_container_any: the DR case -- present but NOT running =="
+# Opt into the stopped-stack state; the default stub state is a healthy box.
+STUB_KANBN_RUNNING=0
+# This is the regression that the first round of this PR shipped: the resolver ran
+# BEFORE `docker compose up -d postgres`, so on a stopped stack it aborted and the
+# restore did nothing. The stub has imagineering-kanbn-postgres in `ps -a` only.
+out=$(resolve_pg_container kanbn 2>&1); rc=$?
+if [ $rc -ne 0 ]; then
+  ok "running-only resolver correctly does NOT see a stopped container (this is why the anchor exists)"
+else
+  no "running-only resolver on stopped container" "rc=0 out=[$out] -- the stub is not simulating a stopped stack"
+fi
+assert_eq "imagineering-kanbn-postgres" "$(resolve_pg_container_any kanbn 2>/dev/null)" \
+  "anchor resolver DOES see the stopped container, so the compose dir is reachable on a dead box"
+
+# ...and the anchor must not become a wildcard: same fail-closed edges as the others.
+assert_eq "imagineering-outline-postgres" "$(resolve_pg_container_any outline 2>/dev/null)" \
+  "anchor resolver excludes xdeca's postgres too (anchored prefix)"
+out=$(resolve_pg_container_any "" 2>&1); rc=$?
+if [ $rc -ne 0 ]; then ok "anchor resolver: empty service name fails closed"; else no "anchor empty service" "rc=0"; fi
+out=$(resolve_pg_container_any nosuchsvc 2>&1); rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "compose down"; then
+  ok "anchor resolver: a removed stack names the real cause, not just 'no match'"
+else
+  no "anchor resolver removed-stack message" "rc=$rc out=[$out]"
+fi
+
+# With the stack UP, both resolvers agree -- the post-'compose up' state.
+STUB_KANBN_RUNNING=1
+assert_eq "imagineering-kanbn-postgres" "$(resolve_pg_container kanbn 2>/dev/null)" \
+  "once running, the running-only resolver finds it (the order the fix establishes)"
+STUB_KANBN_RUNNING=0
 
 echo
 echo "passed: $PASS   failed: $FAIL"

@@ -33,7 +33,18 @@ resolve_container() {
     echo "resolve-container: a name pattern is required" >&2
     return 1
   fi
-  matches=$(docker ps --format '{{.Names}}' | grep -E "$pattern" || true)
+  # Two failures were collapsed into one message: `docker ps ... | grep || true`
+  # reports "no running container matches" both when nothing matches AND when the
+  # DAEMON IS UNREACHABLE (docker ps exits 1; measured). Both fail closed, so this
+  # was never a fail-open -- but during a disaster recovery "no container matches"
+  # sends the operator hunting for a renamed container when the real answer is that
+  # dockerd is down. Split them: `|| true` now covers only grep's no-match exit.
+  local ps_out
+  if ! ps_out=$(docker ps --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps' failed for $label -- is the Docker daemon running?" >&2
+    return 1
+  fi
+  matches=$(printf '%s\n' "$ps_out" | grep -E "$pattern" || true)
   count=$(printf '%s' "$matches" | grep -c .)
   if [ "$count" -eq 0 ]; then
     echo "resolve-container: no running container matches /$pattern/ for $label" >&2
@@ -112,6 +123,53 @@ resolve_pg_container() {
   # and this repo's compose files say `img-`. Anchored so `-kanbn-postgres`
   # cannot also match a future `-kanbn-postgres-replica`.
   resolve_container "^(imagineering|img)-${svc}-postgres\$" "$svc"
+}
+
+# Print the single container for an app stack's Postgres WHETHER OR NOT IT IS RUNNING.
+#
+# WHY THIS EXISTS -- it breaks a circular dependency that the running-only resolver
+# creates on the one path that matters:
+#
+#     to start the stack   you need the compose directory
+#     to get the directory you need a container to read the label off
+#     to get a container   `docker ps` requires it to be ALREADY RUNNING
+#
+# A restore on a box whose stack is DOWN is not an edge case, it is the disaster
+# recovery case. Resolving the directory anchor from `docker ps -a` breaks the cycle
+# at the only link that does not actually need to be tight: `docker inspect` reads
+# labels off a stopped container perfectly well (verified), and only the later
+# `docker exec` phase needs a running one -- by which point `compose up` has run.
+#
+# Still fails closed on 0 or >1, same as the running-only resolver: an ambiguous
+# match must never be resolved by picking between tenants.
+#
+# Honest limit: if the container has been REMOVED entirely (`docker compose down`),
+# there is no label anywhere on the box to read and this returns 1. Nothing records
+# the directory at that point, so the error says so rather than an override env var
+# being added -- that would reintroduce the hand-fed constant this file exists to
+# delete, for a case where the operator is rebuilding from the repo and already has
+# the path in hand.
+resolve_pg_container_any() {
+  local svc=${1:-} label=${2:-${1:-container}} ps_out matches count
+  if [ -z "$svc" ]; then
+    echo "resolve-container: a service name is required (outline|kanbn)" >&2
+    return 1
+  fi
+  if ! ps_out=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps -a' failed for $label -- is the Docker daemon running?" >&2
+    return 1
+  fi
+  matches=$(printf '%s\n' "$ps_out" | grep -E "^(imagineering|img)-${svc}-postgres\$" || true)
+  count=$(printf '%s' "$matches" | grep -c .)
+  if [ "$count" -eq 0 ]; then
+    echo "resolve-container: no container (running or stopped) matches ${svc}-postgres for $label -- if the stack was removed with 'docker compose down', no label records its directory; bring it up once, or run the restore from the stack's directory" >&2
+    return 1
+  fi
+  if [ "$count" -gt 1 ]; then
+    echo "resolve-container: >1 container matches ${svc}-postgres for $label ($(printf '%s' "$matches" | tr '\n' ' ')) -- refusing to guess" >&2
+    return 1
+  fi
+  printf '%s\n' "$matches"
 }
 
 # Print the compose working directory that owns $1 (a container name), read from

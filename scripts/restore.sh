@@ -167,18 +167,35 @@ _restore_pg_atomic() {
   temp="${db}_restore_${ts}"
   rescue="${db}_rescue_${ts}"
 
-  if ! container=$(resolve_pg_container "$svc" 2>&1); then
-    error "$svc: postgres container not resolved: $container"
+  # ORDER MATTERS, and getting it wrong breaks exactly the case this code is for.
+  # The ANCHOR is resolved from `docker ps -a` (running OR stopped) because on a
+  # box being recovered the stack is DOWN -- a running-only lookup here would abort
+  # before `compose up` ever ran, turning the disaster-recovery path into a no-op.
+  # Only the exec phase below needs a RUNNING container, and it is resolved after
+  # the stack is started.
+  local anchor
+  if ! anchor=$(resolve_pg_container_any "$svc" 2>&1); then
+    error "$svc: postgres container not resolved: $anchor"
     return 1
   fi
-  if ! composedir=$(resolve_compose_workdir "$container" "$svc" 2>&1); then
+  if ! composedir=$(resolve_compose_workdir "$anchor" "$svc" 2>&1); then
     error "$svc: compose dir not resolved: $composedir"
     return 1
   fi
-  log "$svc: resolved container $container in $composedir"
+  log "$svc: resolved $anchor in $composedir"
 
-  cd "$composedir" || { error "$svc: cannot cd $composedir"; return 1; }
-  docker compose up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  # `--project-directory` instead of `cd`. The old code cd'd and never came back,
+  # leaving the CALLER's working directory changed -- harmless today only because
+  # every path this script uses is absolute, which is a property of the current
+  # callers and not a guarantee. Removing the side effect beats remembering it.
+  _dc() { docker compose --project-directory "$composedir" "$@"; }
+
+  _dc up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  # NOW require a running container -- after the stack has been started, not before.
+  if ! container=$(resolve_pg_container "$svc" 2>&1); then
+    error "$svc: postgres container not running after 'compose up -d postgres': $container"
+    return 1
+  fi
   for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
   docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 || { error "$svc: postgres not ready after 30s"; return 1; }
 
@@ -219,14 +236,14 @@ _restore_pg_atomic() {
   # lie"). The critical path is the explicit `if !` checks, not set -e.
   _pgx() { docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "$1" >/dev/null 2>&1; }
   _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1 || true; }
-  _apprestart() { docker compose up -d >/dev/null 2>&1 || true; }
+  _apprestart() { _dc up -d >/dev/null 2>&1 || true; }
 
   # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
   #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
   #    ASSERT readiness — a not-ready postgres must not proceed to fence/rename.
   log "$svc: stopping app for the atomic swap..."
-  docker compose stop >/dev/null 2>&1 || true
-  if ! docker compose up -d postgres >/dev/null 2>&1; then
+  _dc stop >/dev/null 2>&1 || true
+  if ! _dc up -d postgres >/dev/null 2>&1; then
     error "$svc: postgres failed to restart for the swap — live $db UNTOUCHED, temp $temp left. Bringing app back up."
     _apprestart; return 1
   fi
@@ -272,7 +289,7 @@ _restore_pg_atomic() {
   #    connections (a silent RC=0 false-success — Tesla). Keep the app STOPPED and
   #    error loudly (starting it against a fenced DB just crash-loops — Carnot r3).
   if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;"; then
-    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose up -d'. Previous live kept as '$rescue'."
+    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose --project-directory $composedir up -d'. Previous live kept as '$rescue'."
     return 1
   fi
   # Re-enable the rescue DB too so operators can inspect it without a manual ALTER
@@ -282,7 +299,7 @@ _restore_pg_atomic() {
   # Success — previous live kept as $rescue (drop it manually once satisfied). Check
   # the app restart: the data swap already succeeded, so a restart failure is a warn
   # (not a data-loss error), but don't print "complete" as if the service is up.
-  if docker compose up -d >/dev/null 2>&1; then
+  if _dc up -d >/dev/null 2>&1; then
     log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). App restarted."
     return 0
   fi
