@@ -181,7 +181,19 @@ jobs:
             # truth rather than in this workflow, so adding a test still needs no
             # edit here — and the skip is PRINTED, because a silent skip is the
             # same thing as the allowlist this replaces.
-            reason=$(sed -n 's/^# ci-skip:[[:space:]]*//p' "$t" | head -1)
+            # LINE 2 EXACTLY — immediately after the shebang. Matching `^# ci-skip:` anywhere in the
+            # file is fail-open in the exact mechanism meant to stop silent
+            # omissions: any occurrence in a heredoc, a doc block or a quoted
+            # sample would remove that test from the run set, and CI would print
+            # SKIP and move on. The likeliest victim is a future test OF this
+            # mechanism, which would carry the marker as a fixture and skip
+            # itself. Confining it to the header makes the declaration a
+            # deliberate act at a fixed place rather than a string that can occur.
+            #
+            # "First few lines" was tried and is still too loose — a marker sitting
+            # in prose on line 3 skipped the file in a local simulation. One exact
+            # line is the only version with no judgement in it.
+            reason=$(sed -n '2s/^# ci-skip:[[:space:]]*//p' "$t")
             if [ -n "$reason" ]; then
               echo "SKIP $t — $reason"
               skipped=$((skipped + 1))
