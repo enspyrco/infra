@@ -155,6 +155,22 @@ while IFS= read -r f; do
   fi
 done < <(find "$SCRIPT_DIR" -name '*.sh' -type f)
 
+# The detector accepts `_ensure_sqlite_dumper` as well as `ensure_sqlite_dumper`,
+# because restore.sh wraps the lib function to get its own `error` formatting. That
+# acceptance is by NAME, and a name is not a contract: a wrapper that did not
+# actually delegate would satisfy the check while ensuring nothing. Carnot raised
+# exactly this on #186. Rather than drop the underscore and break the real wrapper,
+# verify the wrapper does what its name claims.
+while IFS= read -r wrapper_file; do
+  wname=$(basename "$wrapper_file")
+  body=$(awk '/^_ensure_sqlite_dumper\(\)/,/^}/' "$wrapper_file")
+  if printf '%s\n' "$body" | grep -qE '^[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*ensure_sqlite_dumper([[:space:]]|$|;|\||&)'; then
+    ok "$wname's _ensure_sqlite_dumper wrapper actually delegates to the lib function"
+  else
+    no "$wname's _ensure_sqlite_dumper does not delegate" "the corpus check trusts this name; it must earn it"
+  fi
+done < <(grep -rl '^_ensure_sqlite_dumper()' "$SCRIPT_DIR" 2>/dev/null)
+
 # A scan that silently covered nothing would pass every assertion above by
 # vacuum. Assert the instrument saw the corpus it claims to check.
 if [ "$scanned" -ge 25 ]; then
