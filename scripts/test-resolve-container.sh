@@ -249,6 +249,86 @@ do
 done
 eval "$_real_docker_stub"   # restore the fleet stub for any later test
 
+
+echo "== the two postgres resolvers share ONE pattern (no second copy to drift) =="
+# This file's whole reason for existing is that two correct copies of a name drifted
+# and the unexercised half was the disaster path. The resolvers had grown two copies
+# of the ERE -- one against `docker ps`, one against `docker ps -a` -- so a prefix
+# change would have retuned backup's resolver and left the dead-box anchor behind.
+# Assert they agree on acceptance AND rejection, so a reintroduced second copy fails.
+for name_svc in "imagineering-outline-postgres:outline:accept" \
+                "img-outline-postgres:outline:accept" \
+                "xdeca-outline-postgres:outline:reject" \
+                "imagineering-outline-postgres-replica:outline:reject" \
+                "outline_postgres:outline:reject"
+do
+  IFS=: read -r name svc want <<< "$name_svc"
+  pat=$(_pg_container_pattern "$svc")
+  got=$(printf '%s\n' "$name" | grep -cE "$pat" || true)
+  if { [ "$want" = accept ] && [ "$got" = 1 ]; } || { [ "$want" = reject ] && [ "$got" = 0 ]; }; then
+    ok "pattern ${want}s $name"
+  else
+    no "pattern ${want}s $name" "matched=$got"
+  fi
+done
+
+
+echo "== a lone LEGACY-prefix match is refused, not treated as identity =="
+# The scenario Tesla and Carnot described independently: the deployed
+# imagineering-* container is gone (compose down / removed) and a stale img-*
+# one remains. It is a UNIQUE match, so the count guard passes it — and the
+# anchor reads `docker ps -a`, so a STOPPED ghost counts. Its compose label would
+# then point the restore at the wrong stack.
+_saved_docker=$(declare -f docker)
+
+# Ghost only: imagineering-* absent, img-*-postgres present but exited.
+docker() {
+  if [ "${1:-}" = "ps" ] && [ "${2:-}" = "-a" ]; then printf 'img-outline-postgres\n'; return 0; fi
+  if [ "${1:-}" = "ps" ]; then return 0; fi          # nothing running
+  if [ "${1:-}" = "inspect" ]; then echo "$STUB_WORKDIR_OUTLINE"; return 0; fi
+  return 0
+}
+out=$(resolve_pg_container_any outline 2>&1); rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qi "legacy"; then
+  ok "anchor refuses a lone img- ghost and names why"
+else
+  no "anchor vs lone img- ghost" "rc=$rc out=[$out] -- a unique-but-wrong match was accepted"
+fi
+out=$(resolve_pg_container outline 2>&1); rc=$?
+if [ $rc -ne 0 ]; then
+  ok "running resolver applies the same rule (the pair cannot disagree)"
+else
+  no "running resolver vs img- ghost" "rc=0 out=[$out]"
+fi
+
+# Deployed container present alongside the ghost -> ambiguity guard fires first.
+docker() {
+  if [ "${1:-}" = "ps" ] && [ "${2:-}" = "-a" ]; then printf 'img-outline-postgres\nimagineering-outline-postgres\n'; return 0; fi
+  if [ "${1:-}" = "ps" ]; then printf 'imagineering-outline-postgres\n'; return 0; fi
+  if [ "${1:-}" = "inspect" ]; then echo "$STUB_WORKDIR_OUTLINE"; return 0; fi
+  return 0
+}
+out=$(resolve_pg_container_any outline 2>&1); rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "refusing to guess"; then
+  ok "both present -> ambiguity guard refuses (count check still fires first)"
+else
+  no "both present" "rc=$rc out=[$out]"
+fi
+
+# The normal, deployed-only case must be untouched by all of this.
+docker() {
+  if [ "${1:-}" = "ps" ] && [ "${2:-}" = "-a" ]; then printf 'imagineering-outline-postgres\n'; return 0; fi
+  if [ "${1:-}" = "ps" ]; then printf 'imagineering-outline-postgres\n'; return 0; fi
+  if [ "${1:-}" = "inspect" ]; then echo "$STUB_WORKDIR_OUTLINE"; return 0; fi
+  return 0
+}
+assert_eq "imagineering-outline-postgres" "$(resolve_pg_container_any outline 2>/dev/null)" \
+  "the deployed-only case (what the real box looks like) is unchanged"
+assert_eq "imagineering-outline-postgres" "$(resolve_pg_container outline 2>/dev/null)" \
+  "running resolver unchanged for the deployed-only case"
+
+eval "$_saved_docker"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

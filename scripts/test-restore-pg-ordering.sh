@@ -108,12 +108,25 @@ else
 fi
 
 # 4. The caller's working directory must be untouched.
+#
+# CALLED IN THE CURRENT SHELL, DELIBERATELY. The first version of this assertion ran
+# the function inside `( ... )`, which made it VOID: a subshell cannot change its
+# parent's $PWD, so the check passed whether or not the side-effect existed. Proven
+# by reinstating `cd "$composedir"` in the function -- the assertion still reported
+# ok. It was a check whose outcome did not depend on the thing it checked, in a suite
+# written to catch exactly that. (Tesla, cage-match round 2/3.)
+#
+# The suite's must-fail arm did not catch it either, because that arm sabotaged the
+# ORDERING: two OTHER assertions went red and the suite went red with them, which
+# looks identical to this assertion being able to fail. A must-fail arm proves the
+# control CAN fail, not that it fails for the proposition its assertion names.
 before=$PWD
-( _restore_pg_atomic outline outline outline "$DUMP" ) >/dev/null 2>&1
+_restore_pg_atomic outline outline outline "$DUMP" >/dev/null 2>&1
 if [ "$PWD" = "$before" ]; then
-  ok "caller's \$PWD is unchanged after the call"
+  ok "caller's \$PWD is unchanged after the call (checked in the CURRENT shell)"
 else
-  no "caller \$PWD" "was [$before], now [$PWD]"
+  no "caller \$PWD" "was [$before], now [$PWD] -- the function left the caller somewhere else"
+  cd "$before" || true
 fi
 
 echo
