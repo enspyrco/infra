@@ -80,7 +80,19 @@ copies=$(grep -rl "apk add --no-cache sqlite" "$SCRIPT_DIR" 2>/dev/null | grep -
 
 # Every script that RUNS the image must also ENSURE it. This is the assertion that
 # would have caught the original defect: backup.sh ran it without ensuring it.
-for f in "$SCRIPT_DIR"/*.sh; do
+#
+# RECURSIVE, and that is the point. The first version globbed "$SCRIPT_DIR"/*.sh,
+# which saw 15 of the 33 shell scripts here -- lib/, watchers/, watchers/lib/ and
+# watchers/sudo-helpers/ were all invisible. No script down there uses the image
+# TODAY, so nothing was being missed in fact; the defect was that a check calling
+# itself a CORPUS invariant was inspecting less than half the corpus, and would
+# have gone on reporting a clean corpus if a consumer were ever added in a
+# subdirectory. A coverage claim has to match the coverage. (Kelvin, cage-match
+# on #185 -- raised as non-blocking, and the measurement is what made it worth
+# doing rather than filing.)
+scanned=0
+while IFS= read -r f; do
+  scanned=$((scanned + 1))
   base=$(basename "$f")
   case "$base" in test-*) continue ;; esac
   grep -q "sqlite-dumper:latest\|\$SQLITE_DUMPER_IMAGE\|\${SQLITE_DUMPER_IMAGE}" "$f" 2>/dev/null || continue
@@ -90,7 +102,15 @@ for f in "$SCRIPT_DIR"/*.sh; do
   else
     no "$base uses the image without ensuring it" "this is exactly the 2026-09-05 defect"
   fi
-done
+done < <(find "$SCRIPT_DIR" -name '*.sh' -type f)
+
+# A scan that silently covered nothing would pass every assertion above by
+# vacuum. Assert the instrument saw the corpus it claims to check.
+if [ "$scanned" -ge 25 ]; then
+  ok "the scan covered the whole tree ($scanned shell scripts, not just the top level)"
+else
+  no "scan coverage" "only $scanned scripts scanned -- the find is not reaching the subdirectories"
+fi
 
 echo
 echo "passed: $PASS   failed: $FAIL"
