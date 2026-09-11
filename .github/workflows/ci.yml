@@ -127,7 +127,24 @@ jobs:
       #
       # Fails if it finds NOTHING to run: a discovery loop that matches no files
       # is a green job that tested nothing, which is the failure this replaces.
+      # PREREQUISITES FIRST. The discovery loop below runs every test, so anything
+      # a test needs must be installed before it — not after, as this was on the
+      # first attempt. Carnot caught it: discovery ran pg-dump-guard BEFORE the awk
+      # dialects existed, and that test SKIPS SILENTLY when an alternate awk is
+      # absent. A discovered run would have passed while skipping the coverage the
+      # dedicated step was built to force — a true green about a different question,
+      # introduced in the PR that exists to remove exactly that.
+      - name: Install test prerequisites (gawk = the box's awk; mawk defensive)
+        run: sudo apt-get install -y --no-install-recommends mawk gawk
+
       - name: Run shell test suite (discovered, not listed)
+        # REQUIRE_ALL=1 matches what the dedicated secret-quoting and
+        # restore-aiko-island jobs set. Without it the same test name would mean a
+        # weaker assertion surface here than there — two reservoirs at different
+        # temperatures, where a missing prerequisite is enforced in one place and
+        # treated as a skip in the other.
+        env:
+          REQUIRE_ALL: 1
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -165,29 +182,14 @@ jobs:
       # assertions red and the suite exits 1, so this step cannot go green on a
       # dead guard. It opens no connections (TEST-NET-3 + an unknown service that
       # exits before dispatch).
-      - name: Run deploy-provenance tests
-        run: ./scripts/test-deploy-provenance.sh
 
-      - name: Run release-assets tests
-        run: ./scripts/test-release-assets.sh
 
       # Guards the pg_dump completion-marker check. The old inline `tail -n5`
       # passed by exactly one line on pg_dump 15.17; one more trailer would have
       # failed EVERY postgres backup and deleted the dump. The guard is now
       # structural (footer shape, no line count) — the suite pins the real
       # fixture shape, the footer-forgery class, and write/read symmetry.
-      # The guard is awk-based. Measured on 149.118.69.221 (2026-08-26):
-      # /usr/bin/awk is GNU Awk 5.2.1, NOT mawk as this step previously claimed
-      # — so gawk is the dialect that must not regress, and mawk is defensive
-      # cover for a box whose awk alternative gets switched. Both are installed
-      # explicitly so the suite's dialect sweep actually has something to sweep:
-      # an absent alternate awk would skip silently, and a skipped check reads
-      # exactly like a passing one.
-      - name: Install alternate awk dialects (gawk = the box's awk; mawk defensive)
-        run: sudo apt-get install -y --no-install-recommends mawk gawk
 
-      - name: Run pg-dump-guard tests
-        run: ./scripts/test-pg-dump-guard.sh
 
   caddy-validate:
     name: Caddyfile Validate
