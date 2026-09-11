@@ -1,4 +1,5 @@
 #!/bin/bash
+# ci-skip: fetches from 10xdeca/xdeca-backups, a private repo in another org that CI's GITHUB_TOKEN cannot read
 # Real restore test for the xdeca Postgres + MinIO backups.
 #
 # WHY THIS EXISTS: xdeca's recurring backup died on 2026-04-30 (its cron entry
@@ -119,12 +120,31 @@ announce_teardown() {
     return
   fi
   echo ""
-  echo "  LEFT RUNNING FOR INSPECTION (not torn down — by design):"
-  echo "    container : $CTR"
-  echo "    workdir   : $WORK"
-  echo "    inspect   : docker exec -it $CTR psql -U outline -d outline"
-  echo "                docker exec -it $CTR psql -U kanbn   -d kanbn"
-  echo "    TEAR DOWN : docker rm -f $CTR && rm -rf $WORK"
+  # KEEP ON FAILURE, REMOVE ON SUCCESS. The original refusal to tear down at all
+  # was right about the thing it was protecting — the run where an assertion
+  # failed is exactly the one whose state you need to open — and wrong about the
+  # scope: removing the container THIS RUN created, by the exact name it chose,
+  # is not "an unattended docker rm -f on a schedule", it is cleaning up after
+  # itself. The cost of the blanket rule was measured on 2026-09-11: eleven
+  # postgres containers left running on one machine in one evening, because the
+  # full suite was run eleven times and each run leaked one.
+  # ${FAIL:-1} — default to KEEPING. This runs in an EXIT trap under `set -u`,
+  # so if it ever fires before FAIL is initialised the fallback decides, and the
+  # safe direction is to preserve evidence rather than destroy it. (The first
+  # version of this line referenced a $FAILED that does not exist in this script;
+  # under set -u that aborts the trap itself.)
+  if [ "${TEARDOWN_KEEP:-0}" = "1" ] || [ "${FAIL:-1}" -ne 0 ]; then
+    echo "  LEFT RUNNING FOR INSPECTION (failed run, or TEARDOWN_KEEP=1):"
+    echo "    container : $CTR"
+    echo "    workdir   : $WORK"
+    echo "    inspect   : docker exec -it $CTR psql -U outline -d outline"
+    echo "                docker exec -it $CTR psql -U kanbn   -d kanbn"
+    echo "    TEAR DOWN : docker rm -f $CTR && rm -rf $WORK"
+  else
+    docker rm -f "$CTR" >/dev/null 2>&1 || true
+    rm -rf "$WORK"
+    echo "  cleaned up $CTR (passed; re-run with TEARDOWN_KEEP=1 to inspect)"
+  fi
 }
 trap announce_teardown EXIT
 

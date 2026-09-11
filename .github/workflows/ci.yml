@@ -116,32 +116,47 @@ jobs:
       # mutated. These cover the fail-closed guards on container resolution,
       # where a wrong answer silently backs up the WRONG tenant's data (see
       # lib/resolve-container.sh) rather than failing visibly.
-      - name: Run resolve-container tests
-        run: ./scripts/test-resolve-container.sh
-
-      # Guards the ORDER of two individually-correct calls in _restore_pg_atomic.
-      # The resolver unit tests cannot see this class: each call is fine, and the
-      # defect is that resolving a RUNNING container before `compose up` aborts the
-      # restore on exactly the stopped stack a recovery is for.
-      - name: Run restore pg-ordering test
-        run: ./scripts/test-restore-pg-ordering.sh
-
-      # Guards the invariant behind a 7-night backup outage: every script that RUNS
-      # the sqlite-dumper image must also ENSURE it exists. backup.sh used it and
-      # never built it, so a pruned 11MB image cost seven nights of aiko-island and
-      # matrix-bridge backups while the run still reported partial success.
-      - name: Run sqlite-dumper tests
-        run: ./scripts/test-sqlite-dumper.sh
-
-      # The backup-freshness pair. test-backup-services keeps the expected-service
-      # list from drifting behind backup.sh's own dispatch; test-backup-recency-watch
-      # replays the 2026-09-05..09-11 outage shape and fails if the watcher does not
-      # alert on it — the predecessor would have reported healthy on all seven nights.
-      - name: Run backup-services tests
-        run: ./scripts/test-backup-services.sh
-
-      - name: Run backup-recency-watch tests
-        run: ./scripts/test-backup-recency-watch.sh
+      # DISCOVERS tests; does not allowlist them. This block used to be one
+      # hand-added step per test file, which means a new test did not run until
+      # someone remembered to add it here — and a test that never runs is
+      # indistinguishable from a test that passes. A peer session found exactly
+      # this shape in a vitest config that allowlisted individual files and had
+      # silently swallowed three new tests in one evening; the same audit here
+      # found scripts/test-restore-xdeca.sh present in the repo and absent from
+      # CI. Enumerating what exists removes the remembering step entirely.
+      #
+      # Fails if it finds NOTHING to run: a discovery loop that matches no files
+      # is a green job that tested nothing, which is the failure this replaces.
+      - name: Run shell test suite (discovered, not listed)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/test-*.sh)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "no scripts/test-*.sh found — discovery matched nothing, refusing to pass"
+            exit 1
+          fi
+          echo "discovered ${#tests[@]} test scripts"
+          failed=0
+          skipped=0
+          for t in "${tests[@]}"; do
+            # A test may declare itself unrunnable in CI, IN THE TEST, with a
+            # `# ci-skip: <reason>` line. The declaration lives at the point of
+            # truth rather than in this workflow, so adding a test still needs no
+            # edit here — and the skip is PRINTED, because a silent skip is the
+            # same thing as the allowlist this replaces.
+            reason=$(sed -n 's/^# ci-skip:[[:space:]]*//p' "$t" | head -1)
+            if [ -n "$reason" ]; then
+              echo "SKIP $t — $reason"
+              skipped=$((skipped + 1))
+              continue
+            fi
+            echo "::group::$t"
+            if bash "$t"; then echo "PASS $t"; else echo "FAIL $t"; failed=1; fi
+            echo "::endgroup::"
+          done
+          echo "ran $(( ${#tests[@]} - skipped )) / ${#tests[@]} discovered tests (${skipped} declared ci-skip)"
+          exit "$failed"
 
       # Guards deploy-to.sh's provenance preflight. The preflight decides whether
       # production may receive the working tree, and its failure mode is silent:
