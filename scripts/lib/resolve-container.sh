@@ -117,9 +117,8 @@ resolve_container_by_compose() {
 # and (via resolve_compose_workdir below) the compose dir that drives it.
 #
 # WHY A THIRD FUNCTION: the two above fixed backup.sh in 2026-08-07 and
-# restore.sh was left holding the ORIGINAL hardcoded `outline_postgres` /
-# `kanbn_postgres` — the exact two strings whose staleness caused the 40 silent
-# empty backups this file's header describes. One half of a backup/restore pair
+# restore.sh was left holding the original hardcoded names — the same strings whose
+# staleness caused the 40 silent empty backups this file's header describes. One half of a backup/restore pair
 # was repaired and the other was not, so the same defect stayed live on the
 # side nobody exercises. A single definition both halves call cannot drift that
 # way again; two correct copies can.
@@ -191,9 +190,8 @@ resolve_pg_container_any() {
 # Print the compose working directory that owns $1 (a container name), read from
 # the label docker compose itself writes. The caller needs a dir to `cd` into for
 # `docker compose up -d postgres`, and a hardcoded one is the same hand-fed
-# constant this file exists to delete: restore.sh's `~/apps/outline` and
-# `~/apps/kanbn` had not existed since the 2026-06-26 rename to
-# `~/apps/imagineering-outline` / `-kanbn`.
+# constant this file exists to delete: restore.sh's were stale for nearly three
+# months after a 2026-06-26 rename, naming directories that no longer existed.
 #
 # Fails closed on an empty label or a dir that is not there, so a restore aborts
 # before the swap rather than cd-ing nowhere and running compose against $PWD.
