@@ -734,11 +734,19 @@ SSHEOF'
 
     # --- Build sqlite-dumper image for backup_matrix / restore_matrix ---
     # Pre-installs sqlite in alpine so the per-bridge `apk add` overhead
-    # (~5s × 6 bridges = ~30s) is avoided on every nightly run.
+    # (~5s x 6 bridges = ~30s) is avoided on every nightly run.
     # Local-only image; no registry push needed.
+    #
+    # Built through lib/sqlite-dumper.sh rather than a Dockerfile of its own. That
+    # Dockerfile was the FIFTH copy of this recipe and the one that had drifted —
+    # it said alpine:latest while the other four said alpine:3.20, so the image
+    # deploy produced was not the image every other caller described. The lib is
+    # scp'd rather than read from /opt/scripts so this does not depend on the
+    # `scripts` target having been deployed first.
     echo "Building sqlite-dumper image on $REMOTE..."
-    scp -q -r "$REPO_ROOT/scripts/sqlite-dumper" "$REMOTE":/tmp/sqlite-dumper
-    ssh "$REMOTE" "docker build -q -t sqlite-dumper:latest /tmp/sqlite-dumper && rm -rf /tmp/sqlite-dumper" | tail -1
+    scp -q "$REPO_ROOT/scripts/lib/sqlite-dumper.sh" "$REMOTE":/tmp/sqlite-dumper.sh
+    ssh "$REMOTE" ". /tmp/sqlite-dumper.sh && ensure_sqlite_dumper; rc=\$?; rm -f /tmp/sqlite-dumper.sh; exit \$rc" \
+      || { echo "ERROR: could not build sqlite-dumper on $REMOTE — the nightly SQLite backups (aiko-island, matrix bridges) will fail" >&2; return 1; }
 
     # --- Install matrix admin secrets (admin token + age recipient) ---
     # Source-of-truth is matrix/secrets.yaml (SOPS-encrypted). We decrypt
