@@ -78,29 +78,70 @@ copies=$(grep -rl "apk add --no-cache sqlite" "$SCRIPT_DIR" 2>/dev/null | grep -
 [ "$copies" = "1" ] && ok "exactly one build recipe in the corpus" \
   || no "one build recipe" "found $copies files containing a build recipe"
 
-# Every script that RUNS the image must also ENSURE it. This is the assertion that
-# would have caught the original defect: backup.sh ran it without ensuring it.
+# Every script that RUNS the image must also ENSURE it, and ensure it FIRST.
 #
-# RECURSIVE, and that is the point. The first version globbed "$SCRIPT_DIR"/*.sh,
-# which saw 15 of the 33 shell scripts here -- lib/, watchers/, watchers/lib/ and
-# watchers/sudo-helpers/ were all invisible. No script down there uses the image
-# TODAY, so nothing was being missed in fact; the defect was that a check calling
-# itself a CORPUS invariant was inspecting less than half the corpus, and would
-# have gone on reporting a clean corpus if a consumer were ever added in a
-# subdirectory. A coverage claim has to match the coverage. (Kelvin, cage-match
-# on #185 -- raised as non-blocking, and the measurement is what made it worth
-# doing rather than filing.)
+# Two earlier versions of this check were decorative, both caught by Carnot in the
+# cage-match on #186 and both reproduced before fixing:
+#
+#   1. It required `docker run` and the image name on the SAME PHYSICAL LINE. A
+#      normal continuation --  `docker run --rm \` ... `"$SQLITE_DUMPER_IMAGE"` --
+#      was not merely mis-scored, it was SKIPPED ENTIRELY and never reported.
+#   2. It accepted the string `ensure_sqlite_dumper` ANYWHERE in the file. A comment
+#      reading "we should probably call ensure_sqlite_dumper here one day" scored a
+#      green "runs the image and ensures it first".
+#
+#      Planting both as real unguarded consumers, the suite passed 11/11.
+#
+# So the file is NORMALISED first: `\`-continuations joined into logical lines, and
+# whole-line comments dropped, with each logical line carrying the line number it
+# STARTED on. Then the ordering is compared, not merely the presence.
+#
+# HONEST LIMIT, stated rather than implied: this compares TEXTUAL order, which is a
+# proxy for execution order and not the same thing. A consumer that calls ensure
+# inside a function defined below its use would fail this check while being correct,
+# and one that guards only a branch would pass while being wrong. The proxy fits
+# this corpus -- every consumer is a straight-line script -- and the check says so
+# rather than claiming to have proved the ordering property.
+_logical_lines() {
+  # Join backslash continuations, drop whole-line comments, keep the starting line no.
+  awk '
+    { line = $0 }
+    buf != "" { line = buf " " line; ln = startln }
+    { startln = (buf == "" ? NR : ln) }
+    /\\$/ { sub(/\\$/, "", line); buf = line; next }
+    { buf = ""
+      probe = line; sub(/^[ \t]+/, "", probe)
+      if (probe !~ /^#/) print startln ":" line
+    }
+  ' "$1"
+}
+
 scanned=0
 while IFS= read -r f; do
   scanned=$((scanned + 1))
   base=$(basename "$f")
   case "$base" in test-*) continue ;; esac
-  grep -q "sqlite-dumper:latest\|\$SQLITE_DUMPER_IMAGE\|\${SQLITE_DUMPER_IMAGE}" "$f" 2>/dev/null || continue
-  grep -q "docker run .*sqlite-dumper\|docker run .*SQLITE_DUMPER_IMAGE" "$f" 2>/dev/null || continue
-  if grep -q "ensure_sqlite_dumper" "$f"; then
-    ok "$base runs the image and ensures it first"
-  else
+
+  norm=$(_logical_lines "$f")
+
+  # First line that actually RUNS the image (docker run + the image, same LOGICAL line).
+  use_line=$(printf '%s\n' "$norm" \
+    | grep -E 'docker[[:space:]]+run.*(sqlite-dumper:latest|SQLITE_DUMPER_IMAGE)' \
+    | head -1 | cut -d: -f1)
+  [ -n "$use_line" ] || continue
+
+  # First ensure_sqlite_dumper CALL -- not its definition, not a comment.
+  ensure_line=$(printf '%s\n' "$norm" \
+    | grep -E 'ensure_sqlite_dumper' \
+    | grep -vE 'ensure_sqlite_dumper[[:space:]]*\(\)' \
+    | head -1 | cut -d: -f1)
+
+  if [ -z "$ensure_line" ]; then
     no "$base uses the image without ensuring it" "this is exactly the 2026-09-05 defect"
+  elif [ "$ensure_line" -lt "$use_line" ]; then
+    ok "$base ensures the image (line $ensure_line) before running it (line $use_line)"
+  else
+    no "$base ensures the image AFTER using it" "ensure at line $ensure_line, use at line $use_line"
   fi
 done < <(find "$SCRIPT_DIR" -name '*.sh' -type f)
 
