@@ -130,10 +130,20 @@ while IFS= read -r f; do
     | head -1 | cut -d: -f1)
   [ -n "$use_line" ] || continue
 
-  # First ensure_sqlite_dumper CALL -- not its definition, not a comment.
+  # First ensure_sqlite_dumper CALL. Anchored at COMMAND POSITION, because merely
+  # containing the token is not calling it: dropping whole-line comments still let
+  # `FOO=1  # remember to call ensure_sqlite_dumper first` score a green tick, and
+  # that is an ordinary comment somebody would really write. Every real consumer
+  # calls it as the first word of a line (optionally `if !`), so the anchor costs
+  # nothing and closes the inline-comment hole. (Carnot, third round on #186.)
+  #
+  # Remaining known gap, named rather than papered over: the token inside a QUOTED
+  # STRING at command position would still match. Closing that needs a shell parser,
+  # not a regex, and the trade is not worth it for a five-file corpus -- but a reader
+  # should know the boundary rather than infer a stronger guarantee than this gives.
   ensure_line=$(printf '%s\n' "$norm" \
-    | grep -E 'ensure_sqlite_dumper' \
-    | grep -vE 'ensure_sqlite_dumper[[:space:]]*\(\)' \
+    | grep -E '^[0-9]+:[[:space:]]*(if[[:space:]]+)?!?[[:space:]]*_?ensure_sqlite_dumper([[:space:]]|$|;|\||&)' \
+    | grep -vE '_?ensure_sqlite_dumper[[:space:]]*\(\)' \
     | head -1 | cut -d: -f1)
 
   if [ -z "$ensure_line" ]; then
