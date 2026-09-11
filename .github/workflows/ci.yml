@@ -119,6 +119,13 @@ jobs:
       - name: Run resolve-container tests
         run: ./scripts/test-resolve-container.sh
 
+      # Guards the ORDER of two individually-correct calls in _restore_pg_atomic.
+      # The resolver unit tests cannot see this class: each call is fine, and the
+      # defect is that resolving a RUNNING container before `compose up` aborts the
+      # restore on exactly the stopped stack a recovery is for.
+      - name: Run restore pg-ordering test
+        run: ./scripts/test-restore-pg-ordering.sh
+
       # Guards deploy-to.sh's provenance preflight. The preflight decides whether
       # production may receive the working tree, and its failure mode is silent:
       # a check that always passes is indistinguishable from a clean deploy. The
