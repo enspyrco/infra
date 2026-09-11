@@ -1,4 +1,5 @@
 #!/bin/bash
+# ci-skip: reads imagineering-cc/imagineering-backups, a private repo in another org that CI's GITHUB_TOKEN cannot read
 # Restore proof driven by the REAL nightly artifact, not a fixture.
 #
 # WHY THIS EXISTS, given test-restore-aiko-island.sh already passes:
@@ -50,7 +51,12 @@ bad() { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
 ARTIFACT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifact) ARTIFACT="${2:-}"; shift 2 ;;
+    # `shift 2` FAILS (and shifts nothing) when only one positional remains, so
+    # `--artifact` with no value would spin this loop forever, silently, with no
+    # output — there is no set -e here to stop it. Require the value explicitly.
+    --artifact)
+      [ $# -ge 2 ] || { echo "--artifact requires a path" >&2; exit 2; }
+      ARTIFACT="$2"; shift 2 ;;
     # Fail closed on an unrecognised flag rather than silently ignoring it —
     # this script drives a destructive code path against whatever it is handed.
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -82,9 +88,27 @@ if [ -z "$ARTIFACT" ]; then
   command -v gh >/dev/null 2>&1 || { echo "  FAIL - no --artifact and no gh to fetch one"; exit 1; }
   ARTIFACT="$WORK/$ARTIFACT_IN_REPO"
   echo "Fetching $ARTIFACT_IN_REPO from $BACKUP_SLUG ..."
-  if ! gh api "repos/$BACKUP_SLUG/contents/$ARTIFACT_IN_REPO" --jq '.content' \
+  # Fetch via the GIT BLOBS api, not contents. The contents api silently returns
+  # `"encoding":"none","content":""` for any file over 1MB — and NINE of the
+  # twelve backup artifacts are over 1MB, so a contents fetch would hand this
+  # script an empty file and report "artifact is empty", which reads as a backup
+  # problem rather than an api limit. Blobs handles up to 100MB.
+  # (`Accept: raw` is not the fix either: gh refuses to emit responses containing
+  # terminal escape sequences, which the postgres dumps contain.)
+  META="$(gh api "repos/$BACKUP_SLUG/contents/$ARTIFACT_IN_REPO" --jq '.sha + " " + (.size|tostring)' 2>"$WORK/fetch.err")" || {
+    echo "  FAIL - could not stat the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1; }
+  BLOB_SHA="${META%% *}"
+  EXPECT_BYTES="${META##* }"
+  if ! gh api "repos/$BACKUP_SLUG/git/blobs/$BLOB_SHA" --jq '.content' \
        | base64 -d > "$ARTIFACT" 2>"$WORK/fetch.err"; then
     echo "  FAIL - could not fetch the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1
+  fi
+  # "the bytes arrived" and "ALL the bytes arrived" are different claims, and a
+  # short read would present downstream as a truncated BACKUP rather than a
+  # truncated TRANSFER. Pin it here, where the two can still be told apart.
+  GOT_BYTES="$(wc -c < "$ARTIFACT" | tr -d ' ')"
+  if [ "$GOT_BYTES" != "$EXPECT_BYTES" ]; then
+    echo "  FAIL - short read: got $GOT_BYTES bytes, the api reports $EXPECT_BYTES"; exit 1
   fi
   # Provenance matters more than the bytes: an artifact from an unknown night
   # proves a restore of an unknown thing. Print when it was actually pushed.
