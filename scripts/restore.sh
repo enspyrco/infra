@@ -611,6 +611,14 @@ restore_aiko_island() {
 # the bridge's volume. Bridges must be stopped before the replay (writing
 # to a live DB while replaying would corrupt it). The continuwuity homeserver
 # is NOT backed up or restored (its signing key is saved separately — 2026-08-02).
+# The matrix stack's compose directory. Overridable, and ACTUALLY USED: this
+# constant already existed but was declared below restore_matrix, which hardcoded
+# ~/apps/matrix in both of its compose calls — so setting MATRIX_COMPOSE_DIR did
+# nothing for the bridge restore and everything for the continuwuity one. A knob
+# half the code ignores is worse than no knob: it reads as configurable.
+# Default is unchanged, so behaviour is identical unless the var is set.
+MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
+
 restore_matrix() {
   log "Restoring matrix bridges + relay-bots..."
 
@@ -635,8 +643,8 @@ restore_matrix() {
   # line was `cd ~/apps/matrix || { error ...; cleanup_backups; return 1; }` and the
   # bare replacement dies under `set -e` with no diagnostic and no cleanup, leaving
   # the /tmp/restore clone behind. A DR path must not fail silently.
-  docker compose --project-directory ~/apps/matrix stop \
-    || { error "matrix: could not stop the stack (missing ~/apps/matrix, or compose refused) — nothing was written"; cleanup_backups; return 1; }
+  docker compose --project-directory "$MATRIX_COMPOSE_DIR" stop \
+    || { error "matrix: could not stop the stack (missing $MATRIX_COMPOSE_DIR, or compose refused) — nothing was written"; cleanup_backups; return 1; }
 
   local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
@@ -709,8 +717,8 @@ restore_matrix() {
   # Guarded not only for the restart itself: an unguarded failure here exits before
   # the any_failed/skipped summary below, which is the operator's only record of
   # WHICH bridges restored and which were skipped.
-  docker compose --project-directory ~/apps/matrix up -d \
-    || { error "matrix: bridge DBs were processed but the stack FAILED to restart — see the per-bridge results above; run 'docker compose --project-directory ~/apps/matrix up -d' once the cause is fixed"; cleanup_backups; return 1; }
+  docker compose --project-directory "$MATRIX_COMPOSE_DIR" up -d \
+    || { error "matrix: bridge DBs were processed but the stack FAILED to restart — see the per-bridge results above; run 'docker compose --project-directory $MATRIX_COMPOSE_DIR up -d' once the cause is fixed"; cleanup_backups; return 1; }
 
   cleanup_backups
   if [ "$any_failed" -eq 1 ]; then
@@ -724,9 +732,6 @@ restore_matrix() {
   log "Matrix restore complete!"
 }
 
-# Continuwuity restore constants. The image is the exact prod version so the
-# validate-boot exercises the real RocksDB (no ldb version-skew).
-MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the
 # functions (_restore_island_core + the aiko_island_* lib) without running the
