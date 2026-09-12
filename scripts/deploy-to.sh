@@ -369,14 +369,12 @@ deploy_scripts() {
             sudo chmod 0644 /etc/cron.d/$name && sudo chown root:root /etc/cron.d/$name"
     }
 
-    echo "Installing /etc/cron.d/backup-recency-watch..."
-    ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
-        'SHELL=/bin/bash' \
-        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        'MAILTO=\"\"' \
-        '0 8 * * * nick /opt/scripts/watchers/backup-recency-watch.sh >> /home/nick/logs/backup-recency-watch.log 2>&1' \
-        | sudo tee /etc/cron.d/backup-recency-watch > /dev/null && \
-        sudo chmod 0644 /etc/cron.d/backup-recency-watch && sudo chown root:root /etc/cron.d/backup-recency-watch"
+    # Through the same helper as the others, which also finishes claude-tasks#4362
+    # for THIS entry: it was still redirecting to ~/logs/backup-recency-watch.log
+    # while watcher-base writes ~/backup-recency-watch.log, so the declared log was
+    # the permanently-empty one. The previous commit fixed the four new entries and
+    # left this one split, which made its own PR description half-true.
+    install_watcher_cron backup-recency-watch '0 8 * * *'
     echo "Backup-freshness watcher cron installed (08:00 daily)"
 
     # --- The four watchers that were still running from /home/ubuntu ---
@@ -393,9 +391,26 @@ deploy_scripts() {
     # change of RUN PATH and USER only, not of cadence.
     install_watcher_cron disk-usage-watch   '*/30 * * * *'
     install_watcher_cron cert-expiry-watch  '17 */6 * * *'
-    install_watcher_cron oci-instance-watch '13 */2 * * *'
     install_watcher_cron email-health-watch '23 */4 * * *'
-    echo "Four migrated watcher crons installed (disk-usage, cert-expiry, oci-instance, email-health)"
+    echo "Three migrated watcher crons installed (disk-usage, cert-expiry, email-health)"
+
+    # oci-instance-watch is deliberately NOT here, and was rolled back on
+    # 2026-09-12 after the migration deployed. It queries OCI through the CLI,
+    # whose config is PER-USER (~/.oci/config). `ubuntu` has one; `nick` does not.
+    # Run as nick it still exits 0 and still writes a log — it just reports a
+    # question mark where the answer goes:
+    #
+    #     as nick    phase_a: NICK_MEL:?:1     <- the query failed
+    #     as ubuntu  phase_a: NICK_MEL:1:1     <- works
+    #
+    # (the format is <profile>:<actual>:<expected>). So the migration would have
+    # left a watcher that runs, succeeds, logs, and cannot see the thing it
+    # watches — the same failure shape as the mute watcher the assert above now
+    # prevents, through a different credential. The alerting precondition does not
+    # catch it, because alerting was never the broken part.
+    #
+    # It stays on the ubuntu crontab until claude-tasks#4364 settles whether the
+    # OCI credential moves, is shared, or the watcher keeps its own user.
     echo "NOTE: the /home/ubuntu copies + ubuntu crontab lines must be removed once verified —"
     echo "      two live copies of a watcher is the drift this migration exists to end."
 
