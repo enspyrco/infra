@@ -20,14 +20,16 @@ The OCI instance has decent resources (24GB RAM, 4 vCPU) but running many `docke
 
 ## Structure
 
-Every top-level dir, generated from disk 2026-08-26 (the previous block listed 9
-of 26 and had drifted since the early days of the repo). Dirs fall into three
+Every top-level dir, generated from disk 2026-09-12 (a 2026-08-26 regeneration
+missed `archive/` and `enspyr-melb/`, both added after it — a block that asserts
+its own completeness goes stale silently, so the date is the load-bearing part). Dirs fall into three
 kinds: a **stack** (its own `docker-compose.yml`, built and run here), a
 **config-only** dir (SOPS secrets + deploy config for a service whose SOURCE
 lives in another repo), and **tooling**.
 
 ```
 .
+├── archive/                  # config-only: retired-tenant records (xdeca app-dir manifest, 2026-09-02)
 ├── aiko-island/              # config-only: aiko-chat-island secrets (source: nickmeinhold/aiko-chat-island)
 ├── aiko-island-enspyr/       # config-only: the enspyr-tenant island instance
 ├── avatar-deploy/            # tooling: avatar deploy/rollback helpers + rehearsal runbook
@@ -38,6 +40,7 @@ lives in another repo), and **tooling**.
 ├── claudius/                 # stack: headless email agent (Claudius Maximus)
 ├── docs/                     # design docs + runbooks
 ├── dreamfinder/              # stack: Matrix PM bot (Dreamfinder)
+├── enspyr-melb/              # config-only: enspyr-melb OCI Object Storage creds (NOT MinIO — see its README)
 ├── dreamfinder-avatar/       # stack: 3D avatar voice frontend (df.imagineering.cc)
 ├── familiars-server/         # stack: Familiars backend (internal, Caddy-fronted)
 ├── imagineering-contact-us/  # stack: contact-form / QR invite backend (img-contact)
