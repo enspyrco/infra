@@ -319,6 +319,56 @@ deploy_scripts() {
     # MAILTO="" and the explicit PATH for the same reason as health-check above;
     # 08:00 is four hours after the 04:00 backup window so a slow run is not read
     # as a failed one.
+    # --- Watcher alerting precondition: assert BEFORE scheduling anything ---
+    # A scheduled watcher that cannot reach notify is WORSE than no watcher: tg()
+    # logs "NOTIFY_URL/NOTIFY_API_KEY not set; skipping" and RETURNS 0, so the run
+    # succeeds, the log looks calm, and the alarm never rings. Measured 2026-09-12:
+    # backup-recency-watch was scheduled as `nick` on 2026-09-11 and spent its
+    # first day mute, because the credential watcher-base reads is per-USER
+    # ($HOME/.config/imagineering/notify-credentials) and only `ubuntu` had it.
+    # Nothing failed. Its first real run reported failing=[none] and stayed quiet,
+    # which is indistinguishable from a watcher that cannot speak.
+    #
+    # The block below already installs /etc/imagineering-secrets/notify.env from
+    # SOPS, but that file carries only NOTIFY_API_KEY — watcher-base needs
+    # NOTIFY_URL too, so it is necessary and not sufficient. Unifying the two
+    # credential paths is claude-tasks#4363; until then this ASSERTS rather than
+    # provisions, and fails the deploy rather than shipping a silent mute.
+    echo "Asserting the watcher user can actually alert..."
+    if ! ssh "$REMOTE" "sudo -u nick bash -c '
+            C=\$HOME/.config/imagineering/notify-credentials
+            [ -r \"\$C\" ] || exit 3
+            set -a; . \"\$C\"; set +a
+            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
+        '"; then
+        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
+        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
+        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
+        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
+        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
+        return 1
+    fi
+    echo "  Watcher alerting precondition OK"
+
+    # install_watcher_cron <name> <5-field schedule>
+    # One helper rather than a fifth hand-copied block. The log target is the SAME
+    # file watcher-base writes ($HOME/<name>.log), not a separate ~/logs/ path:
+    # redirecting elsewhere produced a permanently-0-byte "declared" log next to
+    # the real one, and an operator reading the path the schedule names saw an
+    # empty file and could not tell "quiet" from "never ran" (claude-tasks#4362).
+    # Stray stderr now interleaves into the log a human actually reads.
+    install_watcher_cron() {
+        local name=$1 schedule=$2
+        echo "Installing /etc/cron.d/$name..."
+        ssh "$REMOTE" "printf '%s\n' \
+            'SHELL=/bin/bash' \
+            'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+            'MAILTO=\"\"' \
+            '$schedule nick /opt/scripts/watchers/$name.sh >> /home/nick/$name.log 2>&1' \
+            | sudo tee /etc/cron.d/$name > /dev/null && \
+            sudo chmod 0644 /etc/cron.d/$name && sudo chown root:root /etc/cron.d/$name"
+    }
+
     echo "Installing /etc/cron.d/backup-recency-watch..."
     ssh "$REMOTE" "mkdir -p ~/logs && printf '%s\n' \
         'SHELL=/bin/bash' \
@@ -328,6 +378,26 @@ deploy_scripts() {
         | sudo tee /etc/cron.d/backup-recency-watch > /dev/null && \
         sudo chmod 0644 /etc/cron.d/backup-recency-watch && sudo chown root:root /etc/cron.d/backup-recency-watch"
     echo "Backup-freshness watcher cron installed (08:00 daily)"
+
+    # --- The four watchers that were still running from /home/ubuntu ---
+    # Scheduled here, from the repo, for the same reason as the block above. Until
+    # now these ran out of an ubuntu crontab against /home/ubuntu copies that the
+    # repo could not reach: measured 2026-09-12, the RUNNING email-health-watch was
+    # dated 2026-06-21 and the running oci-instance-watch 2026-05-02, while deploy
+    # kept shipping current versions to /opt/scripts/watchers/ where nothing ran
+    # them. 61 and 14 lines of divergence respectively — including the whole of
+    # claude-tasks#1062 (per-record DKIM/DMARC naming), written, deployed and never
+    # once executed.
+    #
+    # Schedules preserved exactly as they were in the ubuntu crontab, so this is a
+    # change of RUN PATH and USER only, not of cadence.
+    install_watcher_cron disk-usage-watch   '*/30 * * * *'
+    install_watcher_cron cert-expiry-watch  '17 */6 * * *'
+    install_watcher_cron oci-instance-watch '13 */2 * * *'
+    install_watcher_cron email-health-watch '23 */4 * * *'
+    echo "Four migrated watcher crons installed (disk-usage, cert-expiry, oci-instance, email-health)"
+    echo "NOTE: the /home/ubuntu copies + ubuntu crontab lines must be removed once verified —"
+    echo "      two live copies of a watcher is the drift this migration exists to end."
 
     echo "Scripts deployed to /opt/scripts/"
 }
