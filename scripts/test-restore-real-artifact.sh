@@ -99,9 +99,26 @@ if [ -z "$ARTIFACT" ]; then
     echo "  FAIL - could not stat the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1; }
   BLOB_SHA="${META%% *}"
   EXPECT_BYTES="${META##* }"
-  if ! gh api "repos/$BACKUP_SLUG/git/blobs/$BLOB_SHA" --jq '.content' \
-       | base64 -d > "$ARTIFACT" 2>"$WORK/fetch.err"; then
-    echo "  FAIL - could not fetch the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1
+  # The redirect goes on GH, not on base64. `... | base64 -d > f 2>err` binds the
+  # stderr of BASE64, so gh's actual error escapes to the terminal and the operator
+  # is handed an empty reason — measured: a real `stream error: stream ID 1; CANCEL`
+  # printed as "could not fetch the artifact: ". Capture the channel that speaks.
+  #
+  # Retried because the transfer genuinely flakes: three transient network failures
+  # in one session (two curl-35 in CI, one HTTP/2 CANCEL here), all on GitHub
+  # downloads, none of them a defect in what was being fetched. A single-shot fetch
+  # turns a flake into a red restore proof, which is the expensive misreading.
+  FETCHED=0
+  for attempt in 1 2 3; do
+    if gh api "repos/$BACKUP_SLUG/git/blobs/$BLOB_SHA" --jq '.content' 2>"$WORK/fetch.err" \
+         | base64 -d > "$ARTIFACT"; then
+      FETCHED=1; break
+    fi
+    echo "  retry $attempt/3 after: $(tr '\n' ' ' < "$WORK/fetch.err" | tail -c 120)"
+    sleep 2
+  done
+  if [ "$FETCHED" != "1" ]; then
+    echo "  FAIL - could not fetch the artifact after 3 attempts: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1
   fi
   # "the bytes arrived" and "ALL the bytes arrived" are different claims, and a
   # short read would present downstream as a truncated BACKUP rather than a

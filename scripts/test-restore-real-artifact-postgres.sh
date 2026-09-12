@@ -39,16 +39,22 @@
 # NOT IN CI (see the ci-skip above) and no vacuous-skip path: a restore proof that
 # cannot reach an artifact must fail rather than pass quietly.
 #
-# Usage:  ./scripts/test-restore-real-artifact-postgres.sh [--artifact outline.sql]
+# Usage:  ./scripts/test-restore-real-artifact-postgres.sh [--service outline|kanbn] [--artifact FILE]
 # Exit non-zero on any failure.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_SLUG="imagineering-cc/imagineering-backups"
-SVC=outline                       # the bigger of the two pg services
-ARTIFACT_IN_REPO="outline.sql"
-PG_IMAGE="postgres:15-alpine"     # the image outline/docker-compose.yml declares
+# The two postgres-backed services, as a CLOSED SET. Both declare
+# postgres:15-alpine and both are called as `_restore_pg_atomic <svc> <svc> <svc>`
+# in restore.sh, so service name == pg user == pg database for each.
+# An unknown --service is refused rather than defaulted: this drives a destructive
+# code path, and guessing which database is meant is exactly the wrong-tenant
+# hazard the resolvers already fail closed on.
+PG_SERVICES="outline kanbn"
+SVC=outline                       # default: the bigger of the two
+PG_IMAGE="postgres:15-alpine"     # the image BOTH stacks' compose files declare
 
 PASS=0
 FAIL=0
@@ -61,9 +67,19 @@ while [ $# -gt 0 ]; do
     --artifact)
       [ $# -ge 2 ] || { echo "--artifact requires a path" >&2; exit 2; }
       ARTIFACT="$2"; shift 2 ;;
+    --service)
+      [ $# -ge 2 ] || { echo "--service requires a name ($PG_SERVICES)" >&2; exit 2; }
+      SVC="$2"; shift 2
+      # shellcheck disable=SC2086
+      case " $PG_SERVICES " in
+        *" $SVC "*) ;;
+        *) echo "unknown service '$SVC' — expected one of: $PG_SERVICES" >&2; exit 2 ;;
+      esac ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+ARTIFACT_IN_REPO="${SVC}.sql"
 
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "  FAIL - docker unavailable; this proof needs a real container runtime"
@@ -104,9 +120,26 @@ if [ -z "$ARTIFACT" ]; then
     echo "  FAIL - could not stat the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1; }
   BLOB_SHA="${META%% *}"
   EXPECT_BYTES="${META##* }"
-  if ! gh api "repos/$BACKUP_SLUG/git/blobs/$BLOB_SHA" --jq '.content' \
-       | base64 -d > "$ARTIFACT" 2>"$WORK/fetch.err"; then
-    echo "  FAIL - could not fetch the artifact: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1
+  # The redirect goes on GH, not on base64. `... | base64 -d > f 2>err` binds the
+  # stderr of BASE64, so gh's actual error escapes to the terminal and the operator
+  # is handed an empty reason — measured: a real `stream error: stream ID 1; CANCEL`
+  # printed as "could not fetch the artifact: ". Capture the channel that speaks.
+  #
+  # Retried because the transfer genuinely flakes: three transient network failures
+  # in one session (two curl-35 in CI, one HTTP/2 CANCEL here), all on GitHub
+  # downloads, none of them a defect in what was being fetched. A single-shot fetch
+  # turns a flake into a red restore proof, which is the expensive misreading.
+  FETCHED=0
+  for attempt in 1 2 3; do
+    if gh api "repos/$BACKUP_SLUG/git/blobs/$BLOB_SHA" --jq '.content' 2>"$WORK/fetch.err" \
+         | base64 -d > "$ARTIFACT"; then
+      FETCHED=1; break
+    fi
+    echo "  retry $attempt/3 after: $(tr '\n' ' ' < "$WORK/fetch.err" | tail -c 120)"
+    sleep 2
+  done
+  if [ "$FETCHED" != "1" ]; then
+    echo "  FAIL - could not fetch the artifact after 3 attempts: $(tr '\n' ' ' < "$WORK/fetch.err")"; exit 1
   fi
   GOT_BYTES="$(wc -c < "$ARTIFACT" | tr -d ' ')"
   if [ "$GOT_BYTES" != "$EXPECT_BYTES" ]; then
