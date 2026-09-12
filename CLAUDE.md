@@ -1,8 +1,6 @@
 # enspyrco/infra
 
 Monorepo for self-hosted infrastructure — imagineering.cc services and enspyr.
-(xdeca was co-located here until 2026-09-02; it is decommissioned. See
-`project_xdeca_decommissioned_2026_09_02.md` in memory for what was preserved and where.)
 (Formerly `imagineering-cc/imagineering-infra`; renamed 2026-07-28. The `imagineering.cc` domain
 and its live services are unchanged — only the GitHub repo moved.)
 
@@ -29,7 +27,6 @@ lives in another repo), and **tooling**.
 
 ```
 .
-├── archive/                  # config-only: retired-tenant records (xdeca app-dir manifest, 2026-09-02)
 ├── aiko-island/              # config-only: aiko-chat-island secrets (source: nickmeinhold/aiko-chat-island)
 ├── aiko-island-enspyr/       # config-only: the enspyr-tenant island instance
 ├── avatar-deploy/            # tooling: avatar deploy/rollback helpers + rehearsal runbook
@@ -75,9 +72,9 @@ lives in another repo), and **tooling**.
 
 ## Services
 
-Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). Caddy routes by hostname. A second tenant, **xdeca**, was co-located here on bare names (30xx/9000) until it was decommissioned 2026-09-02 — its containers, networks, volumes and app dirs are gone.
+Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). Caddy routes by hostname.
 
-> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule. **Historical note:** a bare `docker exec radicale` used to reach *xdeca's* container rather than ours, which is why `scripts/lib/resolve-container.sh` exists. With xdeca decommissioned that collision can no longer occur, and whether the helper should now be deleted is an open keep-or-kill question (claude-tasks#3844) — do not assume either way from this line.
+> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule — and note `outline/docker-compose.yml` and `kanbn/docker-compose.yml` still DECLARE the legacy `img-` names while the box runs `imagineering-` ones, which `_pg_select_match` refuses outright (claude-tasks#4288).
 
 ### Imagineering (public)
 
@@ -87,7 +84,7 @@ Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). C
 | imagineering-outline | 3012 | outline.imagineering.cc | Team wiki (Notion-like). Container is `imagineering-outline`, NOT `img-outline` — verified live 2026-08-26. Its postgres/redis are `imagineering-outline-postgres` / `-redis`. |
 | (imagineering-outline-minio) | 9010 | storage.imagineering.cc | S3-compatible file storage for outline + kanbn |
 | imagineering-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative). Container is `imagineering-kanbn`, NOT `img-kanbn`. Its DB is `imagineering-kanbn-postgres`. |
-| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` used to hit xdeca's tenant; xdeca is gone as of 2026-09-02, so that collision is historical. `scripts/lib/resolve-container.sh` exists because of it — see claude-tasks#3844. |
+| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** `scripts/lib/resolve-container.sh` exists to resolve it by compose label rather than by bare name; whether that helper is still needed is an open keep-or-kill question (claude-tasks#3844). Its storage `hook` is configured but has never worked — `/data/collections` is not a git repo, so there is NO version history (claude-tasks#4368). |
 | matrix-continuwuity-1 | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork). Compose appends the `-1` suffix; the whole matrix stack does. |
 | (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
@@ -113,17 +110,6 @@ Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). C
 | Service | Port | URL | Description |
 |---------|------|-----|-------------|
 | tw-clawd, tw-gremlin | 8080 (internal) | world.imagineering.cc | Tech-World bots (Discord/Matrix/Telegram facades). **`tw-dreamfinder` is DISABLED** (commented out in `tech-world-bots/docker-compose.yml`, c2b86aa — it collided with the main dreamfinder); only two run. |
-
-### Co-located xdeca services — REMOVED 2026-09-02
-
-xdeca is decommissioned. It formerly ran outline (3002, kb/wiki.xdeca.com), its MinIO
-(9000, storage.xdeca.com), kanbn (3003, tasks.xdeca.com), radicale (5233, dav.xdeca.com)
-and the Gremlin Telegram bot (gremlin.xdeca.com) on this box.
-
-Teardown was gated on a final snapshot pushed to `10xdeca/xdeca-backups`, fetched back
-from GitHub and restore-tested from that fetched copy (24/24). Config dirs including
-`.env` secrets are archived on the box at
-`~/xdeca-decommissioned-20260902-appdirs.tar.gz`, deliberately not in git.
 
 ### Operational
 
@@ -459,7 +445,9 @@ Self-hosted CalDAV/CardDAV server for team calendars and contacts.
 - CalDAV (calendars) and CardDAV (contacts)
 - htpasswd authentication (bcrypt)
 - Owner-only access rights (users see only their own data)
-- File-based storage with git-tracked changes
+- File-based storage. **NOT git-tracked**: a `hook` is configured but `/data/collections` is not a git
+  repository, so `git add -A` fails, `&&` short-circuits, and no commit has ever been made. There is no
+  version history for any DAV data. Decide git-init-or-drop-the-hook: claude-tasks#4368.
 - Compatible with DAVx5, Apple Calendar/Contacts, Thunderbird
 
 ## Setup
