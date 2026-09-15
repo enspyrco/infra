@@ -107,12 +107,25 @@ and `phase_b_check`. Typical watcher size: 50-80 lines.
 where `deploy-to.sh scripts` installs them, so it is the only path the repo can
 reach, and every cron entry must invoke them there by absolute path.
 
-> **TODAY IT DOES NOT.** As of 2026-08-26 `ubuntu`'s crontab still executes five
-> watchers from `/home/ubuntu/`. The cutover is a separate, deliberate step
-> (#3482) and is NOT done. Until it is, this section describes the target, not
-> the box — do not read it as a description of what is running. Stating this
-> plainly matters: a confident present-tense claim in this very file is what let
-> the split survive for months of spot-checks.
+> **PARTLY TRUE — check before relying on it.** The cutover (#3482) was started
+> on 2026-09-12, not finished. What this repo now SCHEDULES, from
+> `deploy_scripts` into `/etc/cron.d` as `nick` against `/opt/scripts/watchers/`:
+> `backup-recency-watch`, `disk-usage-watch`, `cert-expiry-watch`,
+> `email-health-watch`. What it deliberately does NOT: `oci-instance-watch`,
+> which reads a per-user `~/.oci/config` that `nick` does not have, was rolled
+> back the same day, and still runs from `ubuntu`'s crontab (#4364).
+>
+> That list is read from `deploy-to.sh` in this tree — it is the repo's
+> INTENT. It is not a reading of the box. The last measurement of what
+> `ubuntu`'s crontab actually holds was 2026-09-12; anything since is unobserved
+> from here. Do not upgrade this paragraph to a present-tense claim about
+> production without running the check.
+>
+> Stating the boundary this plainly matters: a confident present-tense claim in
+> this very file is what let the split survive for months of spot-checks. The
+> previous version of this paragraph said the cutover was "NOT done" and was
+> dated 2026-08-26 — accurate when written, false from 2026-09-12, and nobody
+> edited it. The date is the load-bearing part.
 
 This was not always true, and the failure is worth knowing because it was
 invisible for months: watchers used to run from a hand-maintained copy in
