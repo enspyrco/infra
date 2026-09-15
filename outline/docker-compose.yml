@@ -12,7 +12,7 @@
 # silently pick a victim.
 #
 # The digests below record what the imagineering tenant runs (outline a750f764,
-# minio 14cea493); both stacks were checked and matched.
+# minio 14cea493), read from that tenant's live containers.
 name: ${TENANT:?TENANT must be set (e.g. TENANT=enspyr)}-outline
 
 services:
