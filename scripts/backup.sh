@@ -67,6 +67,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # months after a rename (see lib/resolve-container.sh).
 # shellcheck source=lib/resolve-container.sh
 . "$SCRIPT_DIR/lib/resolve-container.sh"
+# The sqlite-dumper helper image, built on first use. This script USED it without
+# ever building it, so when the image was pruned from the box on 2026-09-05 every
+# SQLite-backed backup failed for seven nights while the run still reported the
+# services that had succeeded. restore.sh already had a build-if-absent helper;
+# the nightly half did not. Now both call one definition.
+# shellcheck source=lib/sqlite-dumper.sh
+. "$SCRIPT_DIR/lib/sqlite-dumper.sh"
 # pg_dump completion-marker guard. Was `tail -n5` inline at three call sites
 # (two here, one in restore.sh). Measured on the real dumps: exactly 4 lines
 # follow the marker (pg_dump 15.17 appends `--`, blank, \unrestrict, blank), so
@@ -130,7 +137,7 @@ backup_kanbn() {
   # to gzip masks it behind gzip's status, silently committing a truncated/empty
   # backup over the good one. Then require pg_dump's end-marker before gzip.
   local container
-  if ! container=$(resolve_container '^(imagineering|img)-kanbn-postgres$' kanbn 2>&1); then
+  if ! container=$(resolve_pg_container kanbn 2>&1); then
     error "Kan.bn container not resolved: $container"
     return 1
   fi
@@ -188,7 +195,7 @@ backup_outline() {
   # Plain .sql first (see backup_kanbn) so pg_dump's exit isn't masked by gzip,
   # then require the completion marker before gzip.
   local container
-  if ! container=$(resolve_container '^(imagineering|img)-outline-postgres$' outline 2>&1); then
+  if ! container=$(resolve_pg_container outline 2>&1); then
     error "Outline container not resolved: $container"
     return 1
   fi
@@ -335,8 +342,12 @@ backup_matrix() {
     "matrix-telegram:matrix_telegram_data:mautrix-telegram.db"
     "matrix-whatsapp:matrix_whatsapp_data:whatsapp.db"
     "matrix-relay:matrix_relay_data:relay.db"
-    "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
+
+  # ONCE, before the loop: without this, a missing image failed all five bridges
+  # individually with five identical "pull access denied" errors and no statement
+  # of the single cause. Failing here names it once and stops.
+  ensure_sqlite_dumper || { error "matrix: sqlite-dumper image unavailable — no bridge can be dumped"; return 1; }
 
   local any_failed=0
   for entry in "${entries[@]}"; do
@@ -420,6 +431,8 @@ backup_aiko_island() {
   # Auto-detect follows the island cutover automatically and works on BOTH
   # islands regardless of cutover state (Melbourne still runs the pre-cutover
   # volume name).
+  ensure_sqlite_dumper || { error "aiko-island: sqlite-dumper image unavailable"; return 1; }
+
   local gw_cid gw_vol
   gw_cid=$(aiko_island_container) || return 1
   gw_vol=$(aiko_island_volume "$gw_cid") || return 1
@@ -732,7 +745,7 @@ case $SERVICE in
     # the backups of the others from the commit.
     backup_matrix || error "matrix backup had partial failures"
     for matrix_svc in matrix-discord matrix-signal matrix-telegram \
-                      matrix-whatsapp matrix-relay matrix-relay-hf; do
+                      matrix-whatsapp matrix-relay; do
       if find "$BACKUP_DIR" -name "${matrix_svc}-${DATE}.*" -type f 2>/dev/null | grep -q .; then
         SUCCEEDED+=("$matrix_svc")
       else
@@ -787,7 +800,7 @@ case $SERVICE in
   matrix)
     if backup_matrix; then
       backup_to_github matrix-discord matrix-signal matrix-telegram \
-                       matrix-whatsapp matrix-relay matrix-relay-hf \
+                       matrix-whatsapp matrix-relay \
         || FAILED_SERVICES+=("github-upload")
     else
       FAILED_SERVICES+=(matrix)

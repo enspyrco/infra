@@ -1,6 +1,6 @@
 # enspyrco/infra
 
-Monorepo for self-hosted infrastructure — imagineering.cc services, co-located xdeca, and enspyr.
+Monorepo for self-hosted infrastructure — imagineering.cc services and enspyr.
 (Formerly `imagineering-cc/imagineering-infra`; renamed 2026-07-28. The `imagineering.cc` domain
 and its live services are unchanged — only the GitHub repo moved.)
 
@@ -18,8 +18,9 @@ The OCI instance has decent resources (24GB RAM, 4 vCPU) but running many `docke
 
 ## Structure
 
-Every top-level dir, generated from disk 2026-08-26 (the previous block listed 9
-of 26 and had drifted since the early days of the repo). Dirs fall into three
+Every top-level dir, generated from disk 2026-09-12 (a 2026-08-26 regeneration
+missed `archive/` and `enspyr-melb/`, both added after it — a block that asserts
+its own completeness goes stale silently, so the date is the load-bearing part). Dirs fall into three
 kinds: a **stack** (its own `docker-compose.yml`, built and run here), a
 **config-only** dir (SOPS secrets + deploy config for a service whose SOURCE
 lives in another repo), and **tooling**.
@@ -36,6 +37,7 @@ lives in another repo), and **tooling**.
 ├── claudius/                 # stack: headless email agent (Claudius Maximus)
 ├── docs/                     # design docs + runbooks
 ├── dreamfinder/              # stack: Matrix PM bot (Dreamfinder)
+├── enspyr-melb/              # config-only: enspyr-melb OCI Object Storage creds (NOT MinIO — see its README)
 ├── dreamfinder-avatar/       # stack: 3D avatar voice frontend (df.imagineering.cc)
 ├── familiars-server/         # stack: Familiars backend (internal, Caddy-fronted)
 ├── imagineering-contact-us/  # stack: contact-form / QR invite backend (img-contact)
@@ -70,9 +72,9 @@ lives in another repo), and **tooling**.
 
 ## Services
 
-Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) and co-located **xdeca** services (bare names, original 30xx/9000). Caddy routes by hostname.
+Sydney (149.118.69.221) hosts the **imagineering** services (ports 30xx/90xx). Caddy routes by hostname.
 
-> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule — the tenant-collision this creates is exactly what `scripts/lib/resolve-container.sh` exists to resolve, and a bare `docker exec radicale` reaches xdeca's container, not ours.
+> **The imagineering container prefix is MIXED, not uniformly `img-`** — verified against `docker ps` 2026-08-26. Some are `img-` (`img-contact`, `img-radicale`, `img-familiars-server`, `img-downstream-server`); the outline and kanbn stacks are `imagineering-` (`imagineering-outline`, `imagineering-kanbn`, plus their `-postgres`/`-redis`/`-minio`); the matrix stack carries a compose `-1` suffix. Do not infer a container name from the prefix rule — and note `outline/docker-compose.yml` and `kanbn/docker-compose.yml` still DECLARE the legacy `img-` names while the box runs `imagineering-` ones, which `_pg_select_match` refuses outright (claude-tasks#4288).
 
 ### Imagineering (public)
 
@@ -82,9 +84,9 @@ Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) a
 | imagineering-outline | 3012 | outline.imagineering.cc | Team wiki (Notion-like). Container is `imagineering-outline`, NOT `img-outline` — verified live 2026-08-26. Its postgres/redis are `imagineering-outline-postgres` / `-redis`. |
 | (imagineering-outline-minio) | 9010 | storage.imagineering.cc | S3-compatible file storage for outline + kanbn |
 | imagineering-kanbn | 3013 | kan.imagineering.cc | Kanban (Trello alternative). Container is `imagineering-kanbn`, NOT `img-kanbn`. Its DB is `imagineering-kanbn-postgres`. |
-| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** A bare `docker exec radicale` hits xdeca's tenant instead — that collision is real and is why `scripts/lib/resolve-container.sh` exists. Use it, not a bare name. |
+| img-radicale | 5232 | dav.imagineering.cc | CalDAV/CardDAV. **The container is `img-radicale`.** `scripts/lib/resolve-container.sh` resolves it by compose label rather than by bare name. That helper is **KEEP** — settled in claude-tasks#3844, and for a reason worth knowing: it exists because `backup.sh` HARDCODED container names, a rename made them nonexistent, and the nightly dumps then failed every night for four months, silently gzipping empty files while logging "backup complete". It is not about any two-tenant collision, so nothing that removes a tenant makes it vestigial. Its storage `hook` is configured but has never worked — `/data/collections` is not a git repo, so there is NO version history (claude-tasks#4368). |
 | matrix-continuwuity-1 | 8008 | matrix.imagineering.cc | Matrix homeserver (Conduit fork). Compose appends the `-1` suffix; the whole matrix stack does. |
-| (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot + relay-bot-hf |
+| (matrix bridges) | - | - | mautrix-signal/whatsapp/telegram/discord, plus relay-bot |
 | Dreamfinder (pm-bot) | 8081 | dreamfinder.imagineering.cc | Matrix-based AI project management bot |
 | dreamfinder-avatar | 3015 | df.imagineering.cc | 3D avatar voice frontend |
 | symposium | 3016 | symposium.imagineering.cc | Discussion/event space |
@@ -109,23 +111,13 @@ Sydney (149.118.69.221) hosts both **imagineering** services (ports 30xx/90xx) a
 |---------|------|-----|-------------|
 | tw-clawd, tw-gremlin | 8080 (internal) | world.imagineering.cc | Tech-World bots (Discord/Matrix/Telegram facades). **`tw-dreamfinder` is DISABLED** (commented out in `tech-world-bots/docker-compose.yml`, c2b86aa — it collided with the main dreamfinder); only two run. |
 
-### Co-located xdeca services
-
-| Service | Port | URL | Description |
-|---------|------|-----|-------------|
-| outline (xdeca) | 3002 | kb.xdeca.com / wiki.xdeca.com | Team wiki for xdeca |
-| outline_minio | 9000 | storage.xdeca.com | S3-compatible storage for xdeca outline |
-| kanbn | 3003 | tasks.xdeca.com | Kanban for xdeca (also fronts kan.imagineering.cc) |
-| radicale (xdeca) | 5233 | dav.xdeca.com | xdeca CalDAV/CardDAV |
-| Gremlin | - | gremlin.xdeca.com | xdeca Telegram bot (webhook mode) |
-
 ### Operational
 
 | Service | Port | URL | Description |
 |---------|------|-----|-------------|
-| watchtower | - | - | Auto-pulls new container images |
+| ~~watchtower~~ | - | - | **NOT RUNNING** — absent from `docker ps -a` (verified 2026-08-31). This table claimed it auto-pulled images for an unknown period while nothing did, which means every `:latest` on the box is frozen at whatever was pulled on an unrecorded day. That is the finding behind the digest-pinning work; see `feedback_versioned_containers_not_latest.md`. |
 | lugh | - | - | Auxiliary worker |
-| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project) |
+| callonclare-n8n | 5678 | - | n8n workflow automation (call-on-clare project). **Its vhost `n8n.callonclare.com.au` has NO DNS record** and the apex `callonclare.com.au` points at 35.213.149.172, not this box — so the Caddy vhost is dangling. Container is up. See claude-tasks#3845. |
 
 ## Container Architecture
 
@@ -453,7 +445,9 @@ Self-hosted CalDAV/CardDAV server for team calendars and contacts.
 - CalDAV (calendars) and CardDAV (contacts)
 - htpasswd authentication (bcrypt)
 - Owner-only access rights (users see only their own data)
-- File-based storage with git-tracked changes
+- File-based storage. **NOT git-tracked**: a `hook` is configured but `/data/collections` is not a git
+  repository, so `git add -A` fails, `&&` short-circuits, and no commit has ever been made. There is no
+  version history for any DAV data. Decide git-init-or-drop-the-hook: claude-tasks#4368.
 - Compatible with DAVx5, Apple Calendar/Contacts, Thunderbird
 
 ## Setup

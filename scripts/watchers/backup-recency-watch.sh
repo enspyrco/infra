@@ -1,22 +1,36 @@
 #!/usr/bin/env bash
-# Backup-recency watcher — alerts if the daily 4am backup hasn't run.
+# Backup-freshness watcher — asserts EVERY expected service produced an artifact.
 #
-# Phase A: most recent file in /tmp/backups/ is older than 25 hours → 🚨.
-#          Catches "the daily backup didn't run" / cron silently broke /
-#          backup.sh died early.
-# Phase B: a fresh artifact lands in /tmp/backups/ → ✅, self-disable.
+# WHAT IT REPLACES, and why the replacement is not a tuning change:
 #
-# Why /tmp/backups/ rather than the GitHub repo: backup.sh is run by user
-# `nick` (per /etc/cron.d/xdeca-backup) and uses an SSH deploy key in
-# /home/nick/.ssh/config. Querying GitHub from ubuntu's context would
-# need either an additional PAT or sudo -u nick gymnastics. The local
-# artifacts are written to /tmp/backups/ as part of the same backup run
-# (mode 0664, world-readable), which ubuntu can stat without privilege.
-# If those artifacts are stale, GitHub will be too — same root cause.
+# The previous version asked "is the newest file in /tmp/backups younger than 25
+# hours". That is an ANY check wearing an ALL check's name. Through the
+# 2026-09-05..09-11 outage, seven services produced nothing while four backed up
+# perfectly every night, so the newest file in the directory was always ~4h old at
+# check time. It would have reported healthy on all seven nights. Verified against
+# the artifacts still on disk:
 #
-# Cron: 0 8 * * * /home/ubuntu/backup-recency-watch.sh  # backup-recency-watch
-# (8am daily, 4 hours after the 4am backup window — gives backup.sh time
-# to complete before we judge it.)
+#     2026-09-08  kanbn=1  matrix-signal=0  aiko-island=0
+#     2026-09-09  kanbn=1  matrix-signal=0  aiko-island=0
+#     2026-09-10  kanbn=1  matrix-signal=0  aiko-island=0
+#     newest 09-09 artifact: minio-2026-09-09.tar.gz   <- what the old check saw
+#
+# It also never ran: no cron entry, no state file, no log, on either box account.
+# So the seven nights were not a case of a watcher being fooled — nothing was
+# watching, and the thing that would have watched was blind anyway.
+#
+# WHY IT DOES NOT USE run_watcher: that is a two-phase INCIDENT machine — alert,
+# confirm recovery, then self_disable and delete its own cron entry. Correct for
+# "chase this one problem until it is fixed"; wrong for a standing safety
+# assertion, which must still be asserting a year from now. A backup check that
+# removes itself after its first recovery is a fire alarm that unhooks itself
+# after the first fire. So this drives its own edge-triggered loop and never
+# self-disables.
+#
+# Cron (installed by deploy-to.sh; see scripts/watchers/README.md):
+#   0 8 * * * /opt/scripts/watchers/backup-recency-watch.sh
+# 08:00 local, four hours after the 04:00 backup window, so a slow run is not
+# mistaken for a failed one.
 
 set -euo pipefail
 
@@ -31,79 +45,81 @@ __lib="$(dirname "$0")/lib/watcher-base.sh"
 source "$__lib"
 unset __lib
 
+# diagnose.sh supplies html_escape and tail_backup_log. Dropping it while still
+# CALLING html_escape would kill the recovery path under `set -e` — and only the
+# recovery path, so the alert would work and the all-clear would silently never
+# arrive. Caught before shipping by grepping where the helpers are defined rather
+# than assuming they came with watcher-base.
 __diag="$(dirname "$0")/lib/diagnose.sh"
 [[ -r "$__diag" ]] || __diag="$HOME/lib/diagnose.sh"
 # shellcheck disable=SC1090
 source "$__diag"
 unset __diag
 
-BACKUP_DIR="/tmp/backups"
-STALE_HOURS=25
+__svc="$(dirname "$0")/../lib/backup-services.sh"
+[[ -r "$__svc" ]] || __svc="$HOME/lib/backup-services.sh"
+# shellcheck disable=SC1090
+source "$__svc"
+unset __svc
 
-# Returns the epoch mtime of the most recently modified file under
-# $BACKUP_DIR, or "0" if the directory is empty/missing/unreadable.
-latest_artifact_epoch() {
-    if [[ ! -d "$BACKUP_DIR" ]]; then
-        echo 0
-        return
-    fi
-    # find -printf '%T@\n' gives epoch.fraction. Capture into a var so the
-    # `|| echo 0` fallback only fires when there's truly no output (rather
-    # than when any pipe stage's exit code wobbles).
-    # The `|| true` suppresses pipefail false-positives: under `set -o
-    # pipefail`, this specific find|sort|awk chain reports rc=1 even when
-    # the data flows correctly through. Verified by isolating each stage:
-    # all exit 0 individually, but the captured pipe rc is 1. Likely
-    # awk-pattern-NR-1 + sort interaction. The data is sound; ignore the rc.
-    local out
-    out=$(find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@\n' 2>/dev/null \
-          | sort -rn | awk 'NR==1 { printf "%d", $1 }' || true)
-    echo "${out:-0}"
+BACKUP_DIR="${BACKUP_DIR:-/tmp/backups}"
+STALE_HOURS="${STALE_HOURS:-25}"
+
+# Local artifacts rather than the GitHub repo, for the reason the previous version
+# documented and which still holds: backup.sh runs as `nick` with a deploy key, and
+# querying GitHub from the watcher's account would need a second credential. If the
+# local artifacts are stale the repo is too — same root cause, one fewer secret.
+
+# Echo one "service:reading" per line for every expected service that is NOT fresh.
+# "none" and an hour count are kept DISTINCT deliberately: never-produced points at
+# configuration or a service that was removed, an old artifact points at a run that
+# started and failed. Collapsing them would hide which question to ask.
+failing_services() {
+    local svc age
+    while IFS= read -r svc; do
+        age=$(backup_service_age_hours "$BACKUP_DIR" "$svc")
+        if [[ "$age" == "none" ]]; then
+            echo "${svc}:none"
+        elif [[ "$age" -ge "$STALE_HOURS" ]]; then
+            echo "${svc}:${age}h"
+        fi
+    done < <(backup_services_all)
 }
 
-phase_a_check() {
-    local epoch hours_old
-    epoch=$(latest_artifact_epoch)
-    if [[ "$epoch" == "0" ]]; then
-        log "phase_a: no artifacts in $BACKUP_DIR — backup never ran or dir missing"
-        # Treat "no artifacts at all" as a real alert condition: it means either
-        # backup.sh has never produced anything or someone wiped the dir.
-        tg "🚨 <b>Backup directory empty or missing</b>: <code>${BACKUP_DIR}</code> has no files. backup.sh hasn't produced artifacts."
+# Edge-triggered: alert when the failing SET changes, not on every run. A watcher
+# that re-sends an identical alert every morning trains its reader to filter it,
+# which is how a real one gets missed.
+main() {
+    local current previous
+    current=$(failing_services | sort | tr '\n' ' ' | sed 's/ $//')
+    previous=$(cat "$STATE_FILE" 2>/dev/null || echo "__unset__")
+
+    log "failing=[${current:-none}] previous=[${previous}]"
+
+    if [[ "$current" == "$previous" ]]; then
+        log "no change; staying quiet"
         return 0
     fi
-    hours_old=$(( ($(date +%s) - epoch) / 3600 ))
-    log "phase_a: latest artifact ${hours_old}h old"
-    if [[ "$hours_old" -ge "$STALE_HOURS" ]]; then
-        local last_iso
-        last_iso=$(date -u -d "@$epoch" +"%Y-%m-%dT%H:%MZ" 2>/dev/null \
-                || date -u -r "$epoch" +"%Y-%m-%dT%H:%MZ")
-        # Tail of backup.log: distinguishes "backup ran and failed
-        # mid-stream" from "backup never started" — the difference
-        # determines whether you go look at backup.sh internals (failed)
-        # or cron/systemd-timer (never started).
-        local log_tail
-        log_tail=$(html_escape "$(tail_backup_log)")
-        # shellcheck disable=SC2016  # $(pgrep …) in the message body is literal; intended to be copy-pasted on Sydney by the reader
-        tg "$(printf '🚨 <b>Backup stale: %sh since last artifact</b>\n\nLatest file in <code>%s</code>: <code>%s</code>.\n\nLast lines of <code>backup.log</code>:\n<pre>%s</pre>\n\nIf the log shows nothing recent, cron/systemd-timer didn'"'"'t fire. Otherwise look at backup.sh internals.' "$hours_old" "$BACKUP_DIR" "$last_iso" "$log_tail")"
-        return 0
+
+    if [[ -z "$current" ]]; then
+        # Only announce recovery if there was something to recover FROM. On a first
+        # ever run of a healthy fleet, previous is __unset__ and silence is right.
+        if [[ "$previous" != "__unset__" && -n "$previous" ]]; then
+            tg "✅ <b>Backups healthy</b> — every expected service has an artifact newer than ${STALE_HOURS}h. Previously failing: <code>$(html_escape "$previous")</code>"
+        else
+            log "first run, fleet healthy; no alert"
+        fi
+    else
+        local n
+        n=$(printf '%s' "$current" | wc -w | tr -d ' ')
+        tg "$(printf '🚨 <b>%s of %s backup services stale or missing</b>\n\n<pre>%s</pre>\n\n<code>none</code> = never produced an artifact (config, or a retired service still expected).\nAn hour count = a run started and failed.\n\nDirectory: <code>%s</code>\nLast lines of <code>backup.log</code>:\n<pre>%s</pre>' \
+            "$n" "$(backup_services_all | wc -l | tr -d ' ')" \
+            "$(html_escape "$(printf '%s' "$current" | tr ' ' '\n')")" \
+            "$BACKUP_DIR" \
+            "$(html_escape "$(tail_backup_log 2>/dev/null || echo '(unavailable)')")")"
     fi
-    return 1
+
+    printf '%s' "$current" > "$STATE_FILE"
 }
 
-phase_b_check() {
-    local epoch hours_old
-    epoch=$(latest_artifact_epoch)
-    if [[ "$epoch" == "0" ]]; then
-        log "phase_b: still no artifacts"
-        return 1
-    fi
-    hours_old=$(( ($(date +%s) - epoch) / 3600 ))
-    log "phase_b: latest artifact ${hours_old}h old"
-    if [[ "$hours_old" -lt "$STALE_HOURS" ]]; then
-        tg "✅ <b>Backups recovered</b> — fresh artifact ${hours_old}h ago. ${WATCHER_NAME} self-disabling."
-        return 0
-    fi
-    return 1
-}
-
-run_watcher
+main

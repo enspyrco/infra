@@ -116,39 +116,100 @@ jobs:
       # mutated. These cover the fail-closed guards on container resolution,
       # where a wrong answer silently backs up the WRONG tenant's data (see
       # lib/resolve-container.sh) rather than failing visibly.
-      - name: Run resolve-container tests
-        run: ./scripts/test-resolve-container.sh
-
-      # Guards deploy-to.sh's provenance preflight. The preflight decides whether
-      # production may receive the working tree, and its failure mode is silent:
-      # a check that always passes is indistinguishable from a clean deploy. The
-      # suite is RED-proven — neutering the preflight to `return 0` turns 5
-      # assertions red and the suite exits 1, so this step cannot go green on a
-      # dead guard. It opens no connections (TEST-NET-3 + an unknown service that
-      # exits before dispatch).
-      - name: Run deploy-provenance tests
-        run: ./scripts/test-deploy-provenance.sh
-
-      - name: Run release-assets tests
-        run: ./scripts/test-release-assets.sh
-
-      # Guards the pg_dump completion-marker check. The old inline `tail -n5`
-      # passed by exactly one line on pg_dump 15.17; one more trailer would have
-      # failed EVERY postgres backup and deleted the dump. The guard is now
-      # structural (footer shape, no line count) — the suite pins the real
-      # fixture shape, the footer-forgery class, and write/read symmetry.
-      # The guard is awk-based. Measured on 149.118.69.221 (2026-08-26):
-      # /usr/bin/awk is GNU Awk 5.2.1, NOT mawk as this step previously claimed
-      # — so gawk is the dialect that must not regress, and mawk is defensive
-      # cover for a box whose awk alternative gets switched. Both are installed
-      # explicitly so the suite's dialect sweep actually has something to sweep:
-      # an absent alternate awk would skip silently, and a skipped check reads
-      # exactly like a passing one.
-      - name: Install alternate awk dialects (gawk = the box's awk; mawk defensive)
+      # DISCOVERS tests; does not allowlist them. This block used to be one
+      # hand-added step per test file, which means a new test did not run until
+      # someone remembered to add it here — and a test that never runs is
+      # indistinguishable from a test that passes. A peer session found exactly
+      # this shape in a vitest config that allowlisted individual files and had
+      # silently swallowed three new tests in one evening; the same audit here
+      # found scripts/test-restore-xdeca.sh present in the repo and absent from
+      # CI. Enumerating what exists removes the remembering step entirely.
+      #
+      # Fails if it finds NOTHING to run: a discovery loop that matches no files
+      # is a green job that tested nothing, which is the failure this replaces.
+      # PREREQUISITES FIRST. The discovery loop below runs every test, so anything
+      # a test needs must be installed before it — not after, as this was on the
+      # first attempt. Carnot caught it: discovery ran pg-dump-guard BEFORE the awk
+      # dialects existed, and that test SKIPS SILENTLY when an alternate awk is
+      # absent. A discovered run would have passed while skipping the coverage the
+      # dedicated step was built to force — a true green about a different question,
+      # introduced in the PR that exists to remove exactly that.
+      - name: Install test prerequisites (gawk = the box's awk; mawk defensive)
         run: sudo apt-get install -y --no-install-recommends mawk gawk
 
-      - name: Run pg-dump-guard tests
-        run: ./scripts/test-pg-dump-guard.sh
+      # Pinned mikefarah yq — the SAME install the secret-quoting job does, because
+      # discovery runs that job's test too and REQUIRE_ALL=1 turns a wrong or absent
+      # yq into a hard failure rather than a skip. There are two unrelated tools
+      # called `yq` with incompatible syntax, so "the runner has a yq" is not the
+      # same claim as "the runner has THIS yq"; the discovered run passed on
+      # whatever the image happened to ship, which is luck, not a guarantee.
+      #
+      # I missed this on the first pass because I mapped prerequisites by grepping
+      # for `apt-get install` and `REQUIRE_ALL` and never looked at `run:` blocks
+      # that install by curl. The map had a blind spot exactly where the tool was.
+      - name: Install yq (mikefarah) — same pin as the secret-quoting job
+        run: |
+          YQ_VERSION=v4.44.3
+          sudo curl -fsSL \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      # secret-quoting and restore-aiko-island run BOTH here and in their own
+      # dedicated jobs above. That duplication is deliberate, not an oversight:
+      # the dedicated jobs give branch protection a stable check NAME to require,
+      # which a single discovery job cannot. Both surfaces now set REQUIRE_ALL=1
+      # so the same test name means the same assertion in both places.
+      - name: Run shell test suite (discovered, not listed)
+        # REQUIRE_ALL=1 matches what the dedicated secret-quoting and
+        # restore-aiko-island jobs set. Without it the same test name would mean a
+        # weaker assertion surface here than there — two reservoirs at different
+        # temperatures, where a missing prerequisite is enforced in one place and
+        # treated as a skip in the other.
+        env:
+          REQUIRE_ALL: 1
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/test-*.sh)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "no scripts/test-*.sh found — discovery matched nothing, refusing to pass"
+            exit 1
+          fi
+          echo "discovered ${#tests[@]} test scripts"
+          failed=0
+          skipped=0
+          for t in "${tests[@]}"; do
+            # A test may declare itself unrunnable in CI, IN THE TEST, with a
+            # `# ci-skip: <reason>` line. The declaration lives at the point of
+            # truth rather than in this workflow, so adding a test still needs no
+            # edit here — and the skip is PRINTED, because a silent skip is the
+            # same thing as the allowlist this replaces.
+            # LINE 2 EXACTLY — immediately after the shebang. Matching `^# ci-skip:` anywhere in the
+            # file is fail-open in the exact mechanism meant to stop silent
+            # omissions: any occurrence in a heredoc, a doc block or a quoted
+            # sample would remove that test from the run set, and CI would print
+            # SKIP and move on. The likeliest victim is a future test OF this
+            # mechanism, which would carry the marker as a fixture and skip
+            # itself. Confining it to the header makes the declaration a
+            # deliberate act at a fixed place rather than a string that can occur.
+            #
+            # "First few lines" was tried and is still too loose — a marker sitting
+            # in prose on line 3 skipped the file in a local simulation. One exact
+            # line is the only version with no judgement in it.
+            reason=$(sed -n '2s/^# ci-skip:[[:space:]]*//p' "$t")
+            if [ -n "$reason" ]; then
+              echo "SKIP $t — $reason"
+              skipped=$((skipped + 1))
+              continue
+            fi
+            echo "::group::$t"
+            if bash "$t"; then echo "PASS $t"; else echo "FAIL $t"; failed=1; fi
+            echo "::endgroup::"
+          done
+          echo "ran $(( ${#tests[@]} - skipped )) / ${#tests[@]} discovered tests (${skipped} declared ci-skip)"
+          exit "$failed"
 
   caddy-validate:
     name: Caddyfile Validate
@@ -158,7 +219,7 @@ jobs:
 
       # Validate caddy/Caddyfile with the SAME image the box runs (caddy:2-alpine),
       # so a syntax error or bad directive is caught HERE — before a deploy reloads
-      # it into the live proxy and takes every domain (*.imagineering.cc, xdeca.com,
+      # it into the live proxy and takes every domain (*.imagineering.cc,
       # callonclare.com.au) down. `caddy validate` only parses + adapts the config;
       # it does NOT dial upstreams, so the localhost:PORT backends that don't exist
       # in CI are fine. Fails the build (non-zero) on an invalid Caddyfile.

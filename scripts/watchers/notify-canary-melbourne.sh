@@ -12,7 +12,7 @@
 #   witness that closes that hole.
 #
 # ─── System-shape assumptions ──────────────────────────────────────────────
-#   1. Melbourne (nick-mel, 158.179.17.233) is always-on, and its cron is
+#   1. Melbourne (`enspyr`, 158.179.17.233) is always-on, and its cron is
 #      healthy. (It already runs oci-instance-watch-melbourne.sh on the same
 #      box; if Melbourne itself dies, Sydney's oci-instance-watch.sh catches
 #      Melbourne — mutual peer monitoring. So neither box is its own witness.)

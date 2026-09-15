@@ -35,6 +35,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # mid-disaster. test-pg-dump-guard.sh asserts the symmetry.
 # shellcheck source=lib/pg-dump-guard.sh
 . "$SCRIPT_DIR/lib/pg-dump-guard.sh"
+# Container resolution — the SAME resolver backup.sh uses, for the same reason the
+# dump guard is shared. backup.sh was moved off hardcoded container names on
+# 2026-08-07 after they caused 40 nights of silent empty dumps; restore.sh was not,
+# and the repaired half and the unrepaired half of one pair sat side by side for a
+# month. The retired literals are named in the commit that removed them, not here:
+# spelling them out would put them back into every future grep for a live name.
+# shellcheck source=lib/resolve-container.sh
+. "$SCRIPT_DIR/lib/resolve-container.sh"
+# shellcheck source=lib/sqlite-dumper.sh
+. "$SCRIPT_DIR/lib/sqlite-dumper.sh"
 
 # Usage check + dispatch are deferred to the guarded tail so the test harness
 # can source this file (RESTORE_LIB_ONLY=1) without triggering the arg check.
@@ -92,13 +102,12 @@ _validate_pg_dump() {
 # still validate a SQLite candidate. Shared single door for _restore_island_core
 # and _validate_sqlite_db so both paths validate identically. Returns non-zero on
 # build failure so the caller can abort with live state intact.
+# Thin wrapper over lib/sqlite-dumper.sh so this script's callers keep their name
+# and get this script's `error` formatting. The RECIPE is not duplicated here: it
+# had drifted across five copies, and the copy this half carried was not the one
+# backup.sh needed, which is how a pruned image cost seven nights of backups.
 _ensure_sqlite_dumper() {
-  if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-    log "Building sqlite-dumper:latest (alpine + sqlite3)..."
-    printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-      | docker build -q -t sqlite-dumper:latest - >/dev/null \
-      || { error "failed to build sqlite-dumper:latest"; return 1; }
-  fi
+  ensure_sqlite_dumper || { error "failed to build sqlite-dumper:latest"; return 1; }
   return 0
 }
 
@@ -145,17 +154,49 @@ _validate_sqlite_db() {
 # good dump swaps in with the old DB preserved as rescue; a truncated dump fails the
 # temp load and the live DB is never touched.
 #
-# Args: <svc> <container> <pguser> <db> <composedir> <dumpfile>
+# Args: <svc> <pguser> <db> <dumpfile>
 # Requires the dump to have already passed _validate_pg_dump.
+#
+# The container and the compose directory are DERIVED, not passed. They used to be
+# two hand-fed constants, and both had rotted — killed by two separate renames a
+# quarter apart. Neither ever errored, because nothing runs restore on a good day,
+# so the first caller to notice would have been someone mid-recovery.
 _restore_pg_atomic() {
-  local svc="$1" container="$2" user="$3" db="$4" composedir="$5" dumpfile="$6"
-  local ts temp rescue
+  local svc="$1" user="$2" db="$3" dumpfile="$4"
+  local ts temp rescue container composedir
   ts=$(date +%Y%m%d_%H%M%S)
   temp="${db}_restore_${ts}"
   rescue="${db}_rescue_${ts}"
 
-  cd "$composedir" || { error "$svc: cannot cd $composedir"; return 1; }
-  docker compose up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  # ORDER MATTERS, and getting it wrong breaks exactly the case this code is for.
+  # The ANCHOR is resolved from `docker ps -a` (running OR stopped) because on a
+  # box being recovered the stack is DOWN -- a running-only lookup here would abort
+  # before `compose up` ever ran, turning the disaster-recovery path into a no-op.
+  # Only the exec phase below needs a RUNNING container, and it is resolved after
+  # the stack is started.
+  local anchor
+  if ! anchor=$(resolve_pg_container_any "$svc" 2>&1); then
+    error "$svc: postgres container not resolved: $anchor"
+    return 1
+  fi
+  if ! composedir=$(resolve_compose_workdir "$anchor" "$svc" 2>&1); then
+    error "$svc: compose dir not resolved: $composedir"
+    return 1
+  fi
+  log "$svc: resolved $anchor in $composedir"
+
+  # `--project-directory` instead of `cd`. The old code cd'd and never came back,
+  # leaving the CALLER's working directory changed -- harmless today only because
+  # every path this script uses is absolute, which is a property of the current
+  # callers and not a guarantee. Removing the side effect beats remembering it.
+  _dc() { docker compose --project-directory "$composedir" "$@"; }
+
+  _dc up -d postgres >/dev/null 2>&1 || { error "$svc: postgres failed to start"; return 1; }
+  # NOW require a running container -- after the stack has been started, not before.
+  if ! container=$(resolve_pg_container "$svc" 2>&1); then
+    error "$svc: postgres container not running after 'compose up -d postgres': $container"
+    return 1
+  fi
   for _ in $(seq 1 30); do docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 && break; sleep 1; done
   docker exec "$container" pg_isready -U "$user" >/dev/null 2>&1 || { error "$svc: postgres not ready after 30s"; return 1; }
 
@@ -196,14 +237,14 @@ _restore_pg_atomic() {
   # lie"). The critical path is the explicit `if !` checks, not set -e.
   _pgx() { docker exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d postgres -c "$1" >/dev/null 2>&1; }
   _unfence() { docker exec "$container" psql -U "$user" -d postgres -c "ALTER DATABASE \"$1\" WITH ALLOW_CONNECTIONS true;" >/dev/null 2>&1 || true; }
-  _apprestart() { docker compose up -d >/dev/null 2>&1 || true; }
+  _apprestart() { _dc up -d >/dev/null 2>&1 || true; }
 
   # 3. Stop the app so nothing holds a connection to the live DB (ALTER DATABASE
   #    RENAME needs zero connections), then bring ONLY postgres back for the swap.
   #    ASSERT readiness — a not-ready postgres must not proceed to fence/rename.
   log "$svc: stopping app for the atomic swap..."
-  docker compose stop >/dev/null 2>&1 || true
-  if ! docker compose up -d postgres >/dev/null 2>&1; then
+  _dc stop >/dev/null 2>&1 || true
+  if ! _dc up -d postgres >/dev/null 2>&1; then
     error "$svc: postgres failed to restart for the swap — live $db UNTOUCHED, temp $temp left. Bringing app back up."
     _apprestart; return 1
   fi
@@ -249,7 +290,7 @@ _restore_pg_atomic() {
   #    connections (a silent RC=0 false-success — Tesla). Keep the app STOPPED and
   #    error loudly (starting it against a fenced DB just crash-loops — Carnot r3).
   if ! _pgx "ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true;"; then
-    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose up -d'. Previous live kept as '$rescue'."
+    error "$svc: swap succeeded but FAILED to re-enable connections on live $db — app kept STOPPED to avoid crash-looping. Run: ALTER DATABASE \"$db\" WITH ALLOW_CONNECTIONS true; then 'docker compose --project-directory $composedir up -d'. Previous live kept as '$rescue'."
     return 1
   fi
   # Re-enable the rescue DB too so operators can inspect it without a manual ALTER
@@ -259,7 +300,7 @@ _restore_pg_atomic() {
   # Success — previous live kept as $rescue (drop it manually once satisfied). Check
   # the app restart: the data swap already succeeded, so a restart failure is a warn
   # (not a data-loss error), but don't print "complete" as if the service is up.
-  if docker compose up -d >/dev/null 2>&1; then
+  if _dc up -d >/dev/null 2>&1; then
     log "$svc: atomic swap complete. Previous live DB kept as '$rescue' (drop when satisfied). App restarted."
     return 0
   fi
@@ -284,7 +325,7 @@ restore_kanbn() {
   # dropped+recreated FIRST then loaded, so a dump that errored mid-replay left the
   # DB empty.
   _validate_pg_dump kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-  _restore_pg_atomic kanbn kanbn_postgres kanbn kanbn ~/apps/kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
+  _restore_pg_atomic kanbn kanbn kanbn "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Kan.bn restore complete!"
@@ -303,7 +344,7 @@ restore_outline() {
   fi
   # Validate + atomic temp-DB swap (see restore_kanbn / _restore_pg_atomic).
   _validate_pg_dump outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
-  _restore_pg_atomic outline outline_postgres outline outline ~/apps/outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
+  _restore_pg_atomic outline outline outline "$BACKUP_FILE" || { cleanup_backups; exit 1; }
 
   cleanup_backups
   log "Outline restore complete!"
@@ -332,11 +373,12 @@ restore_pm_bot() {
   # Target /app/data/bot.db — the path the app actually reads and that backup_pm_bot
   # copies FROM. The old kan-bot.db target was a stale pre-rename path, so restore
   # silently wrote a file the app ignores (a no-op restore).
-  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db
+  docker cp "$BACKUP_FILE" dreamfinder:/app/data/bot.db \
+    || { error "dreamfinder: could not copy the DB into the container — live bot.db untouched"; cleanup_backups; return 1; }
 
   log "Restarting Dreamfinder..."
-  cd ~/apps/dreamfinder
-  docker compose restart
+  docker compose --project-directory ~/apps/dreamfinder restart \
+    || { error "dreamfinder: restore wrote the DB but the restart failed — run 'docker compose --project-directory ~/apps/dreamfinder up -d'"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Dreamfinder restore complete!"
@@ -379,20 +421,22 @@ restore_radicale() {
 
   # Stop Radicale
   log "Stopping Radicale..."
-  cd ~/apps/radicale
-  docker compose stop radicale
+  docker compose --project-directory ~/apps/radicale stop radicale \
+    || { error "radicale: could not stop the container — collections untouched"; cleanup_backups; return 1; }
 
   # Restore collections into the volume. Content-validated above (readable tar with
   # real collections members), so the rm won't wipe live data with nothing to
   # restore. NOTE: the in-container extract itself is not yet atomic (a mid-extract
   # failure after the rm leaves a partial tree) — stage-to-temp-then-swap is Phase 2.
   log "Restoring collections..."
-  docker compose run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
-    -c "rm -rf /data/collections && tar xf /restore.tar -C /"
+  docker compose --project-directory ~/apps/radicale run --rm --entrypoint sh -v "$BACKUP_FILE:/restore.tar:ro" radicale \
+    -c "rm -rf /data/collections && tar xf /restore.tar -C /" \
+    || { error "radicale: the extract FAILED after the rm — collections may be MISSING OR PARTIAL in the volume, and the container is still stopped. Inspect the volume before restarting; the validated archive is still in $BACKUP_CLONE_DIR until cleanup."; cleanup_backups; return 1; }
 
   # Start Radicale
   log "Starting Radicale..."
-  docker compose up -d
+  docker compose --project-directory ~/apps/radicale up -d \
+    || { error "radicale: collections were restored but the container FAILED to start — data is in place, the service is down"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Radicale restore complete!"
@@ -430,12 +474,14 @@ restore_claudius() {
 
   # Restore state files into container
   log "Restoring state..."
-  docker cp "$BACKUP_FILE" claudius:/tmp/restore.tar
-  docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar"
+  docker cp "$BACKUP_FILE" claudius:/tmp/restore.tar \
+    || { error "claudius: could not copy the archive into the container — nothing was extracted"; cleanup_backups; return 1; }
+  docker exec claudius sh -c "tar xf /tmp/restore.tar -C / && rm /tmp/restore.tar" \
+    || { error "claudius: the extract FAILED — state may be PARTIAL in the container, and /tmp/restore.tar may remain. Inspect before restarting."; cleanup_backups; return 1; }
 
   log "Restarting Claudius..."
-  cd ~/apps/claudius
-  docker compose restart
+  docker compose --project-directory ~/apps/claudius restart \
+    || { error "claudius: restore extracted the archive but the restart failed — run 'docker compose --project-directory ~/apps/claudius up -d'"; cleanup_backups; return 1; }
 
   cleanup_backups
   log "Claudius restore complete!"
@@ -565,6 +611,14 @@ restore_aiko_island() {
 # the bridge's volume. Bridges must be stopped before the replay (writing
 # to a live DB while replaying would corrupt it). The continuwuity homeserver
 # is NOT backed up or restored (its signing key is saved separately — 2026-08-02).
+# The matrix stack's compose directory. Overridable, and ACTUALLY USED: this
+# constant already existed but was declared below restore_matrix, which hardcoded
+# ~/apps/matrix in both of its compose calls — so setting MATRIX_COMPOSE_DIR did
+# nothing for the bridge restore and everything for the continuwuity one. A knob
+# half the code ignores is worse than no knob: it reads as configurable.
+# Default is unchanged, so behaviour is identical unless the var is set.
+MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
+
 restore_matrix() {
   log "Restoring matrix bridges + relay-bots..."
 
@@ -576,7 +630,6 @@ restore_matrix() {
     "matrix-telegram:matrix_telegram_data:mautrix-telegram.db"
     "matrix-whatsapp:matrix_whatsapp_data:whatsapp.db"
     "matrix-relay:matrix_relay_data:relay.db"
-    "matrix-relay-hf:matrix_relay_hf_data:relay.db"
   )
 
   # Build the sqlite helper if absent — restore may run on a box where the backup
@@ -586,8 +639,12 @@ restore_matrix() {
 
   # Stop the matrix stack first so we don't write to live DBs.
   log "Stopping matrix stack..."
-  cd ~/apps/matrix || { error "cannot cd ~/apps/matrix"; cleanup_backups; return 1; }
-  docker compose stop
+  # Guarded, because removing the `cd` removed its error handling with it: the old
+  # line was `cd ~/apps/matrix || { error ...; cleanup_backups; return 1; }` and the
+  # bare replacement dies under `set -e` with no diagnostic and no cleanup, leaving
+  # the /tmp/restore clone behind. A DR path must not fail silently.
+  docker compose --project-directory "$MATRIX_COMPOSE_DIR" stop \
+    || { error "matrix: could not stop the stack (missing $MATRIX_COMPOSE_DIR, or compose refused) — nothing was written"; cleanup_backups; return 1; }
 
   local any_failed=0 skipped=0 skipped_names=""
   for entry in "${entries[@]}"; do
@@ -657,7 +714,11 @@ restore_matrix() {
   done
 
   log "Restarting matrix stack..."
-  docker compose up -d
+  # Guarded not only for the restart itself: an unguarded failure here exits before
+  # the any_failed/skipped summary below, which is the operator's only record of
+  # WHICH bridges restored and which were skipped.
+  docker compose --project-directory "$MATRIX_COMPOSE_DIR" up -d \
+    || { error "matrix: bridge DBs were processed but the stack FAILED to restart — see the per-bridge results above; run 'docker compose --project-directory $MATRIX_COMPOSE_DIR up -d' once the cause is fixed"; cleanup_backups; return 1; }
 
   cleanup_backups
   if [ "$any_failed" -eq 1 ]; then
@@ -671,9 +732,6 @@ restore_matrix() {
   log "Matrix restore complete!"
 }
 
-# Continuwuity restore constants. The image is the exact prod version so the
-# validate-boot exercises the real RocksDB (no ldb version-skew).
-MATRIX_COMPOSE_DIR="${MATRIX_COMPOSE_DIR:-$HOME/apps/matrix}"
 
 # When sourced by the test harness (RESTORE_LIB_ONLY=1), stop here: expose the
 # functions (_restore_island_core + the aiko_island_* lib) without running the

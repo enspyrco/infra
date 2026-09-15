@@ -118,38 +118,10 @@ rag-api.imagineering.cc {
     reverse_proxy localhost:8010
 }
 
-# --- xdeca (colocated on the same OCI instance) ---
-
-kb.xdeca.com {
-    reverse_proxy localhost:3002
-}
-
-wiki.xdeca.com {
-    redir https://kb.xdeca.com{uri} permanent
-}
-
-storage.xdeca.com {
-    reverse_proxy localhost:9000
-}
-
-tasks.xdeca.com {
-    reverse_proxy localhost:3003
-}
-
-dav.xdeca.com {
-    reverse_proxy localhost:5233
-}
-
 # --- Call on Clare (colocated on OCI) ---
 
 n8n.callonclare.com.au {
     reverse_proxy localhost:5678
-}
-
-# --- Gremlin (Telegram bot webhook) ---
-
-gremlin.xdeca.com {
-    reverse_proxy localhost:8080
 }
 
 # --- Symposium (historical debate system) ---
@@ -161,7 +133,39 @@ symposium.imagineering.cc {
 # --- notify (Telegram notify proxy for remote agents) ---
 
 notify.imagineering.cc {
-    reverse_proxy localhost:8090
+    # SURFACE RESTRICTION. notify exposes exactly two endpoints; everything else
+    # reaching this vhost is a scanner. Measured 2026-09-10: 1,960 probing 404s
+    # in 7 days (~280/day) for /.env, /credentials.json, /gcp-key.json,
+    # /firebase-adminsdk.json, /.config/gcloud/application_default_credentials.json
+    # and friends. The service holds THREE Telegram bot tokens plus NOTIFY_API_KEY,
+    # so the cost of a future path bug here is not "an error page".
+    #
+    # This narrows the surface; it does not remove it. The endpoint is still
+    # internet-facing because enspyr-melb calls it cross-box (it has never yet
+    # fired -- 0 sends -- because its checks have always been healthy, which is
+    # exactly why removing the route without giving melb a private path first
+    # would break the cross-box alarm silently, at the only moment it matters).
+    # Tailscale on melb is the real fix and is NOT installed there yet.
+    #
+    # `abort` rather than `respond 404`: a closed connection returns nothing a
+    # scanner can index or fingerprint, and costs no response body.
+    @api {
+        method POST
+        path /send
+    }
+    @health {
+        method GET
+        path /health
+    }
+    handle @api {
+        reverse_proxy localhost:8090
+    }
+    handle @health {
+        reverse_proxy localhost:8090
+    }
+    handle {
+        abort
+    }
 }
 
 # --- familiars (agent control surface) ---

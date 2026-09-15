@@ -33,8 +33,22 @@ resolve_container() {
     echo "resolve-container: a name pattern is required" >&2
     return 1
   fi
-  matches=$(docker ps --format '{{.Names}}' | grep -E "$pattern" || true)
-  count=$(printf '%s' "$matches" | grep -c .)
+  # Two failures were collapsed into one message: `docker ps ... | grep || true`
+  # reports "no running container matches" both when nothing matches AND when the
+  # DAEMON IS UNREACHABLE (docker ps exits 1; measured). Both fail closed, so this
+  # was never a fail-open -- but during a disaster recovery "no container matches"
+  # sends the operator hunting for a renamed container when the real answer is that
+  # dockerd is down. Split them: `|| true` now covers only grep's no-match exit.
+  local ps_out
+  if ! ps_out=$(docker ps --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps' failed for $label -- is the Docker daemon running?" >&2
+    return 1
+  fi
+  matches=$(printf '%s\n' "$ps_out" | grep -E "$pattern" || true)
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
   if [ "$count" -eq 0 ]; then
     echo "resolve-container: no running container matches /$pattern/ for $label" >&2
     return 1
@@ -70,11 +84,21 @@ resolve_container_by_compose() {
     echo "resolve-container: both a compose project and service are required" >&2
     return 1
   fi
-  matches=$(docker ps \
+  # Last site in the class: a bare `|| true` here reported "no running container for
+  # compose project X" when dockerd was simply down. Every docker call in this file
+  # now distinguishes a daemon failure from an empty result -- swept as a class after
+  # a reviewer named the third instance, rather than patched one per round.
+  if ! matches=$(docker ps \
     --filter "label=com.docker.compose.project=$project" \
     --filter "label=com.docker.compose.service=$service" \
-    --format '{{.Names}}' || true)
-  count=$(printf '%s' "$matches" | grep -c .)
+    --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps' failed for compose project '$project' ($label) -- is the Docker daemon running?" >&2
+    return 1
+  fi
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
   # Fail closed on both edges, same as resolve_container: zero matches must
   # never degrade to "back up nothing and report success", and an ambiguous
   # match must never be resolved by picking arbitrarily between tenants.
@@ -87,4 +111,170 @@ resolve_container_by_compose() {
     return 1
   fi
   printf '%s\n' "$matches"
+}
+
+# Print the single running Postgres container for one of this box's app stacks,
+# and (via resolve_compose_workdir below) the compose dir that drives it.
+#
+# WHY A THIRD FUNCTION: the two above fixed backup.sh in 2026-08-07 and
+# restore.sh was left holding the original hardcoded names — the same strings whose
+# staleness caused the 40 silent empty backups this file's header describes. One half of a backup/restore pair
+# was repaired and the other was not, so the same defect stayed live on the
+# side nobody exercises. A single definition both halves call cannot drift that
+# way again; two correct copies can.
+#
+# Usage:
+#   cid=$(resolve_pg_container outline) || return 1
+# The one place the postgres container name pattern is written. Both resolvers below
+# call this. THIS FILE EXISTS because two correct copies of a name drifted apart and
+# the unexercised half was the disaster path -- and it had grown two copies of its
+# own ERE, one against `docker ps` and one against `docker ps -a`, so the next prefix
+# change would have retuned backup's resolver and left the dead-box anchor on the old
+# note. Same defect, one level in. (Tesla, cage-match round 2/3.)
+#
+# Both historical prefixes, because the deployed app dirs say `imagineering-` and this
+# repo's compose files say `img-`. Anchored so `-postgres` cannot also match a future
+# `-postgres-replica`.
+_pg_container_pattern() {
+  printf '^(imagineering|img)-%s-postgres$' "${1:-}"
+}
+
+# Pick the authoritative match from a candidate list, or REFUSE.
+#
+# A COUNT OF ONE IS NOT PROOF OF OWNERSHIP. The pattern above spans two prefixes for
+# historical reasons, so if the deployed `imagineering-` container were removed and a
+# stale `img-` one remained, the lone match would be the ghost — and because the
+# anchor resolver reads `docker ps -a`, a STOPPED ghost counts. Its compose
+# working_dir label would then be read and a restore would replay live data into the
+# wrong stack, logging a successful swap. Tesla and Carnot found this independently
+# (cage-match #182 and #184); it is the reason the count-based guard alone was not
+# enough.
+#
+# So the deployed prefix is authoritative and the legacy one is never SILENTLY
+# accepted: an `imagineering-` match wins, and a bare `img-` match is refused by name
+# with instructions. Measured 2026-09-11: no `img-*-postgres` exists on the box in
+# any state, so this removes a failure mode rather than changing today's behaviour.
+# Full namespace reconciliation is claude-tasks#4288.
+#
+# Returns 0 and prints the name, or 1 having explained the refusal, or 2 for "no
+# candidate at all" so the caller can emit its own not-found message.
+_pg_select_match() {
+  local svc=${1:-} label=${2:-$1} matches=${3:-} primary legacy
+  primary=$(printf '%s\n' "$matches" | grep -E "^imagineering-${svc}-postgres\$" || true)
+  legacy=$(printf '%s\n' "$matches" | grep -E "^img-${svc}-postgres\$" || true)
+  if [ -n "$primary" ]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+  if [ -n "$legacy" ]; then
+    echo "resolve-container: the only $svc postgres found is '$legacy', which uses the LEGACY img- prefix, not the deployed imagineering- one ($label). Refusing: a lone legacy match is not proof of ownership, and acting on it could read or write the wrong tenant's data. If that container really is the live $svc database, rename it to imagineering-${svc}-postgres or reconcile the stack (claude-tasks#4288)." >&2
+    return 1
+  fi
+  return 2
+}
+
+resolve_pg_container() {
+  local svc=${1:-}
+  if [ -z "$svc" ]; then
+    echo "resolve-container: a service name is required (outline|kanbn)" >&2
+    return 1
+  fi
+  # Resolve through the shared pattern, then apply the SAME authoritative-prefix
+  # rule as the anchor resolver. Both halves of the backup/restore pair must agree
+  # on which container they mean -- that disagreement is the defect this file exists
+  # to prevent, and leaving the rule on one side only would recreate it.
+  local match
+  match=$(resolve_container "$(_pg_container_pattern "$svc")" "$svc") || return 1
+  _pg_select_match "$svc" "$svc" "$match"
+  case $? in
+    0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Print the single container for an app stack's Postgres WHETHER OR NOT IT IS RUNNING.
+#
+# WHY THIS EXISTS -- it breaks a circular dependency that the running-only resolver
+# creates on the one path that matters:
+#
+#     to start the stack   you need the compose directory
+#     to get the directory you need a container to read the label off
+#     to get a container   `docker ps` requires it to be ALREADY RUNNING
+#
+# A restore on a box whose stack is DOWN is not an edge case, it is the disaster
+# recovery case. Resolving the directory anchor from `docker ps -a` breaks the cycle
+# at the only link that does not actually need to be tight: `docker inspect` reads
+# labels off a stopped container perfectly well (verified), and only the later
+# `docker exec` phase needs a running one -- by which point `compose up` has run.
+#
+# Still fails closed on 0 or >1, same as the running-only resolver: an ambiguous
+# match must never be resolved by picking between tenants.
+#
+# Honest limit: if the container has been REMOVED entirely (`docker compose down`),
+# there is no label anywhere on the box to read and this returns 1. Nothing records
+# the directory at that point, so the error says so rather than an override env var
+# being added -- that would reintroduce the hand-fed constant this file exists to
+# delete, for a case where the operator is rebuilding from the repo and already has
+# the path in hand.
+resolve_pg_container_any() {
+  local svc=${1:-} label=${2:-${1:-container}} ps_out matches count
+  if [ -z "$svc" ]; then
+    echo "resolve-container: a service name is required (outline|kanbn)" >&2
+    return 1
+  fi
+  if ! ps_out=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+    echo "resolve-container: 'docker ps -a' failed for $label -- is the Docker daemon running?" >&2
+    return 1
+  fi
+  matches=$(printf '%s\n' "$ps_out" | grep -E "$(_pg_container_pattern "$svc")" || true)
+  # `|| true`: grep -c EXITS 1 on zero matches. Callers wrap these resolvers in
+  # `if !`, which suspends set -e -- but a future bare `cid=$(resolve_pg_container x)`
+  # under set -e would die here, before the fail-closed diagnostic below could print.
+  count=$(printf '%s' "$matches" | grep -c . || true)
+  if [ "$count" -gt 1 ]; then
+    echo "resolve-container: >1 container matches ${svc}-postgres for $label ($(printf '%s' "$matches" | tr '\n' ' ')) -- refusing to guess" >&2
+    return 1
+  fi
+  # Count alone is not enough -- see _pg_select_match. A lone LEGACY-prefix match is
+  # refused there rather than accepted as identity.
+  _pg_select_match "$svc" "$label" "$matches"
+  case $? in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  echo "resolve-container: no container (running or stopped) matches ${svc}-postgres for $label -- if the stack was removed with 'docker compose down', no label records its directory; bring it up once, or run the restore from the stack's directory" >&2
+  return 1
+}
+
+# Print the compose working directory that owns $1 (a container name), read from
+# the label docker compose itself writes. The caller needs a dir to `cd` into for
+# `docker compose up -d postgres`, and a hardcoded one is the same hand-fed
+# constant this file exists to delete: restore.sh's were stale for nearly three
+# months after a 2026-06-26 rename, naming directories that no longer existed.
+#
+# Fails closed on an empty label or a dir that is not there, so a restore aborts
+# before the swap rather than cd-ing nowhere and running compose against $PWD.
+resolve_compose_workdir() {
+  local container=${1:-} label=${2:-$1} dir
+  if [ -z "$container" ]; then
+    echo "resolve-container: a container name is required" >&2
+    return 1
+  fi
+  # Split the daemon failure from the absent label, same as resolve_container: a
+  # bare `|| true` reported "no working_dir label" when dockerd was simply down,
+  # which names the wrong absence at the worst possible moment.
+  if ! dir=$(docker inspect "$container" \
+    --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null); then
+    echo "resolve-container: 'docker inspect $container' failed ($label) -- is the Docker daemon running, or was the container removed?" >&2
+    return 1
+  fi
+  if [ -z "$dir" ]; then
+    echo "resolve-container: container '$container' carries no compose working_dir label ($label) -- it was not created by docker compose" >&2
+    return 1
+  fi
+  if [ ! -d "$dir" ]; then
+    echo "resolve-container: compose working_dir '$dir' for '$container' does not exist ($label)" >&2
+    return 1
+  fi
+  printf '%s\n' "$dir"
 }

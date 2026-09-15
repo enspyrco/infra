@@ -180,10 +180,20 @@ export async function pingIfNoteworthy(verdict, nowMs = Date.now()) {
  * green-auto lifecycle pings (PR opened / failed) where there is no verdict —
  * `pingIfNoteworthy` delegates its actual POST here too. Respects HEALER_NO_PING.
  * @param {string} message  may contain attacker-influenceable diagnosis text → scrubbed
- * @param {{parseMode?: string}} [opts]
+ * @param {{parseMode?: string, bot?: string}} [opts]
  * @returns {Promise<{sent: boolean, reason?: string}>}
  */
-export async function sendNotify(message, { parseMode = 'HTML' } = {}) {
+// Which notify bot identity these alerts speak as. notify's OWN default is
+// "dreams", so a payload that omits `bot` lands in the Claude Dreams bot — which
+// is where every self-healer verdict went until 2026-09-10. The shell fleet
+// (scripts/lib/telegram.sh, watchers/lib/watcher-base.sh) already passes "infra"
+// explicitly; the self-healer is Node and talks to notify directly, so it never
+// inherited either fix. Default here rather than at the call sites: there are
+// several senders (verdicts, lifecycle pings) and an omission at any one of them
+// silently reverts to the wrong voice.
+const DEFAULT_BOT = 'infra';
+
+export async function sendNotify(message, { parseMode = 'HTML', bot = DEFAULT_BOT } = {}) {
   if (process.env.HEALER_NO_PING === '1') return { sent: false, reason: 'disabled via HEALER_NO_PING' };
   const apiKey = process.env.NOTIFY_API_KEY;
   if (!apiKey) return { sent: false, reason: 'no NOTIFY_API_KEY configured' };
@@ -192,7 +202,7 @@ export async function sendNotify(message, { parseMode = 'HTML' } = {}) {
   const res = await fetch(resolveNotifyUrl(), {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ message: safe, parse_mode: parseMode }),
+    body: JSON.stringify({ message: safe, parse_mode: parseMode, bot }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {

@@ -13,7 +13,11 @@
 # Phase B: all back to expected counts → ✅, self-disable.
 #
 # Expected (probed 2026-05-02):
-#   NICK_MEL  → 1 (nick-mel) — Nick's Melbourne instance
+#   NICK_MEL  → 1 (instance `enspyr`, renamed from `nick-mel` 2026-09-05)
+#
+# NOTE: `NICK_MEL` here is an OCI CLI *profile* name keyed to a tenancy OCID
+# (see the PROFILES entry below), NOT a hostname. The box was renamed; the
+# profile was not, and must not be — they only ever looked alike.
 #
 # Initially monitored 3 tenancies (ROBIN, NICK_MEL, CANDEIRA) — those
 # happened to be the OCI profiles on the Sydney box. But ROBIN is Robin
@@ -23,7 +27,7 @@
 #
 # This watcher cannot watch Sydney itself (it runs ON Sydney — chicken
 # and egg). Sydney is watched from outside by oci-instance-watch-
-# melbourne.sh, which runs on nick-mel via a SYDNEY profile keyed
+# melbourne.sh, which runs on `enspyr` via a SYDNEY profile keyed
 # against Nick's user in Sydney's tenancy (gaylejewson@gmail.com,
 # created 2026-03-18). Set up 2026-05-03.
 #

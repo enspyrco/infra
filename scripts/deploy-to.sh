@@ -320,6 +320,111 @@ deploy_scripts() {
         sudo chmod 0644 /etc/cron.d/health-check && sudo chown root:root /etc/cron.d/health-check"
     echo "Health check cron installed (hourly)"
 
+    # --- Backup-freshness watcher ---
+    # Installed HERE, from the repo, rather than hand-added to a crontab. The
+    # previous backup watcher existed in the repo for months and never ran once —
+    # no cron entry, no state file, no log, on either box account — because
+    # scheduling it was a manual step nobody performed. A safety check whose
+    # installation depends on someone remembering is not installed.
+    #
+    # MAILTO="" and the explicit PATH for the same reason as health-check above;
+    # 08:00 is four hours after the 04:00 backup window so a slow run is not read
+    # as a failed one.
+    # --- Watcher alerting precondition: assert BEFORE scheduling anything ---
+    # A scheduled watcher that cannot reach notify is WORSE than no watcher: tg()
+    # logs "NOTIFY_URL/NOTIFY_API_KEY not set; skipping" and RETURNS 0, so the run
+    # succeeds, the log looks calm, and the alarm never rings. Measured 2026-09-12:
+    # backup-recency-watch was scheduled as `nick` on 2026-09-11 and spent its
+    # first day mute, because the credential watcher-base reads is per-USER
+    # ($HOME/.config/imagineering/notify-credentials) and only `ubuntu` had it.
+    # Nothing failed. Its first real run reported failing=[none] and stayed quiet,
+    # which is indistinguishable from a watcher that cannot speak.
+    #
+    # The block below already installs /etc/imagineering-secrets/notify.env from
+    # SOPS, but that file carries only NOTIFY_API_KEY — watcher-base needs
+    # NOTIFY_URL too, so it is necessary and not sufficient. Unifying the two
+    # credential paths is claude-tasks#4363; until then this ASSERTS rather than
+    # provisions, and fails the deploy rather than shipping a silent mute.
+    echo "Asserting the watcher user can actually alert..."
+    if ! ssh "$REMOTE" "sudo -u nick bash -c '
+            C=\$HOME/.config/imagineering/notify-credentials
+            [ -r \"\$C\" ] || exit 3
+            set -a; . \"\$C\"; set +a
+            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
+        '"; then
+        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
+        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
+        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
+        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
+        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
+        return 1
+    fi
+    echo "  Watcher alerting precondition OK"
+
+    # install_watcher_cron <name> <5-field schedule>
+    # One helper rather than a fifth hand-copied block. The log target is the SAME
+    # file watcher-base writes ($HOME/<name>.log), not a separate ~/logs/ path:
+    # redirecting elsewhere produced a permanently-0-byte "declared" log next to
+    # the real one, and an operator reading the path the schedule names saw an
+    # empty file and could not tell "quiet" from "never ran" (claude-tasks#4362).
+    # Stray stderr now interleaves into the log a human actually reads.
+    install_watcher_cron() {
+        local name=$1 schedule=$2
+        echo "Installing /etc/cron.d/$name..."
+        ssh "$REMOTE" "printf '%s\n' \
+            'SHELL=/bin/bash' \
+            'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+            'MAILTO=\"\"' \
+            '$schedule nick /opt/scripts/watchers/$name.sh >> /home/nick/$name.log 2>&1' \
+            | sudo tee /etc/cron.d/$name > /dev/null && \
+            sudo chmod 0644 /etc/cron.d/$name && sudo chown root:root /etc/cron.d/$name"
+    }
+
+    # Through the same helper as the others, which also finishes claude-tasks#4362
+    # for THIS entry: it was still redirecting to ~/logs/backup-recency-watch.log
+    # while watcher-base writes ~/backup-recency-watch.log, so the declared log was
+    # the permanently-empty one. The previous commit fixed the four new entries and
+    # left this one split, which made its own PR description half-true.
+    install_watcher_cron backup-recency-watch '0 8 * * *'
+    echo "Backup-freshness watcher cron installed (08:00 daily)"
+
+    # --- The four watchers that were still running from /home/ubuntu ---
+    # Scheduled here, from the repo, for the same reason as the block above. Until
+    # now these ran out of an ubuntu crontab against /home/ubuntu copies that the
+    # repo could not reach: measured 2026-09-12, the RUNNING email-health-watch was
+    # dated 2026-06-21 and the running oci-instance-watch 2026-05-02, while deploy
+    # kept shipping current versions to /opt/scripts/watchers/ where nothing ran
+    # them. 61 and 14 lines of divergence respectively — including the whole of
+    # claude-tasks#1062 (per-record DKIM/DMARC naming), written, deployed and never
+    # once executed.
+    #
+    # Schedules preserved exactly as they were in the ubuntu crontab, so this is a
+    # change of RUN PATH and USER only, not of cadence.
+    install_watcher_cron disk-usage-watch   '*/30 * * * *'
+    install_watcher_cron cert-expiry-watch  '17 */6 * * *'
+    install_watcher_cron email-health-watch '23 */4 * * *'
+    echo "Three migrated watcher crons installed (disk-usage, cert-expiry, email-health)"
+
+    # oci-instance-watch is deliberately NOT here, and was rolled back on
+    # 2026-09-12 after the migration deployed. It queries OCI through the CLI,
+    # whose config is PER-USER (~/.oci/config). `ubuntu` has one; `nick` does not.
+    # Run as nick it still exits 0 and still writes a log — it just reports a
+    # question mark where the answer goes:
+    #
+    #     as nick    phase_a: NICK_MEL:?:1     <- the query failed
+    #     as ubuntu  phase_a: NICK_MEL:1:1     <- works
+    #
+    # (the format is <profile>:<actual>:<expected>). So the migration would have
+    # left a watcher that runs, succeeds, logs, and cannot see the thing it
+    # watches — the same failure shape as the mute watcher the assert above now
+    # prevents, through a different credential. The alerting precondition does not
+    # catch it, because alerting was never the broken part.
+    #
+    # It stays on the ubuntu crontab until claude-tasks#4364 settles whether the
+    # OCI credential moves, is shared, or the watcher keeps its own user.
+    echo "NOTE: the /home/ubuntu copies + ubuntu crontab lines must be removed once verified —"
+    echo "      two live copies of a watcher is the drift this migration exists to end."
+
     echo "Scripts deployed to /opt/scripts/"
 }
 
@@ -745,11 +850,19 @@ SSHEOF'
 
     # --- Build sqlite-dumper image for backup_matrix / restore_matrix ---
     # Pre-installs sqlite in alpine so the per-bridge `apk add` overhead
-    # (~5s × 6 bridges = ~30s) is avoided on every nightly run.
+    # (~5s x 6 bridges = ~30s) is avoided on every nightly run.
     # Local-only image; no registry push needed.
+    #
+    # Built through lib/sqlite-dumper.sh rather than a Dockerfile of its own. That
+    # Dockerfile was the FIFTH copy of this recipe and the one that had drifted —
+    # it said alpine:latest while the other four said alpine:3.20, so the image
+    # deploy produced was not the image every other caller described. The lib is
+    # scp'd rather than read from /opt/scripts so this does not depend on the
+    # `scripts` target having been deployed first.
     echo "Building sqlite-dumper image on $REMOTE..."
-    scp -q -r "$REPO_ROOT/scripts/sqlite-dumper" "$REMOTE":/tmp/sqlite-dumper
-    ssh "$REMOTE" "docker build -q -t sqlite-dumper:latest /tmp/sqlite-dumper && rm -rf /tmp/sqlite-dumper" | tail -1
+    scp -q "$REPO_ROOT/scripts/lib/sqlite-dumper.sh" "$REMOTE":/tmp/sqlite-dumper.sh
+    ssh "$REMOTE" ". /tmp/sqlite-dumper.sh && ensure_sqlite_dumper; rc=\$?; rm -f /tmp/sqlite-dumper.sh; exit \$rc" \
+      || { echo "ERROR: could not build sqlite-dumper on $REMOTE — the nightly SQLite backups (aiko-island, matrix bridges) will fail" >&2; return 1; }
 
     # --- Install matrix admin secrets (admin token + age recipient) ---
     # Source-of-truth is matrix/secrets.yaml (SOPS-encrypted). We decrypt
@@ -843,6 +956,25 @@ SSHEOF'
 }
 
 deploy_outline() {
+    # REFUSE — outline/ is NOT the production deploy path.
+    # Prod runs a hand-managed tenant stack: ~/apps/imagineering-outline
+    # (outline.imagineering.cc). It used to be two — ~/apps/xdeca-outline was the
+    # other — but xdeca was decommissioned 2026-09-02, so deploying here now adds a
+    # SECOND conflicting stack, not a third.
+    # ~/apps/outline does not exist on the box, and outline/docker-compose.yml still
+    # declares container_name: img-outline, so deploying here would stand up a SECOND,
+    # CONFLICTING stack alongside the live tenant. The header comment in that
+    # compose file says so — a comment is not an invariant, so this is one.
+    # Reconciling the file with the tenant stacks is a tracked backlog item;
+    # until then, override deliberately with OUTLINE_DEPLOY_OVERRIDE=1.
+    if [ "${OUTLINE_DEPLOY_OVERRIDE:-0}" != "1" ]; then
+        echo "REFUSING: outline/ is not the production deploy path." >&2
+        echo "  Live: ~/apps/imagineering-outline (outline.imagineering.cc)" >&2
+        echo "  Deploying this would create a second, conflicting img-outline stack." >&2
+        echo "  See the header in outline/docker-compose.yml. Override: OUTLINE_DEPLOY_OVERRIDE=1" >&2
+        return 1
+    fi
+
     echo "Deploying Outline Wiki..."
 
     local OUTLINE_SECRETS="$REPO_ROOT/outline/secrets.yaml"
@@ -898,12 +1030,32 @@ deploy_outline() {
     # Start Outline
     ssh "$REMOTE" "cd ~/apps/outline && docker compose pull && docker compose up -d"
 
-    echo "Outline deployed!"
-    echo "  URL: https://outline.imagineering.cc"
+    echo "img-outline stack deployed (OVERRIDE)."
+    echo "  This is NOT the live tenant: outline.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-outline, a different directory."
+    echo "  This is NOT a sandbox either — it just rsynced and started a"
+    echo "  conflicting stack on the SAME host, contending for ports and names."
     echo "  Note: First user to sign in becomes admin"
 }
 
 deploy_kanbn() {
+    # REFUSE — kanbn/ is NOT the production deploy path.
+    # Prod runs hand-managed tenant stack(s): ~/apps/imagineering-kanbn (kan.imagineering.cc).
+    # ~/apps/kanbn does not exist on the box, and kanbn/docker-compose.yml still
+    # declares container_name: img-kanbn, so deploying here would stand up a
+    # SECOND, CONFLICTING stack alongside the single live tenant. (Outline has two
+    # tenants and so would gain a third; Kan.bn has one. Counted, not copy-pasted.) The header comment in that
+    # compose file says so — a comment is not an invariant, so this is one.
+    # Reconciling the file with the tenant stacks is a tracked backlog item;
+    # until then, override deliberately with KANBN_DEPLOY_OVERRIDE=1.
+    if [ "${KANBN_DEPLOY_OVERRIDE:-0}" != "1" ]; then
+        echo "REFUSING: kanbn/ is not the production deploy path." >&2
+        echo "  Live: ~/apps/imagineering-kanbn (kan.imagineering.cc)" >&2
+        echo "  Deploying this would create a second, conflicting img-kanbn stack." >&2
+        echo "  See the header in kanbn/docker-compose.yml. Override: KANBN_DEPLOY_OVERRIDE=1" >&2
+        return 1
+    fi
+
     echo "Deploying Kan.bn..."
 
     local KANBN_SECRETS="$REPO_ROOT/kanbn/secrets.yaml"
@@ -952,8 +1104,11 @@ deploy_kanbn() {
     # Pull image from ghcr.io and start
     ssh "$REMOTE" "cd ~/apps/kanbn && docker compose pull && docker compose up -d"
 
-    echo "Kan.bn deployed!"
-    echo "  URL: https://kan.imagineering.cc"
+    echo "img-kanbn stack deployed (OVERRIDE)."
+    echo "  This is NOT the live tenant: kan.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-kanbn, a different directory."
+    echo "  This is NOT a sandbox either — it just rsynced and started a"
+    echo "  conflicting stack on the SAME host, contending for ports and names."
     echo "  Note: First user to sign up becomes admin"
 }
 
@@ -1334,10 +1489,6 @@ deploy_matrix() {
         printf 'HUB_ROOM_ID=%s\n'          "$(dotenv_quote "$(matrix_field '.hub_room_id')")"
         printf 'RELAY_DOUBLE_PUPPETS=%s\n' "$(dotenv_quote "$(matrix_field '.relay_double_puppets')")"
         printf 'RELAY_LOG_LEVEL=%s\n'      "$(dotenv_quote "$(matrix_field '.relay_log_level')")"
-        printf 'HF_RELAY_AS_TOKEN=%s\n'    "$(dotenv_quote "$(matrix_field '.hf_relay_as_token')")"
-        printf 'HF_RELAY_HS_TOKEN=%s\n'    "$(dotenv_quote "$(matrix_field '.hf_relay_hs_token')")"
-        printf 'HF_PORTAL_ROOMS=%s\n'      "$(dotenv_quote "$(matrix_field '.hf_portal_rooms')")"
-        printf 'HF_HUB_ROOM_ID=%s\n'       "$(dotenv_quote "$(matrix_field '.hf_hub_room_id')")"
     } > "$REPO_ROOT/matrix/.env"
 
     # Deploy files.
@@ -1375,9 +1526,9 @@ deploy_matrix() {
     #   so compose tries to PULL that locally-built image from a registry and
     #   fails ("authorization failed"); without the flag that aborts the whole
     #   chain. The image is produced by the build step below, not a registry.
-    # build --pull: must build EVERY `build:` service, not just the relay bots --
+    # build --pull: must build EVERY `build:` service, not just the relay bot --
     #   aiko-registrar builds `./aiko-chat-bridge` -> aiko-bridge:latest, which
-    #   aiko-chat/aiko-bridge consume. Naming only relay-bot/relay-bot-hf meant
+    #   aiko-chat/aiko-bridge consume. Naming only the relay bot meant
     #   `up -d` reused the stale pre-existing aiko-bridge:latest and silently
     #   skipped the renamed build context. Mirrors the other deploys (deploy_pm_bot).
     # up -d: recreates any container whose image changed.

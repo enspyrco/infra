@@ -1,6 +1,7 @@
 services:
   continuwuity:
-    image: forgejo.ellis.link/continuwuation/continuwuity:latest
+    # v0.5.10-1 (was :latest); multi-arch manifest list
+    image: forgejo.ellis.link/continuwuation/continuwuity@sha256:81ea00ad377999586e2a2c4d18c485fb6582bb37d7b345081f49e48b8f5d17d9
     restart: always
     ports:
       - "8008:6167"   # Client API
@@ -34,7 +35,20 @@ services:
         hard: 1048567
 
   mautrix-telegram:
-    image: dock.mau.dev/mautrix/telegram:latest
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
+    image: ghcr.io/enspyrco/mautrix-telegram@sha256:0a8e6fddc0864b95bc02b0219ce5a3f18420a10bb6088d4aef9122d7554e2771  # upstream build 2026-06-17
     restart: always
     volumes:
       - telegram_data:/data
@@ -42,7 +56,20 @@ services:
       - continuwuity
 
   mautrix-discord:
-    image: dock.mau.dev/mautrix/discord:latest
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
+    image: ghcr.io/enspyrco/mautrix-discord@sha256:9d9f9b5fa9da307bf66a362c8929a7073404440e5564a3c7f889bf2d7ffd25dc  # upstream build 2026-05-12
     restart: always
     volumes:
       - discord_data:/data
@@ -50,7 +77,22 @@ services:
       - continuwuity
 
   mautrix-signal:
-    image: dock.mau.dev/mautrix/signal:latest
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # NOTE, and this differs from its three siblings: signal's upstream digest was
+    # STILL SERVED. It is mirrored not because it was already lost, but because it sat
+    # on a registry that had dropped three of four — one GC pulse from their position.
+    # The siblings' pins WERE unserved and fail-unrecoverable; this one was not.
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
+    image: ghcr.io/enspyrco/mautrix-signal@sha256:385668cbd80742fde6f0de51b5eb063e492fdfd8a1d6740143a166a5f2689bf9  # upstream build 2026-06-16
     restart: always
     volumes:
       - signal_data:/data
@@ -58,7 +100,20 @@ services:
       - continuwuity
 
   mautrix-whatsapp:
-    image: dock.mau.dev/mautrix/whatsapp:latest
+    # Our own GHCR mirror of the upstream dock.mau.dev image, pinned by digest.
+    # Replaces a pin to an upstream digest the registry no longer served, which was
+    # FAIL-UNRECOVERABLE (it held only while the local layer survived).
+    # Verified against the running container two independent ways: same-daemon image-ID
+    # comparison on the box, AND pulled from the registry on a machine with NO local
+    # cache where the layer DiffID sets matched exactly. (DiffID equality is a strong
+    # content check, not a whole-object identity proof — the image-ID comparison is the
+    # identity half. Both were done; a bogus-tag control confirmed the check can fail.)
+    # SINGLE-PLATFORM linux/arm64, NOT a multi-arch index — pushed from this aarch64
+    # box, so it is precise for this host and unusable on x86_64. The upstream images
+    # it replaces WERE indexes; that property was deliberately traded, not lost.
+    # Package is PRIVATE: a host needs `docker login ghcr.io` before its first pull.
+    # Recovery paths, limits, and what `docker load` does NOT restore: matrix/DR-RESTORE.md
+    image: ghcr.io/enspyrco/mautrix-whatsapp@sha256:197f9c345f36337fdf80302a7315ffa72a248f277bd21efd051f8d50f960928e  # upstream build 2026-06-18
     restart: always
     volumes:
       - whatsapp_data:/data
@@ -83,32 +138,23 @@ services:
     depends_on:
       - continuwuity
 
-  relay-bot-hf:
-    build: ./relay
-    restart: always
-    environment:
-      RELAY_HOMESERVER_URL: http://continuwuity:6167
-      RELAY_DOMAIN: ${MATRIX_SERVER_NAME}
-      RELAY_AS_TOKEN: ${HF_RELAY_AS_TOKEN}
-      RELAY_HS_TOKEN: ${HF_RELAY_HS_TOKEN}
-      RELAY_PORTAL_ROOMS: ${HF_PORTAL_ROOMS:-}
-      RELAY_HUB_ROOM_ID: ${HF_HUB_ROOM_ID}
-      RELAY_BOT_LOCALPART: relay-bot-hf
-      RELAY_PUPPET_PREFIX: _relayhf_
-      RELAY_DB_PATH: /data/relay.db
-      RELAY_LOG_LEVEL: ${RELAY_LOG_LEVEL:-INFO}
-      RELAY_DOUBLE_PUPPETS: ""
-    volumes:
-      - relay_hf_data:/data
-    depends_on:
-      - continuwuity
-
   # --- aiko-bridge: Matrix <-> aiko_chat (Aiko Services / MQTT) -------------
   # Source is the matrix/aiko-chat-bridge submodule (github.com/nickmeinhold/aiko-chat-bridge).
   # Config + registration + db live server-side in ./aiko-bridge-data (gitignored),
   # generated/registered once per the bridge README (like the other mautrix bridges).
   aiko-mosquitto:
-    image: eclipse-mosquitto:2
+    # Pinned to the digest THIS STACK IS ACTUALLY RUNNING, not to `:2`.
+    # `:2` has already moved under us and this is the live proof, not a worry:
+    #   running here          eclipse-mosquitto@sha256:a908c65c…  built 2026-04-15
+    #   what `:2` resolves to eclipse-mosquitto@sha256:6f8d8a94…  built 2026-06-22
+    # Both are app version 2.1.2 — a base-image rebuild, not a mosquitto upgrade —
+    # so the jump is low-stakes. But deploy_matrix runs `docker compose pull`, so on
+    # `:2` the next deploy would have silently recreated this container on the June
+    # image. That is the exact class this file exists to close.
+    # The running image is UNTAGGED locally (no tag points at it), which is why it
+    # looked unpinnable; its RepoDigest is still served by Docker Hub as a multi-arch
+    # index, so it pins cleanly. Upgrading is now a deliberate edit, not a side effect.
+    image: eclipse-mosquitto@sha256:a908c65cc8e67ec9d292ef27c2c0360dbaaee7eb1b935cdd194e67697f15dea1
     restart: always
     volumes:
       - ./aiko-chat-bridge/deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
@@ -116,7 +162,22 @@ services:
 
   aiko-registrar:
     build: ./aiko-chat-bridge
+    # Built ON THE BOX by the aiko-registrar service's `build: ./aiko-chat-bridge`;
+    # all three services naming this tag consume that locally-built image. There is
+    # no registry digest to pin because the image never comes from a registry.
+    # `pull_policy: never` below is not cosmetic. An unqualified `aiko-bridge:latest`
+    # resolves to docker.io/library/aiko-bridge, so compose tries to pull it on every
+    # deploy. deploy_matrix's --ignore-pull-failures damps the 404 — but the failure
+    # that flag CANNOT damp is a 200: if that name ever resolves, the pull succeeds
+    # and `up -d` would recreate these services on someone else's layers. That is
+    # unlikely (library/ is Docker's own official-images namespace, currently 404 and
+    # not third-party claimable) so this is defence-in-depth, not an open hole — but
+    # it costs one line and it also stops a pointless failed pull each deploy.
+    # Moving this to GHCR is claude-tasks#2937 / #3143. Not a missed pin.
     image: aiko-bridge:latest
+    # `build`, not `never`: this service HAS a build: key, so it produces the
+    # image the other two consume. `never` would forbid obtaining it at all.
+    pull_policy: build
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
@@ -127,6 +188,7 @@ services:
 
   aiko-chat:
     image: aiko-bridge:latest
+    pull_policy: never
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
@@ -139,6 +201,7 @@ services:
 
   aiko-bridge:
     image: aiko-bridge:latest
+    pull_policy: never
     restart: always
     environment:
       AIKO_MQTT_HOST: aiko-mosquitto
@@ -159,5 +222,4 @@ volumes:
   signal_data:
   whatsapp_data:
   relay_data:
-  relay_hf_data:
   aiko_mosquitto_data:

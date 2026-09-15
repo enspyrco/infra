@@ -103,7 +103,7 @@ This is why step 0 exists.
 
 ## Blast radius
 
-Shared Sydney OCI host also running xdeca, imagineering, matrix, outline, kanbn.
+Shared Sydney OCI host also running imagineering, matrix, outline, kanbn.
 The rehearsal touches only:
 
 - `~/apps/lyra-avatar/` and `~/apps/dreamfinder-avatar/` (two compose projects)

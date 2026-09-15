@@ -65,10 +65,11 @@ trap cleanup EXIT
 
 # alpine+sqlite helper for asserting content inside a volume (built by the
 # restore path too; build here so assertions work even if it hasn't run yet).
-if ! docker image inspect sqlite-dumper:latest >/dev/null 2>&1; then
-  printf 'FROM alpine:3.20\nRUN apk add --no-cache sqlite\n' \
-    | docker build -q -t sqlite-dumper:latest - >/dev/null
-fi
+# Same builder the production path uses — a test that builds its assertion tool
+# from its own private recipe can pass while the real one is broken.
+# shellcheck source=lib/sqlite-dumper.sh
+. "$SCRIPT_DIR/lib/sqlite-dumper.sh"
+ensure_sqlite_dumper || { echo "could not build sqlite-dumper" >&2; exit 1; }
 
 # A throwaway "island" image whose tag matches the discovery regex
 # (^aiko-chat-(island|gateway):). It just sleeps — the restore only needs it
