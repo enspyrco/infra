@@ -31,7 +31,7 @@ run_arm() {
 if [ "\$1" = "-l" ]; then
     case "$mode" in
         ok)        printf '%s\n' "0 5 * * * /opt/unrelated-backup.sh  # unrelated" \
-                                 "*/10 * * * * /opt/thing.sh  # amanda-oci-watch"; exit 0 ;;
+                                 "*/10 * * * * /opt/thing.sh  # fixture-watch"; exit 0 ;;
         nocrontab) echo "no crontab for testuser" >&2; exit 1 ;;
         readfail)  echo "crontab: installing new crontab: Permission denied" >&2; exit 1 ;;
         # TOCTOU: the FIRST read succeeds (so the tag-present guard passes),
@@ -45,7 +45,7 @@ if [ "\$1" = "-l" ]; then
                    fi
                    touch "$sandbox/READ_ONCE"
                    printf '%s\n' "0 5 * * * /opt/unrelated-backup.sh  # unrelated" \
-                                  "*/10 * * * * /opt/thing.sh  # amanda-oci-watch"; exit 0 ;;
+                                  "*/10 * * * * /opt/thing.sh  # fixture-watch"; exit 0 ;;
     esac
 fi
 if [ "\$1" = "-" ]; then cat > "$sandbox/WRITE"; echo WROTE >> "$sandbox/writes"; fi
@@ -53,8 +53,8 @@ STUB
     chmod +x "$sandbox/bin/crontab"
 
     cat > "$sandbox/run.sh" <<'HARNESS'
-WATCHER_NAME="amanda-oci-watch"
-CRON_TAG="amanda-oci-watch"
+WATCHER_NAME="fixture-watch"
+CRON_TAG="fixture-watch"
 source "$HOME/lib/watcher-base.sh"
 self_disable
 HARNESS
@@ -72,7 +72,7 @@ HARNESS
     else
         printf '  FAIL  %-44s wrote=%s (want %s)\n' "$name" "$wrote" "$want_write"; FAIL=$((FAIL+1))
         [ -f "$sandbox/WRITE" ] && sed 's/^/          wrote: /' "$sandbox/WRITE"
-        [ -f "$sandbox/amanda-oci-watch.log" ] && tail -2 "$sandbox/amanda-oci-watch.log" | sed 's/^/          log: /'
+        [ -f "$sandbox/fixture-watch.log" ] && tail -2 "$sandbox/fixture-watch.log" | sed 's/^/          log: /'
     fi
     rm -rf "$sandbox"
 }

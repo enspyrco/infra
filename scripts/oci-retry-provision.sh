@@ -3,7 +3,7 @@
 # instance, then resizes it up to the target size.
 #
 # Lineage: reconciled 2026-07-28 to match the deployed (no-cloud-init) variant
-# that actually provisioned Robin's and Amanda's Melbourne boxes. Instances get
+# that actually provisioned Robin's Melbourne box. Instances get
 # the OCI-default 'ubuntu' user; SSH keys come from $AUTHORIZED_KEYS_FILE
 # (one key per line). The older cloud-init/--user-data-file lineage was dropped
 # because it had already diverged from what runs in production.
