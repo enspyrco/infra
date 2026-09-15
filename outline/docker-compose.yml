@@ -1,20 +1,25 @@
-# ⚠ THIS FILE IS NOT THE DEPLOY PATH FOR PRODUCTION OUTLINE.
-# Prod runs a hand-managed tenant stack the host owns, not this one:
-#   ~/apps/imagineering-outline/  (outline.imagineering.cc, container imagineering-outline)
-# (~/apps/xdeca-outline/ ran here too until xdeca was decommissioned 2026-09-02.)
-# `~/apps/outline/` does not exist on the box. Running `deploy-to.sh <ip> outline`
-# would stand up a THIRD, conflicting `img-outline` stack — do not do it blindly.
-# The digests below record what prod runs. This file is not the NORMAL deploy
-# path: scripts/deploy-to.sh now refuses it unless OUTLINE_DEPLOY_OVERRIDE=1,
-# so an override deploy is deliberate and exceptional, not impossible.
-# Both tenant stacks were checked and run the SAME image digests (outline
-# a750f764, minio 14cea493), so one set of pins records both.
-# Reconciling this file with the two tenant stacks is tracked in the backlog.
+# TENANT-PARAMETERISED. Every host-global identifier below (container names,
+# compose project name, published ports) is keyed on $TENANT, so two tenants can
+# run from this one file without colliding.
+#
+# This file is authoritative ONLY for the tenants named in REPO_OWNED_TENANTS in
+# scripts/deploy-to.sh. That list is the honest record of where this file is
+# currently true — not a prohibition with an escape hatch. A tenant absent from
+# it runs from somewhere else (today: imagineering, hand-managed at
+# ~/apps/imagineering-outline on Sydney, which this file does NOT deploy).
+#
+# TENANT is mandatory and unset is a hard error, not a default. A default would
+# silently pick a victim.
+#
+# The digests below record what the imagineering tenant runs (outline a750f764,
+# minio 14cea493), read from that tenant's live containers.
+name: ${TENANT:?TENANT must be set (e.g. TENANT=enspyr)}-outline
+
 services:
   outline:
     # outline v1.6.1 (was :latest); multi-arch manifest list
     image: docker.getoutline.com/outlinewiki/outline@sha256:a750f764080ce28d4a7393176011c8e2e4170b41689a8f6d91327dadf4904eb6
-    container_name: img-outline
+    container_name: ${TENANT:?TENANT must be set (e.g. TENANT=enspyr)}-outline
     restart: unless-stopped
     depends_on:
       - postgres
@@ -48,13 +53,13 @@ services:
       - WEB_CONCURRENCY=1
       - LOG_LEVEL=info
     ports:
-      - "3012:3000"
+      - "${OUTLINE_PORT:?OUTLINE_PORT must be set (imagineering: 3012)}:3000"
     networks:
       - outline
 
   postgres:
     image: postgres:15-alpine
-    container_name: img-outline-postgres
+    container_name: ${TENANT:?TENANT must be set}-outline-postgres
     restart: unless-stopped
     environment:
       - POSTGRES_USER=outline
@@ -67,7 +72,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: img-outline-redis
+    container_name: ${TENANT:?TENANT must be set}-outline-redis
     restart: unless-stopped
     networks:
       - outline
@@ -75,7 +80,7 @@ services:
   minio:
     # image built 2025-09-07 (was untagged); multi-arch manifest list
     image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    container_name: img-outline-minio
+    container_name: ${TENANT:?TENANT must be set}-outline-minio
     restart: unless-stopped
     environment:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER}
@@ -84,7 +89,7 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "9010:9000"
+      - "${OUTLINE_MINIO_PORT:?OUTLINE_MINIO_PORT must be set (imagineering: 9010)}:9000"
     networks:
       - outline
 
@@ -93,7 +98,7 @@ services:
   minio-setup:
     # (was untagged); multi-arch manifest list
     image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
-    container_name: img-outline-minio_setup
+    container_name: ${TENANT:?TENANT must be set}-outline-minio_setup
     depends_on:
       - minio
     entrypoint: >

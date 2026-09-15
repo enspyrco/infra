@@ -1,16 +1,29 @@
-# ⚠ THIS FILE IS NOT THE DEPLOY PATH FOR PRODUCTION KAN.BN.
-# Prod runs a hand-managed tenant stack: ~/apps/imagineering-kanbn/
-# (kan.imagineering.cc, containers imagineering-kanbn{,-migrate,-postgres}).
-# `~/apps/kanbn/` does not exist on the box, and this file still says
-# `container_name: img-kanbn`. Same drift class as outline/docker-compose.yml.
-# The digests below record what prod runs. This file is not the NORMAL deploy
-# path: scripts/deploy-to.sh now refuses it unless KANBN_DEPLOY_OVERRIDE=1,
-# so an override deploy is deliberate and exceptional, not impossible.
+# TENANT-PARAMETERISED. Every host-global identifier below (container names,
+# compose project name, published port) is keyed on $TENANT, so two tenants can
+# run from this one file without colliding.
+#
+# This file is authoritative ONLY for the tenants named in REPO_OWNED_TENANTS in
+# scripts/deploy-to.sh — the honest record of where this file is currently true.
+# A tenant absent from it runs from somewhere else (today: imagineering,
+# hand-managed at ~/apps/imagineering-kanbn on Sydney, which this file does NOT
+# deploy).
+#
+# TENANT is mandatory and unset is a hard error, not a default.
+#
+# ACCESS MODEL, decided before the first board exists: in Kan.bn the workspace is
+# the ONLY access boundary — every member of a workspace sees every board in it
+# (44 permission gates in the API, none board-scoped; raised upstream at
+# kanbn/kan#189). So one workspace per audience. Which workspace a board lives in
+# is a security decision, not a filing decision.
+#
+# The digests below record what the imagineering tenant runs.
+name: ${TENANT:?TENANT must be set (e.g. TENANT=enspyr)}-kanbn
+
 services:
   migrate:
     # kan 0.5.6 migrator (was :latest); multi-arch manifest list
     image: ghcr.io/kanbn/kan-migrate@sha256:3296fd28e037a93dda478981494a72c6905ecd4f0d0739e79139172844acbc4b
-    container_name: img-kanbn-migrate
+    container_name: ${TENANT:?TENANT must be set}-kanbn-migrate
     restart: "no"
     depends_on:
       postgres:
@@ -23,7 +36,7 @@ services:
   kanbn:
     # kan 0.5.6 (was :latest); multi-arch manifest list
     image: ghcr.io/kanbn/kan@sha256:3509af72635922b8195fc08e052f6257f8a05c50c8afcadc636f78c717667673
-    container_name: img-kanbn
+    container_name: ${TENANT:?TENANT must be set (e.g. TENANT=enspyr)}-kanbn
     restart: unless-stopped
     depends_on:
       migrate:
@@ -53,13 +66,13 @@ services:
       - NEXT_PUBLIC_ATTACHMENTS_BUCKET_NAME=kanbn-attachments
       - S3_AVATAR_UPLOAD_LIMIT=10485760
     ports:
-      - "3013:3000"
+      - "${KANBN_PORT:?KANBN_PORT must be set (imagineering: 3013)}:3000"
     networks:
       - kanbn
 
   postgres:
     image: postgres:15-alpine
-    container_name: img-kanbn-postgres
+    container_name: ${TENANT:?TENANT must be set}-kanbn-postgres
     restart: unless-stopped
     environment:
       - POSTGRES_USER=kanbn

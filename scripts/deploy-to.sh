@@ -21,6 +21,66 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE="nick@$IP"
 
 # ---------------------------------------------------------------------------
+# TENANT OWNERSHIP
+#
+# outline/ and kanbn/ are tenant-parameterised: every host-global identifier
+# (container names, compose project name, published ports) is keyed on $TENANT,
+# so two tenants can run from one file without colliding.
+#
+# REPO_OWNED_TENANTS is the list of tenants those files are CURRENTLY TRUE FOR.
+# It replaces a per-service prohibition-with-override, and the difference is not
+# cosmetic:
+#
+#   A prohibition-with-override normalises the drift it guards against — every
+#   real deploy becomes "the exception", so the override gets typed reflexively
+#   and the guard stops carrying information.
+#
+#   An allowlist records WHICH TENANTS THIS FILE IS AUTHORITATIVE FOR. Same
+#   information, opposite failure mode: when a third tenant appears, the honest
+#   move is to add it here (or admit it is hand-managed elsewhere), and a tenant
+#   nobody added simply is not deployed. There is nothing to reflexively type.
+#
+# `imagineering` is deliberately ABSENT. It runs hand-managed stacks on Sydney
+# (~/apps/imagineering-outline, ~/apps/imagineering-kanbn) that this repo does
+# not deploy. Its absence is the honest state, not an oversight — reconciling it
+# is claude-tasks#3842. Adding it here without doing that work would make this
+# file claim an authority it does not have.
+REPO_OWNED_TENANTS="${REPO_OWNED_TENANTS:-enspyr}"
+
+# Fail closed: TENANT unset, or set to something not on the list, aborts.
+# Deploying a tenant this file is not authoritative for is how you stand up a
+# second, conflicting stack next to a live one.
+_assert_repo_owned_tenant() {  # <service-label>
+    local svc="$1"
+
+    if [ -z "${TENANT:-}" ]; then
+        echo "REFUSING: TENANT is not set." >&2
+        echo "  $svc/ is tenant-parameterised; there is no default, because a" >&2
+        echo "  default would silently pick a victim." >&2
+        echo "  Repo-owned tenants: $REPO_OWNED_TENANTS" >&2
+        echo "  e.g. TENANT=enspyr $0 $IP $svc" >&2
+        return 1
+    fi
+
+    # Word-boundary match against the space-separated list. Guards against
+    # `enspyr` matching a hypothetical `enspyr-staging` and vice versa.
+    case " $REPO_OWNED_TENANTS " in
+        *" $TENANT "*) ;;
+        *)
+            echo "REFUSING: TENANT='$TENANT' is not a repo-owned tenant." >&2
+            echo "  This repo's $svc/ is authoritative for: $REPO_OWNED_TENANTS" >&2
+            echo "  '$TENANT' runs from somewhere else, or does not exist yet." >&2
+            echo "  If this repo SHOULD own it, add it to REPO_OWNED_TENANTS in" >&2
+            echo "  $0 — deliberately, in a commit, not as an env var at the" >&2
+            echo "  call site." >&2
+            return 1
+            ;;
+    esac
+
+    echo "Tenant: $TENANT (repo-owned: $REPO_OWNED_TENANTS)"
+}
+
+# ---------------------------------------------------------------------------
 # DEPLOY PROVENANCE PREFLIGHT
 #
 # Every deploy path below rsyncs/scps out of $REPO_ROOT — the WORKING TREE, not
@@ -945,26 +1005,12 @@ SSHEOF'
 }
 
 deploy_outline() {
-    # REFUSE — outline/ is NOT the production deploy path.
-    # Prod runs a hand-managed tenant stack: ~/apps/imagineering-outline
-    # (outline.imagineering.cc). It used to be two — ~/apps/xdeca-outline was the
-    # other — but xdeca was decommissioned 2026-09-02, so deploying here now adds a
-    # SECOND conflicting stack, not a third.
-    # ~/apps/outline does not exist on the box, and outline/docker-compose.yml still
-    # declares container_name: img-outline, so deploying here would stand up a SECOND,
-    # CONFLICTING stack alongside the live tenant. The header comment in that
-    # compose file says so — a comment is not an invariant, so this is one.
-    # Reconciling the file with the tenant stacks is a tracked backlog item;
-    # until then, override deliberately with OUTLINE_DEPLOY_OVERRIDE=1.
-    if [ "${OUTLINE_DEPLOY_OVERRIDE:-0}" != "1" ]; then
-        echo "REFUSING: outline/ is not the production deploy path." >&2
-        echo "  Live: ~/apps/imagineering-outline (outline.imagineering.cc)" >&2
-        echo "  Deploying this would create a second, conflicting img-outline stack." >&2
-        echo "  See the header in outline/docker-compose.yml. Override: OUTLINE_DEPLOY_OVERRIDE=1" >&2
-        return 1
-    fi
+    _assert_repo_owned_tenant outline || return 1
 
-    echo "Deploying Outline Wiki..."
+    : "${OUTLINE_PORT:?OUTLINE_PORT must be set (imagineering uses 3012)}"
+    : "${OUTLINE_MINIO_PORT:?OUTLINE_MINIO_PORT must be set (imagineering uses 9010)}"
+
+    echo "Deploying Outline Wiki for tenant '$TENANT'..."
 
     local OUTLINE_SECRETS="$REPO_ROOT/outline/secrets.yaml"
 
@@ -1010,42 +1056,30 @@ deploy_outline() {
     } > "$REPO_ROOT/outline/.env"
 
     # Deploy files
-    ssh "$REMOTE" "mkdir -p ~/apps/outline"
-    rsync -avz --delete --exclude 'secrets.yaml' "$REPO_ROOT/outline/" "$REMOTE":~/apps/outline/
+    ssh "$REMOTE" "mkdir -p ~/apps/${TENANT}-outline"
+    rsync -avz --delete --exclude 'secrets.yaml' "$REPO_ROOT/outline/" "$REMOTE":~/apps/"${TENANT}"-outline/
 
     # Clean up local .env
     rm -f "$REPO_ROOT/outline/.env"
 
     # Start Outline
-    ssh "$REMOTE" "cd ~/apps/outline && docker compose pull && docker compose up -d"
+    ssh "$REMOTE" "cd ~/apps/${TENANT}-outline && docker compose pull && docker compose up -d"
 
-    echo "img-outline stack deployed (OVERRIDE)."
-    echo "  This is NOT the live tenant: outline.imagineering.cc is served by"
-    echo "  ~/apps/imagineering-outline, a different directory."
-    echo "  This is NOT a sandbox either — it just rsynced and started a"
-    echo "  conflicting stack on the SAME host, contending for ports and names."
+    echo "Outline deployed for tenant '$TENANT' (~/apps/${TENANT}-outline)."
+    echo "  Containers: ${TENANT}-outline{,-postgres,-redis,-minio}"
+    echo "  Published:  ${OUTLINE_PORT} (app), ${OUTLINE_MINIO_PORT} (minio)"
+    echo "  Tenants NOT on REPO_OWNED_TENANTS run from elsewhere and are"
+    echo "  untouched by this — e.g. outline.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-outline, which this repo does not deploy."
     echo "  Note: First user to sign in becomes admin"
 }
 
 deploy_kanbn() {
-    # REFUSE — kanbn/ is NOT the production deploy path.
-    # Prod runs hand-managed tenant stack(s): ~/apps/imagineering-kanbn (kan.imagineering.cc).
-    # ~/apps/kanbn does not exist on the box, and kanbn/docker-compose.yml still
-    # declares container_name: img-kanbn, so deploying here would stand up a
-    # SECOND, CONFLICTING stack alongside the single live tenant. (Outline has two
-    # tenants and so would gain a third; Kan.bn has one. Counted, not copy-pasted.) The header comment in that
-    # compose file says so — a comment is not an invariant, so this is one.
-    # Reconciling the file with the tenant stacks is a tracked backlog item;
-    # until then, override deliberately with KANBN_DEPLOY_OVERRIDE=1.
-    if [ "${KANBN_DEPLOY_OVERRIDE:-0}" != "1" ]; then
-        echo "REFUSING: kanbn/ is not the production deploy path." >&2
-        echo "  Live: ~/apps/imagineering-kanbn (kan.imagineering.cc)" >&2
-        echo "  Deploying this would create a second, conflicting img-kanbn stack." >&2
-        echo "  See the header in kanbn/docker-compose.yml. Override: KANBN_DEPLOY_OVERRIDE=1" >&2
-        return 1
-    fi
+    _assert_repo_owned_tenant kanbn || return 1
 
-    echo "Deploying Kan.bn..."
+    : "${KANBN_PORT:?KANBN_PORT must be set (imagineering uses 3013)}"
+
+    echo "Deploying Kan.bn for tenant '$TENANT'..."
 
     local KANBN_SECRETS="$REPO_ROOT/kanbn/secrets.yaml"
 
@@ -1084,21 +1118,24 @@ deploy_kanbn() {
     } > "$REPO_ROOT/kanbn/.env"
 
     # Deploy .env and compose files
-    ssh "$REMOTE" "mkdir -p ~/apps/kanbn"
-    rsync -avz --delete --exclude 'secrets.yaml' "$REPO_ROOT/kanbn/" "$REMOTE":~/apps/kanbn/
+    ssh "$REMOTE" "mkdir -p ~/apps/${TENANT}-kanbn"
+    rsync -avz --delete --exclude 'secrets.yaml' "$REPO_ROOT/kanbn/" "$REMOTE":~/apps/"${TENANT}"-kanbn/
 
     # Clean up local .env
     rm -f "$REPO_ROOT/kanbn/.env"
 
     # Pull image from ghcr.io and start
-    ssh "$REMOTE" "cd ~/apps/kanbn && docker compose pull && docker compose up -d"
+    ssh "$REMOTE" "cd ~/apps/${TENANT}-kanbn && docker compose pull && docker compose up -d"
 
-    echo "img-kanbn stack deployed (OVERRIDE)."
-    echo "  This is NOT the live tenant: kan.imagineering.cc is served by"
-    echo "  ~/apps/imagineering-kanbn, a different directory."
-    echo "  This is NOT a sandbox either — it just rsynced and started a"
-    echo "  conflicting stack on the SAME host, contending for ports and names."
-    echo "  Note: First user to sign up becomes admin"
+    echo "Kan.bn deployed for tenant '$TENANT' (~/apps/${TENANT}-kanbn)."
+    echo "  Containers: ${TENANT}-kanbn{,-migrate,-postgres}"
+    echo "  Published:  ${KANBN_PORT}"
+    echo "  Tenants NOT on REPO_OWNED_TENANTS run from elsewhere and are"
+    echo "  untouched by this — e.g. kan.imagineering.cc is served by"
+    echo "  ~/apps/imagineering-kanbn, which this repo does not deploy."
+    echo "  Note: First user to sign up becomes admin."
+    echo "  ACCESS MODEL: a workspace is Kan.bn's only access wall — every member"
+    echo "  of a workspace sees every board in it. One workspace per audience."
 }
 
 deploy_pm_bot() {
