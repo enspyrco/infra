@@ -41,8 +41,8 @@ PASS=0; FAIL=0
 ok()   { printf '  PASS  %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL+1)); }
 
-run_arm() {  # $1=label  $2=docker_exit  $3=docker_stdout
-    local label="$1" dexit="$2" dout="$3"
+run_arm() {  # $1=docker_exit  $2=docker_stdout
+    local dexit="$1" dout="$2"
     local sandbox; sandbox=$(mktemp -d)
     mkdir -p "$sandbox/bin"
 
@@ -78,7 +78,7 @@ EOF
 }
 
 echo "=== ARM 1 (forced bad state): docker unreachable — must NOT report recovery ==="
-S=$(run_arm "blind" 1 "")
+S=$(run_arm 1 "")
 if grep -qi "Resolved" "$S/out.txt" && grep -q "img-radicale" "$S/out.txt"; then
     bad "docker down: reported img-radicale as RESOLVED (the false all-clear)"
     sed 's/^/        /' "$S/out.txt"
@@ -99,7 +99,7 @@ fi
 
 echo
 echo "=== ARM 2 (null control): docker healthy, genuinely zero bad containers — MUST resolve ==="
-S2=$(run_arm "clear" 0 "")
+S2=$(run_arm 0 "")
 if grep -qi "Resolved" "$S2/out.txt"; then
     ok "docker up + empty: recovery correctly reported (arm 1 measures the daemon, not emptiness)"
 else
