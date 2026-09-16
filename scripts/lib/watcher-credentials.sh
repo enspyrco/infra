@@ -42,8 +42,17 @@ watcher_declared_creds() {
     while IFS= read -r line; do
         # Strip the marker and normalise whitespace.
         line="${line#*requires-credential:}"
+        # `set -f` BEFORE the split: `set --` performs pathname expansion as well as
+        # word splitting, so a declaration of `.config/x/* KEY` in a directory with
+        # one match is rewritten by the FILESYSTEM into a well-formed pair and then
+        # checked rather than refused. The allowlist below never sees the `*`.
+        # Confirmed: `sub/*` -> `sub/afile`. (Tesla, cage-match #199 round 3.)
+        local _glob_was_off=0
+        case "$-" in *f*) _glob_was_off=1 ;; esac
+        set -f
         # shellcheck disable=SC2086  # deliberate word-split into exactly two fields
         set -- $line
+        [ "$_glob_was_off" -eq 1 ] || set +f
         path="${1:-}"; var="${2:-}"
         if [ "$#" -ne 2 ] || [ -z "$path" ] || [ -z "$var" ]; then
             echo "watcher_declared_creds: malformed declaration in $f: 'requires-credential:$line'" >&2

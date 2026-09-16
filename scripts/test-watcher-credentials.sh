@@ -95,6 +95,22 @@ W=$(mkw broken '# requires-credential: /absolute BAD')
 watcher_credentials_ok "$W" check_ok >/dev/null 2>&1
 expect_rc "malformed declaration → refuse even though the checker would pass (fail closed)" 2 $?
 
+W=$(mkw globpath '# requires-credential: sub/* KEY')
+( cd "$WORK" && mkdir -p sub && : > sub/afile
+  watcher_declared_creds "$W" >/dev/null 2>&1 )
+expect_rc "GLOB: pathname expansion rejected, not silently rewritten by the filesystem" 2 $?
+
+echo
+echo "=== UNREADABLE INPUT is not 'declares nothing' ==="
+# The recast's core property. A watcher file we cannot read must be FATAL, never
+# collapsed into the permit path — that collapse (`if [ -r "$_w" ]`) is what let
+# a missing or misnamed watcher ship a mute schedule.
+watcher_declared_creds "$WORK/does-not-exist.sh" >/dev/null 2>&1
+expect_rc "unreadable watcher file → rc=2 (cannot tell), NOT rc=0 (declares nothing)" 2 $?
+
+watcher_credentials_ok "$WORK/does-not-exist.sh" check_ok >/dev/null 2>&1
+expect_rc "unreadable watcher file → refused even with a passing checker" 2 $?
+
 echo
 echo "=== REGRESSION — the real watcher that caused this ==="
 out=$(watcher_declared_creds "$REPO/scripts/watchers/email-health-watch.sh"); rc=$?
