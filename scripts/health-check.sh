@@ -67,18 +67,62 @@ fi
 # Containers: exited (non-allowlisted) or restarting. Known one-shot helpers
 # (compose migrate/setup jobs) exit 0 by design and are skipped by name.
 ONESHOT_HELPERS_RE='^(imagineering|img)-(kanbn-migrate|outline-minio-setup)$'
+
+# ENUMERATE CONTAINERS WITH THE EXIT STATUS CONSUMED.
+#
+# This read used to be `done < <(docker ps -a ... 2>/dev/null)`, and its failure
+# was not "no alert" — it was a WRONG alert. With the daemon down the process
+# substitution yields nothing, the loop body never runs, and `issues` ends with
+# zero container:* keys. The resolved_keys diff below then finds every
+# previously-active container key missing from `issues` and fires a ✅ RECOVERY
+# for each one. A dockerd crash made this script send GOOD NEWS about containers
+# that were still broken, once an hour, and clear their state so the real
+# breakage could never re-alert.
+#
+# The repo already had this right twice — lib/resolve-container.sh checks
+# `docker ps`'s status before trusting its output, and avatar-deploy rolls back
+# rather than trust an unreadable boot anchor. It never reached here.
+#
+# DOCKER_BLIND is only a FLAG here: the previous-state carry-forward it drives
+# cannot run until `prev` is loaded, which happens further down. Doing it here
+# would iterate an empty array and silently do nothing — the same
+# failure-looks-like-success defect this block exists to remove.
+DOCKER_BLIND=0
+container_ps=""
+container_ps_err=""
+if ! container_ps=$(docker ps -a --filter "status=exited" --filter "status=restarting" \
+        --format "{{.Names}} {{.Status}}" 2>&1); then
+    DOCKER_BLIND=1
+    container_ps_err="$container_ps"
+    container_ps=""
+fi
 while read -r name status; do
     [ -n "$name" ] || continue
     if [[ "$status" == "Exited (0)"* ]] && [[ "$name" =~ $ONESHOT_HELPERS_RE ]]; then
         continue
     fi
     issues["container:${name}"]="Container <b>${name}</b>: ${status}"
-done < <(docker ps -a --filter "status=exited" --filter "status=restarting" --format "{{.Names}} {{.Status}}" 2>/dev/null)
+done < <(printf '%s\n' "$container_ps")
 
 # Previous active keys.
 declare -A prev
 if [ -f "$STATE_FILE" ]; then
     while IFS= read -r k; do [ -n "$k" ] && prev["$k"]=1; done < "$STATE_FILE"
+fi
+
+# Docker was unreachable: fail CLOSED before the diff runs.
+#   - raise the blindness itself, because a health check that cannot see is a
+#     health problem and should alert once, on change, like anything else;
+#   - carry every previous container issue forward so the diff below cannot
+#     mistake "could not ask" for "recovered".
+# Placed here, after `prev` is populated, for the reason given at DOCKER_BLIND.
+if [ "$DOCKER_BLIND" -eq 1 ]; then
+    issues["healthcheck:docker"]="Health check is BLIND: <code>docker ps</code> failed, so container state is unknown this run. Error: $(printf '%s' "$container_ps_err" | tr '\n' ' ' | cut -c1-200)"
+    for k in "${!prev[@]}"; do
+        case "$k" in
+            container:*) [ -n "${issues[$k]:-}" ] || issues["$k"]="Container <b>${k#container:}</b>: state UNKNOWN (docker unreachable)" ;;
+        esac
+    done
 fi
 
 # Diff: what's newly-broken, what just cleared.
