@@ -217,6 +217,21 @@ WATCHER_SCHEDULE=(
 # declared set, with a missing input fatal and the remote assertion expressed as
 # the command itself rather than as data fed to a shell.
 assert_watcher_credentials() {
+    echo "Asserting the watcher user can actually alert..."
+    if ! ssh "$REMOTE" "sudo -u nick bash -c '
+            C=\$HOME/.config/imagineering/notify-credentials
+            [ -r \"\$C\" ] || exit 3
+            set -a; . \"\$C\"; set +a
+            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
+        '"; then
+        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
+        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
+        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
+        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
+        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
+        return 1
+    fi
+
     if [ ! -r "$REPO_ROOT/scripts/lib/watcher-credentials.sh" ]; then
         echo "FATAL: scripts/lib/watcher-credentials.sh is missing — the credential gate cannot run." >&2
         return 1
@@ -426,20 +441,13 @@ deploy_scripts() {
     # NOTIFY_URL too, so it is necessary and not sufficient. Unifying the two
     # credential paths is claude-tasks#4363; until then this ASSERTS rather than
     # provisions, and fails the deploy rather than shipping a silent mute.
-    echo "Asserting the watcher user can actually alert..."
-    if ! ssh "$REMOTE" "sudo -u nick bash -c '
-            C=\$HOME/.config/imagineering/notify-credentials
-            [ -r \"\$C\" ] || exit 3
-            set -a; . \"\$C\"; set +a
-            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
-        '"; then
-        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
-        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
-        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
-        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
-        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
-        return 1
-    fi
+    # The notify assertion moved INTO assert_watcher_credentials, which runs before
+    # any mutation. Leaving it here made the gate's own headline claim false: a
+    # refusal at this point happens AFTER `cp -r /tmp/scripts/. /opt/scripts/`, so
+    # the box already carries the changed watcher code while the old cron entries
+    # keep executing it. Half a gate hoisted is not a hoisted gate. (Carnot,
+    # cage-match #199 round 3 — the same finding as round 3's, because the first
+    # pass moved only the credential half.)
     echo "  Watcher alerting precondition OK"
 
     # install_watcher_cron <name> <5-field schedule>
