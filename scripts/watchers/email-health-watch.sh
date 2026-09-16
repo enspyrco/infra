@@ -36,6 +36,14 @@
 # CREDENTIALS: needs BREVO_API_KEY. Sourced from
 # ~/.config/imagineering/brevo-credentials (mode 0600, exports BREVO_API_KEY),
 # mirroring the notify-credentials pattern that watcher-base.sh already uses.
+#
+# The line below is MACHINE-READABLE and load-bearing: deploy-to.sh refuses to
+# install this watcher's cron entry unless the scheduled user can actually read
+# the file and it actually defines the variable. Without it this watcher ran as
+# `nick` from 2026-09-12 against a credential that only `ubuntu` had, logged
+# "cannot check" every four hours, and exited 0 (claude-tasks#4470). The comment
+# above said the same thing in prose and stopped nothing.
+# requires-credential: .config/imagineering/brevo-credentials BREVO_API_KEY
 # If absent, the watcher logs and exits cleanly (can't check, won't crash cron).
 #
 # Cron: 23 */4 * * * /home/ubuntu/email-health-watch.sh  # email-health-watch

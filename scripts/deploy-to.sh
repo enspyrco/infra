@@ -184,7 +184,114 @@ dotenv_quote() {
 
 echo "Deploying to $REMOTE..."
 
+# THE watcher schedule. Declared once and consumed TWICE — by the credential gate
+# that runs before any bytes ship, and by the installer further down. Two lists
+# that happen to match is not the same as one list: the gate must be over exactly
+# the set that gets scheduled, or "what we checked" and "what we scheduled" can
+# drift silently. (Carnot + Tesla, cage-match #199 round 3.)
+WATCHER_SCHEDULE=(
+    "backup-recency-watch|0 8 * * *"
+    "disk-usage-watch|*/30 * * * *"
+    "cert-expiry-watch|17 */6 * * *"
+    "email-health-watch|23 */4 * * *"
+)
+
+# assert_watcher_credentials — ONE gate, over the declared set, BEFORE mutation.
+#
+# The first version put this INSIDE install_watcher_cron, where it inherited that
+# function's call-conditions, and three review rounds found three different ways
+# for it not to run:
+#   - it executed 220 lines AFTER `cp -r /tmp/scripts/. /opt/scripts/`, so a
+#     refusal left changed watcher code on the box with the old cron entries
+#     still running it. The safety property was not reversible.
+#   - `if [ -r "$_w" ]` turned a missing or misnamed watcher file into "declares
+#     nothing", which is the PERMIT path — a skip built around the one object
+#     that carries the declaration.
+#   - the remote check ran via `bash -s` reading stdin, and `bash -s` with an
+#     empty script exits 0, so "the checks passed" and "no line executed" were
+#     the same reading.
+#
+# The invariant none of those patches stated: A GUARD MUST BE POSITIONED AND
+# CONSTRUCTED SO THAT EVERY PATH REACHING THE GUARDED ACTION HAS PROVABLY
+# EXECUTED IT. Hence: out of the guarded function, before the mutation, over a
+# declared set, with a missing input fatal and the remote assertion expressed as
+# the command itself rather than as data fed to a shell.
+assert_watcher_credentials() {
+    echo "Asserting the watcher user can actually alert..."
+    if ! ssh "$REMOTE" "sudo -u nick bash -c '
+            C=\$HOME/.config/imagineering/notify-credentials
+            [ -r \"\$C\" ] || exit 3
+            set -a; . \"\$C\"; set +a
+            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
+        '"; then
+        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
+        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
+        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
+        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
+        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
+        return 1
+    fi
+
+    if [ ! -r "$REPO_ROOT/scripts/lib/watcher-credentials.sh" ]; then
+        echo "FATAL: scripts/lib/watcher-credentials.sh is missing — the credential gate cannot run." >&2
+        return 1
+    fi
+    # shellcheck source=lib/watcher-credentials.sh
+    . "$REPO_ROOT/scripts/lib/watcher-credentials.sh"
+
+    # Expressed as the COMMAND, not piped in as data: `bash -c '<expr>'` cannot be
+    # the empty program, so exit 0 can only mean the expression ran and succeeded.
+    # `bash -s` reading stdin CAN be empty and still exit 0, which is how the
+    # previous form left "never executed" in the passband. Values travel as argv
+    # and are read by indirect expansion, never spliced into code.
+    _remote_cred_check() {  # <watcher-name> <home-relative-path> <VAR>
+        local wname="$1" path="$2" var="$3"
+        if ssh "$REMOTE" "sudo -u nick bash -c 'p=\$1; v=\$2; C=\"\$HOME/\$p\"; [ -r \"\$C\" ] || exit 3; set -a; . \"\$C\"; set +a; [ -n \"\${!v:-}\" ] || exit 4' cred-check '$path' '$var'"; then
+            echo "  credential OK: $wname -> $path defines $var for nick"
+            return 0
+        fi
+        echo "FATAL: watcher $wname declares $path ($var), which the scheduled user (nick) cannot use." >&2
+        echo "  Scheduling it anyway is how a watcher ends up green and blind: its" >&2
+        echo "  missing-credential branch is the same 'still waiting' return as a" >&2
+        echo "  healthy cycle, so the run exits 0 and nothing complains." >&2
+        echo "  Fix: install /home/nick/$path (mode 0600, owner nick) defining $var." >&2
+        return 1
+    }
+
+    local entry name wfile rc=0
+    for entry in "${WATCHER_SCHEDULE[@]}"; do
+        name="${entry%%|*}"
+        wfile="$REPO_ROOT/scripts/watchers/$name.sh"
+        # FATAL, not skipped. A watcher we are about to schedule whose file we
+        # cannot read is not "declares nothing" — it is "we cannot tell", and
+        # those must never share an outcome.
+        if [ ! -r "$wfile" ]; then
+            echo "FATAL: $name is scheduled but scripts/watchers/$name.sh is missing or unreadable." >&2
+            echo "  Refusing: an unreadable watcher cannot be asserted, and scheduling it anyway" >&2
+            echo "  would install a cron entry for code nothing has checked." >&2
+            return 1
+        fi
+        # Goes through watcher_credentials_ok — the SAME function the test suite
+        # exercises. An earlier draft of this recast inlined the loop here, which
+        # would have left the tested function called by nothing but its test: a
+        # proof of a code path production does not take is this session's own
+        # class, one level up.
+        if ! watcher_credentials_ok "$wfile" _remote_cred_check "$name"; then
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 deploy_scripts() {
+    # GATE FIRST. Nothing below this line may mutate the box until every watcher
+    # we intend to schedule has had its declared credentials asserted.
+    echo "Asserting declared watcher credentials BEFORE shipping any bytes..."
+    if ! assert_watcher_credentials; then
+        echo "REFUSING to deploy scripts: the box is untouched." >&2
+        return 1
+    fi
+
     echo "Deploying scripts..."
     ssh "$REMOTE" "sudo mkdir -p /opt/scripts /opt/scripts/lib"
     rsync -avz "$REPO_ROOT/scripts/" "$REMOTE":/tmp/scripts/
@@ -334,20 +441,13 @@ deploy_scripts() {
     # NOTIFY_URL too, so it is necessary and not sufficient. Unifying the two
     # credential paths is claude-tasks#4363; until then this ASSERTS rather than
     # provisions, and fails the deploy rather than shipping a silent mute.
-    echo "Asserting the watcher user can actually alert..."
-    if ! ssh "$REMOTE" "sudo -u nick bash -c '
-            C=\$HOME/.config/imagineering/notify-credentials
-            [ -r \"\$C\" ] || exit 3
-            set -a; . \"\$C\"; set +a
-            [ -n \"\${NOTIFY_URL:-}\" ] && [ -n \"\${NOTIFY_API_KEY:-}\" ] || exit 4
-        '"; then
-        echo "FATAL: the watcher user (nick) cannot reach notify." >&2
-        echo "  Every watcher scheduled below would run MUTE — tg() logs 'skipping'," >&2
-        echo "  returns 0, and the run reads as healthy. Refusing to install them." >&2
-        echo "  Fix: place NOTIFY_URL + NOTIFY_API_KEY in" >&2
-        echo "  /home/nick/.config/imagineering/notify-credentials (mode 0600, owner nick)." >&2
-        return 1
-    fi
+    # The notify assertion moved INTO assert_watcher_credentials, which runs before
+    # any mutation. Leaving it here made the gate's own headline claim false: a
+    # refusal at this point happens AFTER `cp -r /tmp/scripts/. /opt/scripts/`, so
+    # the box already carries the changed watcher code while the old cron entries
+    # keep executing it. Half a gate hoisted is not a hoisted gate. (Carnot,
+    # cage-match #199 round 3 — the same finding as round 3's, because the first
+    # pass moved only the credential half.)
     echo "  Watcher alerting precondition OK"
 
     # install_watcher_cron <name> <5-field schedule>
@@ -359,6 +459,12 @@ deploy_scripts() {
     # Stray stderr now interleaves into the log a human actually reads.
     install_watcher_cron() {
         local name=$1 schedule=$2
+
+        # Credentials for every watcher in WATCHER_SCHEDULE were asserted by
+        # assert_watcher_credentials BEFORE any bytes shipped. Deliberately NOT
+        # re-checked here: a second gate inside the guarded function is what the
+        # recast removed, and re-adding one would restore the call-condition
+        # coupling that let three rounds find three ways for it not to run.
         echo "Installing /etc/cron.d/$name..."
         ssh "$REMOTE" "printf '%s\n' \
             'SHELL=/bin/bash' \
@@ -374,7 +480,11 @@ deploy_scripts() {
     # while watcher-base writes ~/backup-recency-watch.log, so the declared log was
     # the permanently-empty one. The previous commit fixed the four new entries and
     # left this one split, which made its own PR description half-true.
-    install_watcher_cron backup-recency-watch '0 8 * * *'
+    for _entry in "${WATCHER_SCHEDULE[@]}"; do
+        [ "${_entry%%|*}" = "backup-recency-watch" ] || continue
+        install_watcher_cron backup-recency-watch "${_entry#*|}"
+    done
+    unset _entry
     echo "Backup-freshness watcher cron installed (08:00 daily)"
 
     # --- The four watchers that were still running from /home/ubuntu ---
@@ -389,9 +499,15 @@ deploy_scripts() {
     #
     # Schedules preserved exactly as they were in the ubuntu crontab, so this is a
     # change of RUN PATH and USER only, not of cadence.
-    install_watcher_cron disk-usage-watch   '*/30 * * * *'
-    install_watcher_cron cert-expiry-watch  '17 */6 * * *'
-    install_watcher_cron email-health-watch '23 */4 * * *'
+    # Driven from WATCHER_SCHEDULE — the SAME array the credential gate asserted,
+    # so the checked set and the scheduled set cannot drift. backup-recency-watch
+    # is installed above from the same array for its own documented reason.
+    for _entry in "${WATCHER_SCHEDULE[@]}"; do
+        _n="${_entry%%|*}"
+        [ "$_n" = "backup-recency-watch" ] && continue   # already installed above
+        install_watcher_cron "$_n" "${_entry#*|}"
+    done
+    unset _entry _n
     echo "Three migrated watcher crons installed (disk-usage, cert-expiry, email-health)"
 
     # oci-instance-watch is deliberately NOT here, and was rolled back on
