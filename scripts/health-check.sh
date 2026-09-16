@@ -48,11 +48,24 @@ declare -A issues
 declare -A blind
 
 # Disk (all real filesystems).
+# Streams split here too. The first version of this block used `2>&1`, which is
+# the same stderr-folding defect fixed for docker three lines below — a warning on
+# a ZERO exit would have been parsed as a "usage mount" pair. Fixed for one sensor
+# and not its sibling in the same commit.
+#
+# And a non-zero df is NOT necessarily total blindness: GNU df exits 1 when a
+# SINGLE mount is unreadable (a stale NFS handle, a dead FUSE, /run/user/N/doc)
+# while still printing every other filesystem correctly. Discarding stdout there
+# turns one bad mount into permanent blindness across every disk, plus a standing
+# false alarm. So: keep whatever was measured, AND mark the sensor blind so the
+# unmeasured mounts' prior keys are carried forward rather than resolved. Partial
+# knowledge is not ignorance, and it is not completeness either. (Tesla.)
 disk_raw=""
-if ! disk_raw=$(df -h --output=pcent,target -x tmpfs -x devtmpfs -x overlay 2>&1); then
-    blind["disk:"]="df failed: $(printf '%s' "$disk_raw" | tr '\n' ' ' | cut -c1-120)"
-    disk_raw=""
+_disk_err=$(mktemp)
+if ! disk_raw=$(df -h --output=pcent,target -x tmpfs -x devtmpfs -x overlay 2>"$_disk_err"); then
+    blind["disk:"]="df exited non-zero (some mounts unreadable): $(tr '\n' ' ' < "$_disk_err" | cut -c1-120)"
 fi
+rm -f "$_disk_err"
 while read -r usage mount; do
     pct=${usage%\%}
     if [ "$pct" -gt "$DISK_THRESHOLD" ]; then

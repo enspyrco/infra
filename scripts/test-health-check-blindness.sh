@@ -226,6 +226,35 @@ for case_name in "empty" "no-MemAvailable"; do
 done
 
 echo
+echo "=== ARM 4b (partial df): one bad mount must not blind every disk ==="
+# GNU df exits 1 when a single mount is unreadable while still printing the rest.
+# Discarding stdout there turns one stale NFS handle into permanent blindness
+# across every filesystem, plus a standing false alarm. (Tesla, cage-match #198.)
+S4b=$(mktemp -d); mkdir -p "$S4b/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$S4b/bin/docker"
+cat > "$S4b/bin/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Use% Mounted on"
+echo " 95% /"
+echo "df: /run/user/1000/doc: Transport endpoint is not connected" >&2
+exit 1
+EOF
+chmod +x "$S4b/bin/"*
+: > "$S4b/state"
+write_meminfo "$S4b/meminfo"
+PATH="$S4b/bin:$PATH" HEALTHCHECK_STATE="$S4b/state" NOTIFY_API_KEY="" \
+    HEALTHCHECK_MEMINFO="$S4b/meminfo" "$BASH4" "$REPO/scripts/health-check.sh" > "$S4b/out.txt" 2>&1
+grep -q "disk:/" "$S4b/state" \
+  && ok "partial df: the readable mount at 95% was STILL measured and alerted" \
+  || { bad "partial df: a readable 95% mount was discarded — one bad mount blinded every disk"; sed 's/^/        /' "$S4b/out.txt"; cat "$S4b/state"; }
+grep -qi "BLIND on disk" "$S4b/out.txt" \
+  && ok "partial df: still marked blind, so unmeasured mounts are not resolved" \
+  || { bad "partial df: silently treated a partial read as a complete one"; sed 's/^/        /' "$S4b/out.txt"; }
+grep -qE "disk:(df|Transport|endpoint)" "$S4b/state" \
+  && { bad "partial df: a stderr line was parsed as a mount"; cat "$S4b/state"; } \
+  || ok "partial df: stderr did not become a disk key"
+
+echo
 echo "=== ARM 6 (stderr must not become a container): a WARNING on a healthy daemon ==="
 # `2>&1` on a ZERO exit folded stderr into the roster, so a daemon warning became
 # a phantom container:* key — then a false recovery when the warning stopped.
