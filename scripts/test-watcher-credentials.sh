@@ -48,7 +48,35 @@ W=$(mkw dotdot '# requires-credential: ../../etc/shadow VAR')
 watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "path traversal rejected" 2 $?
 
 W=$(mkw badvar '# requires-credential: .config/x 9NOTAVAR')
-watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "invalid variable name rejected" 2 $?
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "invalid variable name rejected (bad FIRST char)" 2 $?
+
+# INJECTION ARMS. These exist because the first version of this guard checked only
+# the first character of VAR — `case "$var" in [A-Za-z_]*)` — and the fixture above
+# was the one input that check does catch. The test asserted "invalid variable name
+# rejected" and PASSED while `BREVO;touch /tmp/pwn` sailed through into a remote
+# `bash -c` running as nick. A guard verified only by inputs it already handles
+# reports its contract, not its behaviour. (Carnot, cage-match #199 round 2.)
+W=$(mkw injvar '# requires-credential: .config/x BREVO;touch/tmp/pwn')
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "INJECTION: ';' in VAR rejected (not just a bad first char)" 2 $?
+
+W=$(mkw injvar2 '# requires-credential: .config/x A$(id)')
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "INJECTION: command substitution in VAR rejected" 2 $?
+
+W=$(mkw injvar3 '# requires-credential: .config/x BREVO-API')
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "hyphen in VAR rejected (not a shell identifier)" 2 $?
+
+W=$(mkw injpath '# requires-credential: .config/x;touch/tmp/pwn VAR')
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "INJECTION: ';' in PATH rejected" 2 $?
+
+W=$(mkw injpath2 '# requires-credential: .config/$(id) VAR')
+watcher_declared_creds "$W" >/dev/null 2>&1; expect_rc "INJECTION: command substitution in PATH rejected" 2 $?
+
+# The allowlist must not be so tight it rejects legitimate names.
+W=$(mkw okvar '# requires-credential: .config/imagineering/x-y_z.env _OK9')
+out=$(watcher_declared_creds "$W"); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = ".config/imagineering/x-y_z.env _OK9" ] \
+  && ok "legitimate path/VAR with . _ - / digits still accepted" \
+  || bad "allowlist too tight: rejected a legitimate declaration (got '$out' rc=$rc)"
 
 echo
 echo "=== REFUSAL — the safety property ==="

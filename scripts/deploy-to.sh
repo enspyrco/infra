@@ -393,13 +393,22 @@ deploy_scripts() {
         # entire defect class is that $HOME differs between them.
         local _w="$REPO_ROOT/scripts/watchers/$name.sh"
         if [ -r "$_w" ]; then
+            # DEFENCE IN DEPTH. The parser already allowlists both values to
+            # [A-Za-z0-9._/-] and [A-Za-z_][A-Za-z0-9_]*, which is the real
+            # boundary — sanitised at the assignment site, not here. This form
+            # additionally passes them as ARGUMENTS rather than splicing them
+            # into the remote script text, and resolves the variable by indirect
+            # expansion (${!v}) instead of building `${<name>:-}` as code. A
+            # future edit that loosens the allowlist therefore does not silently
+            # become remote code execution as `nick`.
             _cred_checker() {  # <home-relative-path> <VAR>
-                ssh "$REMOTE" "sudo -u nick bash -c '
-                    C=\$HOME/$1
-                    [ -r \"\$C\" ] || exit 3
-                    set -a; . \"\$C\"; set +a
-                    [ -n \"\${$2:-}\" ] || exit 4
-                '"
+                ssh "$REMOTE" "sudo -u nick bash -s -- '$1' '$2'" <<'CRED_EOF'
+p=$1; v=$2
+C="$HOME/$p"
+[ -r "$C" ] || exit 3
+set -a; . "$C"; set +a
+[ -n "${!v:-}" ] || exit 4
+CRED_EOF
             }
             if ! watcher_credentials_ok "$_w" _cred_checker; then
                 echo "FATAL: watcher $name declares a credential the scheduled user (nick) cannot use." >&2

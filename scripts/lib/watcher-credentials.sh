@@ -50,13 +50,33 @@ watcher_declared_creds() {
             echo "  expected: # requires-credential: <home-relative-path> <VAR_NAME>" >&2
             rc=2; continue
         fi
+        # SANITISE AT THE ASSIGNMENT SITE, not at the use site. These two values
+        # are consumed by deploy-to.sh inside a remote `bash -c` running as the
+        # watcher user, so anything that reaches that point is code. Validate to
+        # a conservative ALLOWLIST here and the use site cannot be surprised.
+        #
+        # An earlier revision used `case "$var" in [A-Za-z_]*)`, which checks only
+        # the FIRST CHARACTER — `*` matches the rest — so `BREVO;touch /tmp/pwn`
+        # was accepted and spliced into the remote shell. Its test asserted
+        # "invalid variable name rejected" and PASSED, because the fixture was
+        # `9NOTAVAR`, the single case a first-character check does catch. A guard
+        # verified only by the input it already handles reports its own contract
+        # rather than its behaviour. (Carnot, cage-match #199 round 2.)
         case "$path" in
             /*) echo "watcher_declared_creds: $f declares an ABSOLUTE path '$path'; must be HOME-relative (the defect class is per-user files)" >&2; rc=2; continue ;;
             *..*) echo "watcher_declared_creds: $f declares a path containing '..': '$path'" >&2; rc=2; continue ;;
         esac
+        # Full-string match, anchored by construction: reject if ANY character
+        # falls outside the allowlist. Deliberately excludes whitespace, quotes,
+        # `;`, `$`, backtick, `&`, `|`, `(`, `)`, `<`, `>` and `\`.
+        case "$path" in
+            *[!A-Za-z0-9._/-]*) echo "watcher_declared_creds: $f declares a path with disallowed characters: '$path' (allowed: A-Za-z0-9 . _ / -)" >&2; rc=2; continue ;;
+        esac
         case "$var" in
-            [A-Za-z_]*) ;;
-            *) echo "watcher_declared_creds: $f declares an invalid variable name '$var'" >&2; rc=2; continue ;;
+            [A-Za-z_]) ;;                       # single-character name
+            [A-Za-z_]*[!A-Za-z0-9_]*) echo "watcher_declared_creds: $f declares an invalid variable name '$var' (must match [A-Za-z_][A-Za-z0-9_]*)" >&2; rc=2; continue ;;
+            [A-Za-z_]*) ;;                      # valid: starts right, no bad chars
+            *) echo "watcher_declared_creds: $f declares an invalid variable name '$var' (must match [A-Za-z_][A-Za-z0-9_]*)" >&2; rc=2; continue ;;
         esac
         printf '%s %s\n' "$path" "$var"
     done < <(grep -E '^[[:space:]]*#[[:space:]]*requires-credential:' "$f" 2>/dev/null)
