@@ -3,7 +3,7 @@
 # instance, then resizes it up to the target size.
 #
 # Lineage: reconciled 2026-07-28 to match the deployed (no-cloud-init) variant
-# that actually provisioned Robin's and Amanda's Melbourne boxes. Instances get
+# that actually provisioned Robin's Melbourne box. Instances get
 # the OCI-default 'ubuntu' user; SSH keys come from $AUTHORIZED_KEYS_FILE
 # (one key per line). The older cloud-init/--user-data-file lineage was dropped
 # because it had already diverged from what runs in production.
@@ -207,7 +207,37 @@ done
 # ── If everything is at its (capped) full target, we're done — disable cron ──
 if $all_done; then
     log "All instances at target size! Disabling cron job. 🎊"
-    crontab -l | grep -v "retry-provision" | crontab -
+    # ONE read, validated, and the write derived from THAT read.
+    #
+    # The previous form was `crontab -l | grep -v ... | crontab -`. If the read
+    # fails for any reason, its empty output flows through grep into `crontab -`,
+    # which installs an EMPTY crontab: a line-removal silently destroys every
+    # unrelated job on the account. Same defect self_disable() in
+    # watchers/lib/watcher-base.sh was hardened against in this PR; the fix landed
+    # in the library and this sibling was missed until a reviewer swept the class.
+    # Two streams, deliberately. CONTENT is read with stderr discarded, because
+    # this value is written back as the crontab and a warning merged into it would
+    # be installed as a line. CLASSIFICATION re-reads stderr only on failure, so
+    # "no crontab exists" is not reported as "the read failed" — distinguishing
+    # those two is the same honesty this block exists to restore.
+    _ct=""; _rc=0
+    _ct=$(crontab -l 2>/dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        case "$(crontab -l 2>&1 >/dev/null)" in
+            *"no crontab for"*) log "no crontab for this user; nothing to remove" ;;
+            *) log "REFUSING to rewrite crontab: read failed (rc=$_rc); retry-provision entry left in place" ;;
+        esac
+    else
+        # Safe here only because $_ct is a verified successful read: an empty
+        # result means our line was the only one, which is a correct empty
+        # crontab rather than a lost one.
+        if printf '%s\n' "$(printf '%s' "$_ct" | grep -v "retry-provision" || true)" | crontab -; then
+            log "retry-provision cron entry removed"
+        else
+            log "crontab write FAILED; retry-provision entry may still be installed"
+        fi
+    fi
+    unset _ct _rc
 fi
 
 log "Provisioning cycle complete."
