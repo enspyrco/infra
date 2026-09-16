@@ -74,6 +74,28 @@ if ! meminfo=$(cat "$MEMINFO_PATH" 2>&1); then
     blind["memory"]="cannot read $MEMINFO_PATH: $(printf '%s' "$meminfo" | tr '\n' ' ' | cut -c1-120)"
     blind["swap"]="${blind[memory]}"
     meminfo=""
+else
+    # A SENSOR DECLARES THE FIELDS IT NEEDS, and a read that lacks any of them is
+    # BLIND — not a measurement. Keying blindness off `cat`'s exit status alone
+    # left two doors open, and they fail in opposite directions:
+    #   - MemAvailable absent but MemTotal present: `mem_available` is empty,
+    #     arithmetic reads it as 0, and the sensor reports 100% used — a false
+    #     ALARM (Carnot).
+    #   - the file readable but empty: not blind, `mem_total` empty, the `-gt 0`
+    #     guard skips, and any existing memory/swap key silently RESOLVES — a
+    #     false ALL-CLEAR (Tesla), which is the dangerous direction.
+    # Both are the same defect: a readable file was taken as a valid measurement.
+    # Checking the required fields closes both at once rather than patching each.
+    _missing=""
+    for _f in MemTotal MemAvailable SwapTotal SwapFree; do
+        printf '%s\n' "$meminfo" | grep -qE "^${_f}:" || _missing="$_missing $_f"
+    done
+    if [ -n "$_missing" ]; then
+        blind["memory"]="$MEMINFO_PATH is readable but missing required field(s):$_missing"
+        blind["swap"]="${blind[memory]}"
+        meminfo=""
+    fi
+    unset _f _missing
 fi
 
 mem_total=$(printf '%s\n' "$meminfo" | awk '/MemTotal/ {print $2}')

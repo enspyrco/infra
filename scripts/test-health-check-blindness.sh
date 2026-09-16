@@ -192,6 +192,40 @@ grep -qi "BLIND on memory" "$S5/out.txt" \
   || { bad "meminfo unreadable: stayed quiet"; sed 's/^/        /' "$S5/out.txt"; }
 
 echo
+echo "=== ARM 5b (sensor validity): a READABLE but incomplete meminfo is BLIND, not a measurement ==="
+# Two doors, opposite directions, same defect — a readable file taken as a valid
+# measurement. MemAvailable missing => false ALARM at 100% (Carnot). File empty
+# => not blind, guard skips, memory/swap silently RESOLVE (Tesla).
+for case_name in "empty" "no-MemAvailable"; do
+    S5b=$(mktemp -d); mkdir -p "$S5b/bin"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$S5b/bin/docker"
+    printf '#!/usr/bin/env bash\necho "Use%%%% Mounted on"\necho "  1%%%% /"\n' > "$S5b/bin/df"
+    chmod +x "$S5b/bin/"*
+    printf 'memory\nswap\n' > "$S5b/state"
+    if [ "$case_name" = "empty" ]; then : > "$S5b/meminfo"
+    else printf 'MemTotal:       16000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        2000000 kB\n' > "$S5b/meminfo"; fi
+    PATH="$S5b/bin:$PATH" HEALTHCHECK_STATE="$S5b/state" NOTIFY_API_KEY="" \
+        HEALTHCHECK_MEMINFO="$S5b/meminfo" "$BASH4" "$REPO/scripts/health-check.sh" > "$S5b/out.txt" 2>&1
+    if grep -qi "Resolved" "$S5b/out.txt"; then
+        bad "$case_name meminfo: reported memory/swap RESOLVED (false all-clear)"
+        sed 's/^/        /' "$S5b/out.txt"
+    else
+        ok "$case_name meminfo: no recovery claimed"
+    fi
+    if grep -qi "BLIND on memory" "$S5b/out.txt"; then
+        ok "$case_name meminfo: marked blind rather than measured"
+    else
+        bad "$case_name meminfo: treated an incomplete read as a measurement"
+        sed 's/^/        /' "$S5b/out.txt"
+    fi
+    if grep -q "100% used" "$S5b/out.txt"; then
+        bad "$case_name meminfo: emitted a spurious 100% memory alarm"
+    else
+        ok "$case_name meminfo: no spurious 100% alarm"
+    fi
+done
+
+echo
 echo "=== ARM 6 (stderr must not become a container): a WARNING on a healthy daemon ==="
 # `2>&1` on a ZERO exit folded stderr into the roster, so a daemon warning became
 # a phantom container:* key — then a false recovery when the warning stopped.
