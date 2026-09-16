@@ -18,6 +18,8 @@ fi
 IP=$1
 SERVICE=${2:-all}
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/watcher-credentials.sh
+. "$REPO_ROOT/scripts/lib/watcher-credentials.sh"
 REMOTE="nick@$IP"
 
 # ---------------------------------------------------------------------------
@@ -359,6 +361,41 @@ deploy_scripts() {
     # Stray stderr now interleaves into the log a human actually reads.
     install_watcher_cron() {
         local name=$1 schedule=$2
+
+        # DECLARED-CREDENTIAL PREFLIGHT — assert before scheduling, per watcher.
+        #
+        # The notify assert above covers ONE credential for ALL watchers. This
+        # covers whatever each watcher declares for itself, because the notify
+        # assert was necessary and not sufficient: email-health-watch also needs
+        # BREVO_API_KEY from a per-user file nothing deploys, ran as `nick`
+        # against ubuntu's copy from 2026-09-12, and exited 0 while checking
+        # nothing (claude-tasks#4470). Third credential in one class
+        # (notify #4363, OCI #4364), which is why this reads a declaration
+        # instead of growing a third hardcoded check.
+        #
+        # Resolved AS THE SCHEDULED USER (`nick`), not as the deploy user: the
+        # entire defect class is that $HOME differs between them.
+        local _w="$REPO_ROOT/scripts/watchers/$name.sh"
+        if [ -r "$_w" ]; then
+            _cred_checker() {  # <home-relative-path> <VAR>
+                ssh "$REMOTE" "sudo -u nick bash -c '
+                    C=\$HOME/$1
+                    [ -r \"\$C\" ] || exit 3
+                    set -a; . \"\$C\"; set +a
+                    [ -n \"\${$2:-}\" ] || exit 4
+                '"
+            }
+            if ! watcher_credentials_ok "$_w" _cred_checker; then
+                echo "FATAL: watcher $name declares a credential the scheduled user (nick) cannot use." >&2
+                echo "  Scheduling it anyway is how a watcher ends up green and blind: its" >&2
+                echo "  missing-credential branch is the same 'still waiting' return as a" >&2
+                echo "  healthy cycle, so the run exits 0 and nothing complains." >&2
+                echo "  Fix: install the declared file under /home/nick (mode 0600, owner nick)" >&2
+                echo "  so that it defines the named variable, then re-run the deploy." >&2
+                return 1
+            fi
+        fi
+
         echo "Installing /etc/cron.d/$name..."
         ssh "$REMOTE" "printf '%s\n' \
             'SHELL=/bin/bash' \
