@@ -18,8 +18,6 @@ fi
 IP=$1
 SERVICE=${2:-all}
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=lib/watcher-credentials.sh
-. "$REPO_ROOT/scripts/lib/watcher-credentials.sh"
 REMOTE="nick@$IP"
 
 # ---------------------------------------------------------------------------
@@ -359,6 +357,24 @@ deploy_scripts() {
     # the real one, and an operator reading the path the schedule names saw an
     # empty file and could not tell "quiet" from "never ran" (claude-tasks#4362).
     # Stray stderr now interleaves into the log a human actually reads.
+    # Sourced HERE, not at the top of the file. The provenance preflight and every
+    # other deploy path have no business depending on this lib, and the script runs
+    # under `set -e`: a top-level source made a missing lib abort EVERY deploy,
+    # including ones that schedule no watcher. (It also broke
+    # test-deploy-provenance.sh, whose fixture copies deploy-to.sh alone — the
+    # failure that surfaced the coupling.)
+    #
+    # Fail CLOSED all the same: if the lib is absent, the credential preflight
+    # would not run, and a preflight that silently does not run is precisely the
+    # failure-equals-success collapse it exists to prevent.
+    if [ ! -r "$REPO_ROOT/scripts/lib/watcher-credentials.sh" ]; then
+        echo "FATAL: scripts/lib/watcher-credentials.sh is missing." >&2
+        echo "  Watcher credential preflight cannot run, so scheduling would be unguarded." >&2
+        return 1
+    fi
+    # shellcheck source=lib/watcher-credentials.sh
+    . "$REPO_ROOT/scripts/lib/watcher-credentials.sh"
+
     install_watcher_cron() {
         local name=$1 schedule=$2
 
